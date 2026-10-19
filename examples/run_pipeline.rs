@@ -1,6 +1,9 @@
-// E2E: plan.json → place → route → DRC → preflight (the idea-to-PCB spine)
+// E2E: plan → place → route → DRC → preflight (the idea-to-PCB spine).
+// `cargo run --example run_pipeline [plan.json]` (default examples/plan_555.json);
+// writes someda-build/circuit.kicad_pcb.
 fn main() {
-    let plan_json = std::fs::read_to_string("plan.json").expect("plan.json");
+    let arg = std::env::args().nth(1).unwrap_or_else(|| "examples/plan_555.json".to_string());
+    let plan_json = std::fs::read_to_string(&arg).expect("plan file");
     let plan: someda::orchestrator::CircuitPlan = serde_json::from_str(&plan_json).expect("valid plan");
     someda::orchestrator::validate_plan(&plan).expect("plan validates");
 
@@ -37,7 +40,8 @@ fn main() {
         });
     }
 
-    std::fs::write("circuit.kicad_pcb", board.to_kicad_pcb()).expect("write pcb");
+    std::fs::create_dir_all("someda-build").expect("output dir");
+    std::fs::write("someda-build/circuit.kicad_pcb", board.to_kicad_pcb()).expect("write pcb");
 
     let report = someda::drc::run_drc(&board, &someda::drc::DrcConfig::default());
     println!("someda DRC: {} errors, {} warnings", report.errors(), report.warnings());
