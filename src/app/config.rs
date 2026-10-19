@@ -53,16 +53,31 @@ impl AppConfig {
     }
 
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
+        use std::io::Write;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {}", dir.display(), e))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("permissions on {}: {}", dir.display(), e))?;
+            }
         }
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, text).map_err(|e| format!("write {}: {}", path.display(), e))?;
+        // Written to a fresh owner-only file, then renamed over the old one:
+        // the key is never readable by others, not even for an instant.
+        let tmp = path.with_extension("json.tmp");
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600).custom_flags(libc_o_nofollow());
         }
+        let mut f = opts.open(&tmp).map_err(|e| format!("create {}: {}", tmp.display(), e))?;
+        f.write_all(text.as_bytes()).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+        f.sync_all().ok();
+        drop(f);
+        std::fs::rename(&tmp, path).map_err(|e| format!("rename {} → {}: {}", tmp.display(), path.display(), e))?;
         Ok(())
     }
 
@@ -73,6 +88,19 @@ impl AppConfig {
             return "•".repeat(k.len());
         }
         format!("{}…{}", &k[..4], &k[k.len() - 4..])
+    }
+}
+
+#[cfg(unix)]
+fn libc_o_nofollow() -> i32 {
+    // O_NOFOLLOW: never write through a symlink planted at the config path
+    #[cfg(target_os = "linux")]
+    {
+        0o400000
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0x0100
     }
 }
 

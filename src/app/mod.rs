@@ -5,6 +5,8 @@
 
 pub mod config;
 pub mod deps;
+pub mod interview;
+pub mod project;
 pub mod providers;
 pub mod runner;
 pub mod state;

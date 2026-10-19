@@ -3,6 +3,8 @@
 //! effects the state machine asks for on worker threads.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod screens;
+
 use eframe::egui;
 use someda::app::config::AppConfig;
 use someda::app::deps;
@@ -17,13 +19,16 @@ struct App {
     frames: u32,
     screenshot: Option<std::path::PathBuf>,
     shot_requested: bool,
+    /// Text being typed (the state machine only sees it when submitted).
+    description: String,
+    edit_prompt: String,
 }
 
 impl App {
     fn new(state: AppState) -> Self {
         let (tx, events) = channel();
         let screenshot = std::env::var_os("SOMEDA_APP_SCREENSHOT").map(std::path::PathBuf::from);
-        App { state, events, tx, frames: 0, screenshot, shot_requested: false }
+        App { state, events, tx, frames: 0, screenshot, shot_requested: false, description: String::new(), edit_prompt: String::new() }
     }
 
     fn dispatch(&mut self, ev: Event) {
@@ -64,6 +69,22 @@ impl App {
                 let dir = std::env::temp_dir().join("someda-downloads");
                 std::thread::spawn(move || {
                     let _ = tx.send(Event::Installed(deps::install(&plan, &dir)));
+                });
+            }
+            Effect::AskModel(call) => {
+                let (protocol, base_url, api_key, model) = (self.state.protocol(), self.state.config.base_url.clone(), self.state.config.api_key.clone(), self.state.config.model.clone());
+                std::thread::spawn(move || {
+                    let gw = someda::gateway::Gateway::new(protocol, &base_url, &api_key, &model);
+                    let r = gw.chat_with_temperature(&call.system, &call.user, Some(0.1)).map_err(|e| e.to_string());
+                    let _ = tx.send(Event::ModelReplied(r));
+                });
+            }
+            Effect::SpawnBuild(req) => {
+                let rx = someda::app::runner::spawn(req);
+                std::thread::spawn(move || {
+                    for ev in rx {
+                        let _ = tx.send(Event::BuildOutput(ev));
+                    }
                 });
             }
         }
@@ -239,8 +260,29 @@ impl eframe::App for App {
             }
             Screen::Provider => self.provider_screen(ui),
             Screen::Dependencies => self.dependencies_screen(ui),
-            other => {
-                ui.label(format!("{:?}: not built yet", other));
+            Screen::Interview => {
+                let evs = screens::interview(ui, &self.state, &mut self.description);
+                for ev in evs {
+                    self.dispatch(ev);
+                }
+            }
+            Screen::Build => {
+                let evs = screens::build(ui, &self.state);
+                for ev in evs {
+                    self.dispatch(ev);
+                }
+            }
+            Screen::Results => {
+                let evs = screens::results(ui, &self.state);
+                for ev in evs {
+                    self.dispatch(ev);
+                }
+            }
+            Screen::Edit => {
+                let evs = screens::edit(ui, &self.state, &mut self.edit_prompt);
+                for ev in evs {
+                    self.dispatch(ev);
+                }
             }
         });
         if self.state.busy != Busy::None {
@@ -279,11 +321,35 @@ fn main() -> eframe::Result {
         Ok("dependencies") => {
             state.go(Screen::Dependencies);
         }
+        Ok("interview") => {
+            state.go(Screen::Interview);
+        }
+        Ok("results") => {
+            // SOMEDA_APP_PROJECT=<dir with plan.v1.json + build-v1/>: show its result
+            if let Some(dir) = std::env::var_os("SOMEDA_APP_PROJECT") {
+                let dir = std::path::PathBuf::from(dir);
+                let v = someda::app::project::Project::latest_version(&dir).unwrap_or(1);
+                state.project = Some(someda::app::project::Project { dir: dir.clone(), version: v });
+                state.version = v;
+                if let Ok(log) = std::fs::read_to_string(dir.join(format!("build-v{}", v)).join("build.log")) {
+                    state.log = log.lines().map(|l| l.to_string()).collect();
+                    state.summary = Some(someda::app::runner::summarize(&state.log));
+                }
+            }
+            state.go(Screen::Results);
+        }
         _ => {}
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 640.0]).with_title("someda"),
         ..Default::default()
     };
-    eframe::run_native("someda", options, Box::new(move |_cc| Ok(Box::new(App::new(state)))))
+    eframe::run_native(
+        "someda",
+        options,
+        Box::new(move |cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
+            Ok(Box::new(App::new(state)))
+        }),
+    )
 }

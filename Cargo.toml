@@ -13,7 +13,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The desktop app (someda-app) only: the CLI and the test suite never compile these.
 eframe = { version = "0.37", optional = true }
-egui_extras = { version = "0.37", features = ["image"], optional = true }
+egui_extras = { version = "0.37", features = ["image", "file"], optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 dirs = { version = "7", optional = true }
 

@@ -19,7 +19,7 @@ pub enum BuildEvent {
 }
 
 /// What to run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BuildRequest {
     pub someda_cli: PathBuf,
     pub plan_file: PathBuf,
@@ -30,6 +30,8 @@ pub struct BuildRequest {
     pub model_dir: Option<PathBuf>,
     /// Extra environment (the API key goes here, never on the command line).
     pub env: Vec<(String, String)>,
+    /// Every line is also appended here (the results screen re-reads it later).
+    pub log_file: Option<PathBuf>,
 }
 
 /// Spawn the build; lines arrive on the receiver as they are printed.
@@ -69,6 +71,12 @@ pub fn spawn(req: BuildRequest) -> Receiver<BuildEvent> {
         };
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        let mut log = req.log_file.as_ref().and_then(|p| {
+            if let Some(d) = p.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
+            std::fs::File::create(p).ok()
+        });
         let tx2 = tx.clone();
         let err_thread = std::thread::spawn(move || {
             if let Some(e) = stderr {
@@ -79,6 +87,10 @@ pub fn spawn(req: BuildRequest) -> Receiver<BuildEvent> {
         });
         if let Some(o) = stdout {
             for line in BufReader::new(o).lines().map_while(Result::ok) {
+                if let Some(f) = log.as_mut() {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", line);
+                }
                 let _ = tx.send(BuildEvent::Line(line));
             }
         }
@@ -220,6 +232,7 @@ mod tests {
             footprint_dirs: vec![],
             model_dir: None,
             env: vec![],
+            log_file: None,
         });
         match rx.recv().unwrap() {
             BuildEvent::Failed(m) => assert!(m.contains("could not start")),

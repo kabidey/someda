@@ -102,11 +102,17 @@ pub fn detect(config_kicad_cli: Option<&str>, config_someda: Option<&str>) -> Re
 }
 
 fn sibling_binary(name: &str) -> Option<PathBuf> {
+    if let Some(b) = std::env::var_os("SOMEDA_BIN") {
+        let p = PathBuf::from(b);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     let bin = if cfg!(windows) { format!("{}.exe", name) } else { name.to_string() };
-    let p = dir.join(bin);
-    p.is_file().then_some(p)
+    // next to the app, or one level up (cargo's target/release/examples/)
+    [dir.join(&bin), dir.parent().map(|d| d.join(&bin)).unwrap_or_default()].into_iter().find(|p| p.is_file())
 }
 
 /// `which`, without a dependency.
