@@ -265,7 +265,7 @@ fn check_segment_clearance(board: &Board, config: &DrcConfig, findings: &mut Vec
 }
 
 /// Minimum distance between two segments (center-line to center-line).
-fn segment_segment_distance(
+pub fn segment_segment_distance(
     a1: (f64, f64), a2: (f64, f64),
     b1: (f64, f64), b2: (f64, f64),
 ) -> f64 {

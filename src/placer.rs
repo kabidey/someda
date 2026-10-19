@@ -5,11 +5,16 @@
 //!    overlap avoidance, board fitting, and DRC."
 //!
 //! The LLM (or a human) expresses INTENT — semantic positions ("top_left",
-//! "center"), groups, rows, spacing constraints — and this module turns it
-//! into geometry. Two layers:
+//! "left_edge"), "near" relations, keep-apart distances — and this module
+//! turns it into geometry using the footprints' REAL courtyards:
 //!
-//!   1. `place`   — footprint arrangement: grid packing with constraints
-//! 2. `route`    — grid router: A* with clearance, vias, honest failure
+//!   1. parts with a semantic/edge position are placed first (connectors
+//!      flush to their edge, slid along it to the first free slot)
+//!   2. every other part is placed in connectivity order at the free spot
+//!      nearest the centroid of its already-placed neighbours — decoupling
+//!      caps land next to their IC, the SoC claims the centre
+//!   3. courtyards never overlap (0.3mm gap), hot parts keep their
+//!      thermal distance, everything stays inside the outline margin
 //!
 //! Everything here is deterministic: same plan in, same board out.
 
@@ -23,6 +28,7 @@ pub enum Pos {
     TopLeft, Top, TopRight,
     Left, Center, Right,
     BottomLeft, Bottom, BottomRight,
+    LeftEdge, RightEdge, TopEdge, BottomEdge,
 }
 
 impl Pos {
@@ -39,6 +45,10 @@ impl Pos {
             "bottom_left" => BottomLeft,
             "bottom" => Bottom,
             "bottom_right" => BottomRight,
+            "left_edge" => LeftEdge,
+            "right_edge" => RightEdge,
+            "top_edge" => TopEdge,
+            "bottom_edge" => BottomEdge,
             _ => return None,
         })
     }
@@ -48,15 +58,19 @@ impl Pos {
         use Pos::*;
         match self {
             TopLeft => (0.15, 0.10),
-            Top => (0.50, 0.10),
+            Top | TopEdge => (0.50, 0.10),
             TopRight => (0.85, 0.10),
-            Left => (0.15, 0.50),
+            Left | LeftEdge => (0.15, 0.50),
             Center => (0.50, 0.50),
-            Right => (0.85, 0.50),
+            Right | RightEdge => (0.85, 0.50),
             BottomLeft => (0.15, 0.90),
-            Bottom => (0.50, 0.90),
+            Bottom | BottomEdge => (0.50, 0.90),
             BottomRight => (0.85, 0.90),
         }
+    }
+
+    fn is_edge(self) -> bool {
+        matches!(self, Pos::LeftEdge | Pos::RightEdge | Pos::TopEdge | Pos::BottomEdge)
     }
 }
 
@@ -108,6 +122,10 @@ pub struct PlacementIntent {
     pub groups: Vec<GroupIntent>,
     pub apart: Vec<ApartIntent>,
     pub rows: Vec<RowIntent>,
+    /// (part, anchor): place `part` as close to `anchor` as possible.
+    pub near: Vec<(String, String)>,
+    /// Nets ignored for connectivity placement (planes, big power rails).
+    pub ignore_nets: Vec<String>,
 }
 
 /// The solved geometry for one footprint.
@@ -124,23 +142,263 @@ pub struct Solved {
 pub struct Placer {
     pub board_w: f64,
     pub board_h: f64,
-    /// Cell pitch used for grid packing (mm).
+    /// Cell pitch used for grid packing (mm) — legacy arrange().
     pub pitch: f64,
+    /// Courtyard-to-courtyard gap (mm).
+    pub gap: f64,
+    /// Courtyard-to-outline margin (mm).
+    pub margin: f64,
+}
+
+/// An axis-aligned rectangle (min_x, min_y, max_x, max_y).
+type Rect = (f64, f64, f64, f64);
+
+fn overlaps(a: Rect, b: Rect, gap: f64) -> bool {
+    a.0 < b.2 + gap && b.0 < a.2 + gap && a.1 < b.3 + gap && b.1 < a.3 + gap
 }
 
 impl Placer {
     pub fn new(board_w: f64, board_h: f64) -> Placer {
-        Placer { board_w, board_h, pitch: 10.0 }
+        Placer { board_w, board_h, pitch: 10.0, gap: 0.3, margin: 0.5 }
     }
 
-    /// Arrange footprints from intent + connectivity.
+    /// Courtyard-aware placement from real footprint geometry.
     ///
-    /// Deterministic order:
-    /// 1. Explicit semantic positions win.
-    /// 2. Rows align their members on the axis.
-    /// 3. Groups hug their anchors (within max_mm).
-    /// 4. Everything else packs on a pitch grid ordered by ratsnest
-    ///    centrality — the most-connected parts claim the center.
+    /// Footprints are expected at the origin (x = y = 0) with their final
+    /// rotation applied; the returned `x`/`y` is where their origin goes.
+    pub fn arrange_courtyards(
+        &self,
+        board: &Board,
+        netlist: &Netlist,
+        intent: &PlacementIntent,
+    ) -> Vec<Solved> {
+        // Per-part geometry: courtyard bbox relative to the origin (rotated)
+        struct Part {
+            reference: String,
+            rel: Rect,
+            rot: i32,
+            degree: usize,
+        }
+        let mut parts: Vec<Part> = Vec::new();
+        let neighbours = Self::neighbour_map(netlist, &intent.ignore_nets);
+        for fp in &board.footprints {
+            let (x0, y0, x1, y1) = fp.abs_bbox();
+            parts.push(Part {
+                reference: fp.reference.clone(),
+                rel: (x0 - fp.x, y0 - fp.y, x1 - fp.x, y1 - fp.y),
+                rot: fp.rotation.round() as i32,
+                degree: neighbours.get(&fp.reference).map(|v| v.len()).unwrap_or(0),
+            });
+        }
+        let part_of = |r: &str| parts.iter().position(|p| p.reference == r);
+
+        let mut solved: Vec<Solved> = Vec::new();
+        let mut placed_rects: Vec<(String, Rect)> = Vec::new();
+        let hot: std::collections::HashMap<String, Vec<(String, f64)>> = {
+            let mut m: std::collections::HashMap<String, Vec<(String, f64)>> = std::collections::HashMap::new();
+            for ap in &intent.apart {
+                m.entry(ap.a.clone()).or_default().push((ap.b.clone(), ap.min_mm));
+                m.entry(ap.b.clone()).or_default().push((ap.a.clone(), ap.min_mm));
+            }
+            m
+        };
+
+        // The free-spot test for a part's bbox centred at (cx, cy)
+        let fits = |reference: &str, rel: Rect, cx: f64, cy: f64, placed: &[(String, Rect)], solved: &[Solved]| -> bool {
+            let hw = (rel.2 - rel.0) / 2.0;
+            let hh = (rel.3 - rel.1) / 2.0;
+            let r = (cx - hw, cy - hh, cx + hw, cy + hh);
+            if r.0 < self.margin || r.1 < self.margin || r.2 > self.board_w - self.margin || r.3 > self.board_h - self.margin {
+                return false;
+            }
+            if placed.iter().any(|(_, q)| overlaps(r, *q, self.gap)) {
+                return false;
+            }
+            if let Some(constraints) = hot.get(reference) {
+                for (other, min_mm) in constraints {
+                    if let Some(s) = solved.iter().find(|s| &s.reference == other) {
+                        let d = ((s.x - cx).powi(2) + (s.y - cy).powi(2)).sqrt();
+                        if d < *min_mm {
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        };
+        // Deterministic spiral search on a 0.5mm lattice from a target point
+        let spiral = |reference: &str, rel: Rect, tx: f64, ty: f64, placed: &[(String, Rect)], solved: &[Solved]| -> Option<(f64, f64)> {
+            let step = 0.5;
+            let max_r = ((self.board_w.max(self.board_h)) / step).ceil() as i32 + 2;
+            let snap = |v: f64| (v / step).round() * step;
+            let (sx, sy) = (snap(tx), snap(ty));
+            if fits(reference, rel, sx, sy, placed, solved) {
+                return Some((sx, sy));
+            }
+            for ring in 1..=max_r {
+                let r = ring as f64 * step;
+                // walk the ring perimeter clockwise from the top-left corner
+                let mut cands: Vec<(f64, f64)> = Vec::new();
+                let n = ring * 2;
+                for i in 0..n {
+                    let t = i as f64 * step;
+                    cands.push((sx - r + t, sy - r));
+                    cands.push((sx + r, sy - r + t));
+                    cands.push((sx + r - t, sy + r));
+                    cands.push((sx - r, sy + r - t));
+                }
+                // prefer the candidate closest to the target among the ring
+                cands.sort_by(|a, b| {
+                    let da = (a.0 - tx).powi(2) + (a.1 - ty).powi(2);
+                    let db = (b.0 - tx).powi(2) + (b.1 - ty).powi(2);
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                for (cx, cy) in cands {
+                    if fits(reference, rel, cx, cy, placed, solved) {
+                        return Some((cx, cy));
+                    }
+                }
+            }
+            None
+        };
+        let commit = |p: &Part, cx: f64, cy: f64, solved: &mut Vec<Solved>, placed: &mut Vec<(String, Rect)>| {
+            let hw = (p.rel.2 - p.rel.0) / 2.0;
+            let hh = (p.rel.3 - p.rel.1) / 2.0;
+            // origin = bbox centre minus the bbox's own offset from the origin
+            let ox = cx - (p.rel.0 + hw);
+            let oy = cy - (p.rel.1 + hh);
+            solved.push(Solved { reference: p.reference.clone(), x: ox, y: oy, rot: p.rot, back: false });
+            placed.push((p.reference.clone(), (cx - hw, cy - hh, cx + hw, cy + hh)));
+        };
+
+        // 1. Semantic / edge positions first
+        for pi in &intent.places {
+            let Some(idx) = part_of(&pi.reference) else { continue };
+            let p = &parts[idx];
+            let pos = pi.pos.unwrap_or(Pos::Center);
+            let (ux, uy) = pos.unit();
+            let hw = (p.rel.2 - p.rel.0) / 2.0;
+            let hh = (p.rel.3 - p.rel.1) / 2.0;
+            let (tx, ty) = if pos.is_edge() {
+                match pos {
+                    Pos::LeftEdge => (self.margin + hw, uy * self.board_h),
+                    Pos::RightEdge => (self.board_w - self.margin - hw, uy * self.board_h),
+                    Pos::TopEdge => (ux * self.board_w, self.margin + hh),
+                    _ => (ux * self.board_w, self.board_h - self.margin - hh),
+                }
+            } else {
+                (ux * self.board_w, uy * self.board_h)
+            };
+            let spot = if pos.is_edge() {
+                // slide along the edge: alternate outward from the target
+                let step = 0.5;
+                let mut found = None;
+                let span = (self.board_w.max(self.board_h) / step) as i32;
+                for k in 0..=span {
+                    for sign in [1.0, -1.0] {
+                        if k == 0 && sign < 0.0 { continue; }
+                        let d = k as f64 * step * sign;
+                        let (cx, cy) = match pos {
+                            Pos::LeftEdge | Pos::RightEdge => (tx, ty + d),
+                            _ => (tx + d, ty),
+                        };
+                        if fits(&p.reference, p.rel, cx, cy, &placed_rects, &solved) {
+                            found = Some((cx, cy));
+                            break;
+                        }
+                    }
+                    if found.is_some() { break; }
+                }
+                found.or_else(|| spiral(&p.reference, p.rel, tx, ty, &placed_rects, &solved))
+            } else {
+                spiral(&p.reference, p.rel, tx, ty, &placed_rects, &solved)
+            };
+            if let Some((cx, cy)) = spot {
+                commit(p, cx, cy, &mut solved, &mut placed_rects);
+            }
+        }
+
+        // 2. Everything else: connectivity order, nearest free spot to the
+        //    centroid of already-placed neighbours ("near" wins when given)
+        let mut rest: Vec<usize> = (0..parts.len())
+            .filter(|i| !solved.iter().any(|s| s.reference == parts[*i].reference))
+            .collect();
+        rest.sort_by(|&a, &b| {
+            parts[b].degree.cmp(&parts[a].degree).then_with(|| parts[a].reference.cmp(&parts[b].reference))
+        });
+        // Place in waves: a part whose neighbours are all unplaced waits for
+        // the most-connected part to seed the centre.
+        let mut remaining = rest.clone();
+        let mut guard = 0;
+        while !remaining.is_empty() && guard < 10_000 {
+            guard += 1;
+            // pick the first remaining part with a placed neighbour/anchor,
+            // else the most connected one
+            let pick = remaining
+                .iter()
+                .position(|&i| {
+                    let r = &parts[i].reference;
+                    intent.near.iter().any(|(p, a)| p == r && solved.iter().any(|s| &s.reference == a))
+                        || neighbours.get(r).map(|ns| ns.iter().any(|n| solved.iter().any(|s| &s.reference == n))).unwrap_or(false)
+                })
+                .unwrap_or(0);
+            let i = remaining.remove(pick);
+            let p = &parts[i];
+            let target = if let Some((_, anchor)) = intent.near.iter().find(|(pr, _)| pr == &p.reference) {
+                solved.iter().find(|s| &s.reference == anchor).map(|s| (s.x, s.y))
+            } else {
+                None
+            }
+            .or_else(|| {
+                let ns = neighbours.get(&p.reference)?;
+                let pts: Vec<(f64, f64)> = ns
+                    .iter()
+                    .filter_map(|n| solved.iter().find(|s| &s.reference == n).map(|s| (s.x, s.y)))
+                    .collect();
+                if pts.is_empty() {
+                    None
+                } else {
+                    let n = pts.len() as f64;
+                    Some((pts.iter().map(|p| p.0).sum::<f64>() / n, pts.iter().map(|p| p.1).sum::<f64>() / n))
+                }
+            })
+            .unwrap_or((self.board_w / 2.0, self.board_h / 2.0));
+            if let Some((cx, cy)) = spiral(&p.reference, p.rel, target.0, target.1, &placed_rects, &solved) {
+                commit(p, cx, cy, &mut solved, &mut placed_rects);
+            } else {
+                // No room: park at the centre so the pin-coverage/DRC gates
+                // report the overlap honestly rather than losing the part.
+                commit(p, self.board_w / 2.0, self.board_h / 2.0, &mut solved, &mut placed_rects);
+            }
+        }
+        solved
+    }
+
+    /// Reference → connected references, through nets not ignored and not
+    /// huge (rails with > 8 pins do not pull parts together).
+    fn neighbour_map(netlist: &Netlist, ignore: &[String]) -> std::collections::HashMap<String, Vec<String>> {
+        let mut m: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for (name, pins) in &netlist.nets {
+            if ignore.contains(name) || pins.len() > 8 {
+                continue;
+            }
+            let refs: Vec<&String> = pins.iter().map(|(r, _)| r).collect();
+            for a in &refs {
+                for b in &refs {
+                    if a != b {
+                        let e = m.entry((*a).clone()).or_default();
+                        if !e.contains(b) {
+                            e.push((*b).clone());
+                        }
+                    }
+                }
+            }
+        }
+        m
+    }
+
+    /// Arrange footprints from intent + connectivity (legacy pitch-grid
+    /// packer kept for the bringup flow and existing callers).
     pub fn arrange(
         &self,
         board: &Board,
@@ -150,7 +408,6 @@ impl Placer {
         let mut solved: Vec<Solved> = Vec::new();
         let mut placed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        // 1. Semantic positions
         for p in &intent.places {
             if let Some(fp) = board.footprints.iter().find(|f| f.reference == p.reference) {
                 let (ux, uy) = p.pos.unwrap_or(Pos::Center).unit();
@@ -165,7 +422,6 @@ impl Placer {
             }
         }
 
-        // 2. Rows: spread members along the axis, centered if asked
         for row in &intent.rows {
             let (w, h) = (self.board_w, self.board_h);
             let n = row.references.len();
@@ -179,19 +435,12 @@ impl Placer {
                     Axis::Vertical => (if row.center { w * 0.5 } else { w * 0.25 }, f * h),
                 };
                 if let Some(fp) = board.footprints.iter().find(|f| f.reference == *r) {
-                    solved.push(Solved {
-                        reference: r.clone(),
-                        x,
-                        y,
-                        rot: fp.rotation as i32,
-                        back: false,
-                    });
+                    solved.push(Solved { reference: r.clone(), x, y, rot: fp.rotation as i32, back: false });
                     placed.insert(r.clone());
                 }
             }
         }
 
-        // 3. Groups: hug the anchor (snap to next free pitch cell within max_mm)
         for g in &intent.groups {
             if let Some(anchor) = solved.iter().find(|s| s.reference == g.anchor).cloned() {
                 for m in &g.members {
@@ -200,17 +449,12 @@ impl Placer {
                     }
                     let mut k = 1;
                     loop {
-                        let (dx, dy) = (
-                            anchor.x + (k as f64) * self.pitch,
-                            anchor.y + (k as f64) * self.pitch * 0.6,
-                        );
+                        let (dx, dy) = (anchor.x + (k as f64) * self.pitch, anchor.y + (k as f64) * self.pitch * 0.6);
                         if dx > anchor.x + g.max_mm && dy > anchor.y + g.max_mm {
                             break;
                         }
                         if !solved.iter().any(|s| s.reference == *m) {
-                            if let Some(fp) =
-                                board.footprints.iter().find(|f| f.reference == *m)
-                            {
+                            if let Some(fp) = board.footprints.iter().find(|f| f.reference == *m) {
                                 solved.push(Solved {
                                     reference: m.clone(),
                                     x: anchor.x + g.max_mm.min(dx - anchor.x),
@@ -230,49 +474,26 @@ impl Placer {
             }
         }
 
-        // 4. Everything else: grid packing ordered by ratsnest centrality
-        let mut rest: Vec<&crate::board::Footprint> = board
-            .footprints
-            .iter()
-            .filter(|f| !placed.contains(&f.reference))
-            .collect();
-
-        // Order by net degree (most connected = most central = early center cells)
+        let mut rest: Vec<&crate::board::Footprint> =
+            board.footprints.iter().filter(|f| !placed.contains(&f.reference)).collect();
         let degree = |refdes: &str| -> usize {
-            netlist
-                .edges
-                .iter()
-                .filter(|e| e.from_ref == refdes || e.to_ref == refdes)
-                .count()
+            netlist.edges.iter().filter(|e| e.from_ref == refdes || e.to_ref == refdes).count()
         };
         rest.sort_by_key(|f| std::cmp::Reverse(degree(&f.reference)));
-
-        // Spiral-ish center-out cell order: deterministic ring walk around the center
         let cells = self.center_out_cells(rest.len());
         for (i, fp) in rest.iter().enumerate() {
             let (cx, cy) = cells[i];
-            solved.push(Solved {
-                reference: fp.reference.clone(),
-                x: cx,
-                y: cy,
-                rot: fp.rotation as i32,
-                back: false,
-            });
+            solved.push(Solved { reference: fp.reference.clone(), x: cx, y: cy, rot: fp.rotation as i32, back: false });
         }
 
-        // 5. Enforce apart constraints: push b away from a until the
-        // CENTER DISTANCE ≥ min_mm (use 2D distance; fall back to x-axis push).
         for ap in &intent.apart {
             let (ia, ib) = (
                 solved.iter().position(|s| s.reference == ap.a),
                 solved.iter().position(|s| s.reference == ap.b),
             );
             if let (Some(ia), Some(ib)) = (ia, ib) {
-                let d = ((solved[ib].x - solved[ia].x).powi(2)
-                    + (solved[ib].y - solved[ia].y).powi(2))
-                    .sqrt();
+                let d = ((solved[ib].x - solved[ia].x).powi(2) + (solved[ib].y - solved[ia].y).powi(2)).sqrt();
                 if d < ap.min_mm {
-                    // Push b along the a→b direction to exactly min_mm
                     let dx = solved[ib].x - solved[ia].x;
                     let dy = solved[ib].y - solved[ia].y;
                     if dx.abs() > 1e-9 || dy.abs() > 1e-9 {
@@ -280,25 +501,17 @@ impl Placer {
                         solved[ib].x = solved[ia].x + dx * scale;
                         solved[ib].y = solved[ia].y + dy * scale;
                     } else {
-                        // coincident: push along +x deterministically
                         solved[ib].x = solved[ia].x + ap.min_mm;
                     }
                 }
             }
         }
 
-        // 6. Clamp all inside the outline with margin
-        // Clamp inside the outline with a small mounting margin (1 mm),
-        // NOT the packing pitch — semantic edge positions are legitimate.
-        // 2.5mm keeps every pad ≥1.75mm off the edge — inside KiCad's
-        // 0.5mm default edge clearance with the pad half-width included
-        // (1.0mm margin left pads at 0.25mm; live-verified violations).
         let margin = 2.5;
         for s in &mut solved {
             s.x = s.x.clamp(margin, (self.board_w - margin).max(margin));
             s.y = s.y.clamp(margin, (self.board_h - margin).max(margin));
         }
-
         solved
     }
 
@@ -310,32 +523,20 @@ impl Placer {
             (self.board_h / 2.0 / self.pitch).floor() * self.pitch,
         );
         let mut cells = vec![(cx, cy)];
-        // Walk concentric square rings, clockwise from top-left, ring by ring
         let mut ring: i32 = 1;
         while cells.len() < n {
             let step = self.pitch;
-            // ring corners and edges: perimeter walk of the square at radius ring
             let r = ring as f64;
             let (left, right) = (cx - r * step, cx + r * step);
             let (top, bottom) = (cy - r * step, cy + r * step);
-            // top edge (left→right), right edge (top→bottom),
-            // bottom edge (right→left), left edge (bottom→top)
-            let k = ring as usize; // cells per side
-            for i in 0..k {
-                cells.push((left + i as f64 * step, top)); // top
-            }
-            for i in 0..k {
-                cells.push((right, top + i as f64 * step)); // right
-            }
-            for i in 0..k {
-                cells.push((right - i as f64 * step, bottom)); // bottom
-            }
-            for i in 0..k {
-                cells.push((left, bottom - i as f64 * step)); // left
-            }
+            let k = ring as usize;
+            for i in 0..k { cells.push((left + i as f64 * step, top)); }
+            for i in 0..k { cells.push((right, top + i as f64 * step)); }
+            for i in 0..k { cells.push((right - i as f64 * step, bottom)); }
+            for i in 0..k { cells.push((left, bottom - i as f64 * step)); }
             ring += 1;
             if ring > 64 {
-                break; // safety bound
+                break;
             }
         }
         cells.truncate(n);
@@ -369,6 +570,7 @@ mod tests {
     #[test]
     fn pos_parse_roundtrip() {
         assert_eq!(Pos::parse("top_left"), Some(Pos::TopLeft));
+        assert_eq!(Pos::parse("left_edge"), Some(Pos::LeftEdge));
         assert_eq!(Pos::parse("nonsense"), None);
     }
 
@@ -378,12 +580,7 @@ mod tests {
         let nl = netlist_2comp(&b);
         let p = Placer::new(100.0, 80.0);
         let intent = PlacementIntent {
-            places: vec![PlaceIntent {
-                reference: "R1".into(),
-                pos: Pos::parse("top_left"),
-                rot: None,
-                side_back: false,
-            }],
+            places: vec![PlaceIntent { reference: "R1".into(), pos: Pos::parse("top_left"), rot: None, side_back: false }],
             ..Default::default()
         };
         let solved = p.arrange(&b, &nl, &intent);
@@ -399,7 +596,6 @@ mod tests {
         let p = Placer::new(100.0, 80.0);
         let solved = p.arrange(&b, &nl, &PlacementIntent::default());
         assert_eq!(solved.len(), 2);
-        // Everything inside the board
         for s in &solved {
             assert!(s.x > 0.0 && s.x < 100.0 && s.y > 0.0 && s.y < 80.0, "outside: {:?}", s);
         }
@@ -418,8 +614,7 @@ mod tests {
         let r1 = solved.iter().find(|s| s.reference == "R1").unwrap();
         let r2 = solved.iter().find(|s| s.reference == "R2").unwrap();
         let d = ((r2.x - r1.x).powi(2) + (r2.y - r1.y).powi(2)).sqrt();
-        assert!(d >= 15.0 - 1e-9,
-            "apart violated: R1=({}, {}) R2=({}, {}) d={}", r1.x, r1.y, r2.x, r2.y, d);
+        assert!(d >= 15.0 - 1e-9, "apart violated: d={}", d);
     }
 
     #[test]
@@ -430,5 +625,60 @@ mod tests {
         let i1 = p.arrange(&b, &nl, &PlacementIntent::default());
         let i2 = p.arrange(&b, &nl, &PlacementIntent::default());
         assert_eq!(format!("{:?}", i1), format!("{:?}", i2));
+    }
+
+    /// Courtyard placement: a hub IC with 6 caps and an edge connector.
+    fn board_hub() -> Board {
+        let mut s = String::from("(kicad_pcb (version 20221018)\n");
+        // U1: 10x10 courtyard
+        s.push_str("(footprint \"U\" (layer \"F.Cu\") (at 0 0 0) (fp_text reference \"U1\" (at 0 0))\n");
+        s.push_str(" (fp_rect (start -5 -5) (end 5 5) (layer \"F.CrtYd\"))\n");
+        for i in 1..=6 {
+            s.push_str(&format!(" (pad \"{}\" smd rect (at -4 {}) (size 0.5 0.5) (net {} \"N{}\"))\n", i, i as f64 - 3.5, i, i));
+        }
+        s.push_str(" (pad \"7\" smd rect (at 4 0) (size 0.5 0.5) (net 7 \"BUS\")))\n");
+        for i in 1..=6 {
+            s.push_str(&format!("(footprint \"C\" (layer \"F.Cu\") (at 0 0 0) (fp_text reference \"C{}\" (at 0 0))\n (fp_rect (start -1.5 -0.75) (end 1.5 0.75) (layer \"F.CrtYd\"))\n (pad \"1\" smd rect (at -0.8 0) (size 0.6 0.9) (net {} \"N{}\"))\n (pad \"2\" smd rect (at 0.8 0) (size 0.6 0.9) (net 99 \"GND\")))\n", i, i, i));
+        }
+        s.push_str("(footprint \"J\" (layer \"F.Cu\") (at 0 0 90) (fp_text reference \"J1\" (at 0 0))\n (fp_rect (start -2 -2) (end 2 8) (layer \"F.CrtYd\"))\n (pad \"1\" thru_hole circle (at 0 0) (size 1.7 1.7) (drill 1) (layers \"*.Cu\") (net 7 \"BUS\")))\n");
+        s.push_str(")\n");
+        Board::from_kicad_pcb(&s).unwrap()
+    }
+
+    #[test]
+    fn courtyards_never_overlap_and_caps_hug_their_ic() {
+        let b = board_hub();
+        let nl = Netlist::from_board(&b);
+        let p = Placer::new(40.0, 30.0);
+        let intent = PlacementIntent {
+            places: vec![PlaceIntent { reference: "J1".into(), pos: Pos::parse("left_edge"), rot: None, side_back: false }],
+            ignore_nets: vec!["GND".into()],
+            ..Default::default()
+        };
+        let solved = p.arrange_courtyards(&b, &nl, &intent);
+        assert_eq!(solved.len(), 8);
+        // Apply and check courtyards
+        let mut rects: Vec<(String, (f64, f64, f64, f64))> = Vec::new();
+        for s in &solved {
+            let mut fp = b.footprints.iter().find(|f| f.reference == s.reference).unwrap().clone();
+            fp.translate(s.x - fp.x, s.y - fp.y);
+            let r = fp.abs_bbox();
+            assert!(r.0 >= 0.5 - 1e-9 && r.1 >= 0.5 - 1e-9 && r.2 <= 39.5 + 1e-9 && r.3 <= 29.5 + 1e-9, "{} outside: {:?}", s.reference, r);
+            rects.push((s.reference.clone(), r));
+        }
+        for (i, (ra, a)) in rects.iter().enumerate() {
+            for (rb, bb) in rects.iter().skip(i + 1) {
+                assert!(!overlaps(*a, *bb, 0.0), "{} overlaps {}: {:?} {:?}", ra, rb, a, bb);
+            }
+        }
+        // J1 on the left edge
+        let j1 = rects.iter().find(|r| r.0 == "J1").unwrap();
+        assert!((j1.1 .0 - 0.5).abs() < 1e-6, "J1 flush to the left edge: {:?}", j1.1);
+        // every cap within 8mm of U1's origin
+        let u1 = solved.iter().find(|s| s.reference == "U1").unwrap();
+        for s in solved.iter().filter(|s| s.reference.starts_with('C')) {
+            let d = ((s.x - u1.x).powi(2) + (s.y - u1.y).powi(2)).sqrt();
+            assert!(d < 10.0, "{} is {:.1}mm from U1", s.reference, d);
+        }
     }
 }

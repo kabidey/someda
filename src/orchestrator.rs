@@ -257,8 +257,11 @@ pub fn build(
     });
 
     // ─── Stage 2b: Deterministic placement (skill 102) ───
-    // The LLM never outputs coordinates; the solver owns geometry.
-    println!("─── Stage 2b: Deterministic placement ───");
+    // The LLM never outputs coordinates; the solver owns geometry. The plan
+    // may express INTENT: semantic/edge positions, "near" relations; the
+    // physics adds thermal keep-apart for hot parts.
+    println!("─── Stage 2b: Deterministic placement (real courtyards) ───");
+    let plane_specs = resolve_planes(&plan, &board);
     {
         let nl = crate::netlist::Netlist::from_board(&board);
         let (w, h) = board
@@ -266,20 +269,32 @@ pub fn build(
             .map(|(x0, y0, x1, y1)| (x1 - x0, y1 - y0))
             .unwrap_or((100.0, 80.0));
         let placer = crate::placer::Placer::new(w, h);
-        // PHYSICS-DRIVEN PLACEMENT INTENT: design parameters place the
-        // components — thermal dissipation demands separation between hot
-        // parts (apart ≥15mm for every pair ≥0.5W), and per the directive
-        // the board grows for impedance corridors (handled in the area
-        // budget). The LLM still never emits coordinates.
         let mut intent = crate::placer::PlacementIntent::default();
+        for c in &plan.components {
+            if let Some(pos) = c.position.as_deref() {
+                match crate::placer::Pos::parse(pos) {
+                    Some(p) => intent.places.push(crate::placer::PlaceIntent {
+                        reference: c.reference.clone(),
+                        pos: Some(p),
+                        rot: c.rotation.map(|r| r as i32),
+                        side_back: false,
+                    }),
+                    None => println!("  [warning] {}: unknown position '{}' ignored", c.reference, pos),
+                }
+            }
+            if let Some(anchor) = &c.near {
+                intent.near.push((c.reference.clone(), anchor.clone()));
+            }
+        }
+        for ps in &plane_specs {
+            intent.ignore_nets.push(ps.net.clone());
+        }
         {
             let hot: Vec<&crate::orchestrator::PlannedComponent> = plan
                 .components
                 .iter()
                 .filter(|c| {
-                    let p = c
-                        .power_w
-                        .unwrap_or_else(|| crate::thermal::power_from_value(&c.value));
+                    let p = c.power_w.unwrap_or_else(|| crate::thermal::power_from_value(&c.value));
                     p >= 0.5
                 })
                 .collect();
@@ -293,44 +308,77 @@ pub fn build(
                 }
             }
             if !intent.apart.is_empty() {
-                println!(
-                    "  thermal placement: {} hot pair(s) ≥15mm apart",
-                    intent.apart.len()
-                );
+                println!("  thermal placement: {} hot pair(s) ≥15mm apart", intent.apart.len());
             }
         }
-        let solved = placer.arrange(&board, &nl, &intent);
+        let solved = placer.arrange_courtyards(&board, &nl, &intent);
         for s in &solved {
             if let Some(fp) = board.footprints.iter_mut().find(|f| f.reference == s.reference) {
-                // Move the footprint AND its pads (pads are absolute in the model)
                 let (dx, dy) = (s.x - fp.x, s.y - fp.y);
-                fp.x = s.x;
-                fp.y = s.y;
-                for pad in &mut fp.pads {
-                    pad.x += dx;
-                    pad.y += dy;
+                fp.translate(dx, dy);
+            }
+        }
+        // Courtyard overlap is a DRC error in KiCad: report it here first
+        let mut overlaps = 0;
+        for (i, a) in board.footprints.iter().enumerate() {
+            let ra = a.abs_bbox();
+            for b in board.footprints.iter().skip(i + 1) {
+                let rb = b.abs_bbox();
+                if ra.0 < rb.2 && rb.0 < ra.2 && ra.1 < rb.3 && rb.1 < ra.3 {
+                    overlaps += 1;
+                    println!("  [error] courtyard overlap {} / {}", a.reference, b.reference);
                 }
             }
         }
         stages.push(StageResult {
             stage: "placement".into(),
-            success: true,
-            detail: format!("placed {} footprint(s) deterministically", solved.len()),
+            success: overlaps == 0,
+            detail: format!(
+                "placed {} footprint(s) on {:.0}x{:.0}mm, {} hint(s), {} courtyard overlap(s)",
+                solved.len(), w, h, intent.places.len() + intent.near.len(), overlaps
+            ),
         });
     }
 
-    // ─── Stage 2c: Autorouting (skill 101: SomRoute defaults) ───
-    // Frequency-aware: nets with impedance targets get their width SOLVED
-    // from the microstrip physics on the JLCPCB stackup (the RF path is
-    // 50Ω by construction, not by luck).
-    println!("─── Stage 2c: Autorouting (trace 0.25mm, clearance 0.2mm, via 0.6/0.3; impedance nets solved) ───");
+    // ─── Stage 2c: Autorouting (design rules for this layer count) ───
+    // Planes carry GND/power on inner layers; signals route on the rest.
+    // Impedance nets get their width SOLVED from the stackup physics.
+    let rules = crate::rules::DesignRules::for_layers(board.layer_count);
+    let stackup = crate::materials::Stackup::for_layers(board.layer_count);
+    let plane_layers: Vec<String> = plane_specs.iter().map(|p| p.layer.clone()).collect();
+    let signal_layers: Vec<String> = board
+        .copper_layers()
+        .into_iter()
+        .filter(|l| !plane_layers.contains(l))
+        .collect();
+    for ps in &plane_specs {
+        if let Some((idx, name)) = board.nets.iter().find(|(_, n)| n == &ps.net).cloned() {
+            let (x0, y0, x1, y1) = board.outline_bbox().unwrap_or((0.0, 0.0, 100.0, 80.0));
+            let m = rules.edge_clearance_mm;
+            board.zones.push(crate::board::Zone {
+                net: (idx, name),
+                layer: ps.layer.clone(),
+                polygon: vec![(x0 + m, y0 + m), (x1 - m, y0 + m), (x1 - m, y1 - m), (x0 + m, y1 - m)],
+                clearance: rules.clearance_mm.max(0.2),
+                min_thickness: 0.25,
+            });
+        }
+    }
+    println!(
+        "─── Stage 2c: Autorouting ({} layers: signals on {}, planes {}; trace {}mm, clearance {}mm, via {}/{}mm) ───",
+        board.layer_count,
+        signal_layers.join("/"),
+        if plane_specs.is_empty() { "none".to_string() } else {
+            plane_specs.iter().map(|p| format!("{}={}", p.layer, p.net)).collect::<Vec<_>>().join(" ")
+        },
+        rules.trace_width_mm, rules.clearance_mm, rules.via_diameter_mm, rules.via_drill_mm
+    );
     let route_summary;
     let unrouted_count;
     {
         let nl = crate::netlist::Netlist::from_board(&board);
-        let mut router = crate::router::Router::new(crate::router::RouterConfig::default())
-            .stackup_with(crate::materials::Stackup::default());
-        // Declare impedance targets from the net signals (plan contract)
+        // Power nets (routed as wide traces when not planes)
+        let mut power_nets: Vec<String> = Vec::new();
         for net in &plan.nets {
             let mut member_values: Vec<&str> = Vec::new();
             for pin in &net.pins {
@@ -341,19 +389,43 @@ pub fn build(
                     }
                 }
             }
-            let sig = crate::netfreq::net_signal(
-                &net.name, &member_values, net.freq_hz, net.role.as_deref(),
-            );
+            let sig = crate::netfreq::net_signal(&net.name, &member_values, net.freq_hz, net.role.as_deref());
+            if matches!(sig.role, crate::netfreq::NetRole::Power | crate::netfreq::NetRole::Ground) {
+                power_nets.push(net.name.clone());
+            }
+        }
+        let cfg = crate::router::RouterConfig::from_rules(
+            &rules,
+            signal_layers.clone(),
+            plane_specs.iter().map(|p| p.net.clone()).collect(),
+            power_nets,
+        );
+        let mut router = crate::router::Router::new(cfg).stackup_with(stackup.clone());
+        for net in &plan.nets {
+            let mut member_values: Vec<&str> = Vec::new();
+            for pin in &net.pins {
+                if let Some((refdes, _)) = pin.split_once(':') {
+                    if let Some(c) = plan.components.iter().find(|c| c.reference == refdes) {
+                        member_values.push(&c.value);
+                        member_values.push(&c.lib_id);
+                    }
+                }
+            }
+            let sig = crate::netfreq::net_signal(&net.name, &member_values, net.freq_hz, net.role.as_deref());
             if let Some(z0) = sig.z_target {
                 if sig.needs_impedance_control() {
                     router = router.with_impedance_target(&net.name, z0);
-                    println!("  net {}: {:.0}Ω target → width solved", net.name, z0);
+                    let w = crate::formulas::microstrip_width_for_z0(z0, stackup.er, stackup.h_mm, stackup.copper_thickness_mm);
+                    println!("  net {}: {:.0}Ω target → {:.3}mm on {}", net.name, z0, w, stackup.name);
                 }
             }
         }
         let route = router.route(&board, &nl);
         route_summary = route.summary_line();
         unrouted_count = route.unrouted.len();
+        for u in &route.unrouted {
+            println!("  UNROUTED {} {} → {}: {}", u.net.1, u.from, u.to, u.cause);
+        }
         for seg in &route.segments {
             board.segments.push(crate::board::Segment {
                 start: (seg.x1, seg.y1),
@@ -388,7 +460,6 @@ pub fn build(
     // and thermal junctions — the microwave-stability gate.
     println!("─── Stage 2d: physics audit (frequency / SI / thermal) ───");
     {
-        let stackup = crate::materials::Stackup::default();
         let fab = crate::materials::FabLimits::default();
 
         // Per-net signals: frequency + role from the plan contract
@@ -417,14 +488,14 @@ pub fn build(
         // net's solved width exceeds 1mm, the honest engineering advice is
         // a thin-dielectric stackup (4-layer, ~0.2mm core → ~0.4mm traces).
         {
-            let st = crate::materials::Stackup::default();
+            let st = stackup.clone();
             for (sig, _) in &signals {
                 if let Some(z0) = sig.z_target {
                     if sig.needs_impedance_control() {
                         let w = crate::formulas::microstrip_width_for_z0(
                             z0, st.er, st.h_mm, st.copper_thickness_mm,
                         );
-                        if w > 1.0 {
+                        if w > 1.0 && board.layer_count <= 2 {
                             println!(
                                 "  [info] stackup-counsel {}: {:.0}Ω needs {:.2}mm traces on 1.6mm FR-4 — consider a 4-layer thin-dielectric stackup (~0.2mm core → ~0.4mm traces)",
                                 sig.name, z0, w
@@ -512,17 +583,20 @@ pub fn build(
             detail: format!("{} error(s), {} warning(s)", th_errors, th_warnings),
         });
 
-        // Fab-scope: the routed geometry must fit JLCPCB
-        let via_checks = fab.check_via(0.3, 0.6, stackup.finished_thickness_mm);
-        let trace_checks = fab.check_trace(0.25, 0.2);
-        let fab_ok = via_checks.is_empty() && trace_checks.is_empty();
+        // Fab-scope: the design rules the board was routed with must fit JLCPCB
+        let fab_checks = rules.fab_violations(&fab, stackup.finished_thickness_mm);
+        let fab_ok = fab_checks.is_empty();
         stages.push(StageResult {
             stage: "fab-scope".into(),
             success: fab_ok,
             detail: if fab_ok {
-                "routed geometry fits JLCPCB 4/4mil, 0.15/0.25 via, ±10% impedance scope".into()
+                format!(
+                    "{}: trace {}/{}mm, via {}/{}mm inside JLCPCB {}-layer scope (±10% impedance)",
+                    stackup.name, rules.trace_width_mm, rules.clearance_mm,
+                    rules.via_diameter_mm, rules.via_drill_mm, board.layer_count
+                )
             } else {
-                format!("{:?} {:?}", via_checks, trace_checks)
+                fab_checks.join("; ")
             },
         });
     }
@@ -756,8 +830,64 @@ pub fn build(
     })
 }
 
+/// Which net fills which inner layer. Plan-declared planes win; otherwise
+/// a 4-layer board gets GND on In1.Cu, a 6-layer board GND on In1.Cu and
+/// In4.Cu plus the main power rail on In3.Cu (when such a net exists).
+pub fn resolve_planes(plan: &CircuitPlan, board: &crate::board::Board) -> Vec<PlaneSpec> {
+    if let Some(p) = &plan.planes {
+        return p.clone();
+    }
+    let has = |n: &str| board.nets.iter().any(|(_, name)| name == n);
+    let mut out = Vec::new();
+    if board.layer_count < 4 {
+        return out;
+    }
+    let gnd = ["GND", "GNDD", "AGND", "VSS"].iter().find(|n| has(n)).map(|s| s.to_string());
+    let Some(gnd) = gnd else { return out };
+    out.push(PlaneSpec { net: gnd.clone(), layer: "In1.Cu".into() });
+    if board.layer_count >= 6 {
+        // the busiest power net becomes the In3 plane
+        let mut best: Option<(usize, String)> = None;
+        for net in &plan.nets {
+            let role = crate::netfreq::net_signal(&net.name, &[], net.freq_hz, net.role.as_deref()).role;
+            if matches!(role, crate::netfreq::NetRole::Power) && net.name != gnd {
+                if best.as_ref().map(|b| net.pins.len() > b.0).unwrap_or(true) {
+                    best = Some((net.pins.len(), net.name.clone()));
+                }
+            }
+        }
+        if let Some((_, pwr)) = best {
+            out.push(PlaneSpec { net: pwr, layer: "In3.Cu".into() });
+        }
+        out.push(PlaneSpec { net: gnd, layer: "In4.Cu".into() });
+    }
+    out
+}
+
 /// Validate the plan against the contract (every pin belongs to a component).
 pub fn validate_plan(plan: &CircuitPlan) -> Result<(), OrchestrateError> {
+    if let Some(l) = plan.layers {
+        if l < 2 || l % 2 != 0 || l > 12 {
+            return Err(OrchestrateError::PlanInvalid(format!(
+                "layers must be an even number from 2 to 12, got {}", l
+            )));
+        }
+        if let Some(planes) = &plan.planes {
+            let copper = crate::board::copper_layer_names(l);
+            for p in planes {
+                if !copper.contains(&p.layer) || p.layer == "F.Cu" || p.layer == "B.Cu" {
+                    return Err(OrchestrateError::PlanInvalid(format!(
+                        "plane '{}' on '{}' is not an inner copper layer of a {}-layer board", p.net, p.layer, l
+                    )));
+                }
+                if !plan.nets.iter().any(|n| n.name == p.net) {
+                    return Err(OrchestrateError::PlanInvalid(format!("plane net '{}' is not a plan net", p.net)));
+                }
+            }
+        }
+    } else if plan.planes.is_some() {
+        return Err(OrchestrateError::PlanInvalid("planes need an explicit layers count (4 or 6)".into()));
+    }
     if plan.components.is_empty() {
         return Err(OrchestrateError::PlanInvalid("no components in plan".into()));
     }
