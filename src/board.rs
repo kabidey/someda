@@ -148,6 +148,10 @@ pub struct Footprint {
     pub courtyard: Option<(f64, f64, f64, f64)>,
     /// Keep-out areas (absolute) the router must honour
     pub keepouts: Vec<Keepout>,
+    /// Where the reference designator text goes: (x, y) relative to the
+    /// origin in the footprint frame, and the layer ("F.SilkS" or "F.Fab").
+    /// None = the library's own position.
+    pub ref_text: Option<(f64, f64, String)>,
     /// The library definition this footprint was instantiated from, if
     /// any. The writer re-emits it verbatim (with placement, reference
     /// and pad nets injected) so silkscreen, fab and 3D data survive.
@@ -633,6 +637,14 @@ fn emit_library_footprint(fp: &Footprint) -> String {
                     Some("Reference") => {
                         parts[2] = Sexp::Str(fp.reference.clone());
                         saw_reference = true;
+                        if let Some((rx, ry, layer)) = &fp.ref_text {
+                            // text angle is absolute like pads: keep it upright
+                            // for 0/180 parts, along the part for 90/270
+                            let ang = if (fp.rotation % 180.0).abs() < 1e-6 { 0.0 } else { 90.0 };
+                            parts.retain(|q| q.as_tagged("at").is_none() && q.as_tagged("layer").is_none() && q.as_tagged("hide").is_none());
+                            parts.insert(3, Sexp::List(vec![Sexp::Atom("at".into()), Sexp::Atom(format!("{:.3}", rx)), Sexp::Atom(format!("{:.3}", ry)), Sexp::Atom(trim_angle(ang))]));
+                            parts.insert(4, Sexp::List(vec![Sexp::Atom("layer".into()), Sexp::Str(layer.clone())]));
+                        }
                     }
                     Some("Value") => parts[2] = Sexp::Str(fp.value.clone()),
                     _ => {}
@@ -884,6 +896,7 @@ fn parse_footprint(item: &Sexp, nets: &[(usize, String)]) -> Option<Footprint> {
         rotation,
         pads,
         courtyard: lib.courtyard,
+        ref_text: None,
         // Board-file zone polygons are already absolute
         keepouts: lib
             .keepouts

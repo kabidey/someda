@@ -16,10 +16,43 @@
 //!
 //! Units: mm, ps, GHz, mΩ, nH, pF unless a function name says otherwise.
 
-/// Skill 101/082: microstrip impedance.
-/// Z₀ = (87/√(Er+1.41))·ln(5.98h/(0.8w+t)) — the skill's verbatim formula.
+/// Microstrip impedance, Hammerstad–Jensen (1980) with the finite-thickness
+/// correction — the closed form used by field-solver-calibrated calculators.
+/// Valid over the whole w/h range. (The skill's verbatim
+/// `87/√(εr+1.41)·ln(5.98h/(0.8w+t))` is the IPC-2141 narrow-trace form,
+/// only valid for 0.1 < w/h < 2: on a 0.1 mm prepreg it returned a NEGATIVE
+/// Z₀ for a 1 mm trace and solved the 50 Ω width 15 % narrow —
+/// cross-checked 2026-10-19 against an independent implementation.)
 pub fn microstrip_z0(er: f64, h_mm: f64, w_mm: f64, t_mm: f64) -> f64 {
-    (87.0 / (er + 1.41).sqrt()) * (5.98 * h_mm / (0.8 * w_mm + t_mm)).ln()
+    if w_mm <= 0.0 || h_mm <= 0.0 || er < 1.0 {
+        return f64::NAN;
+    }
+    let mut u = w_mm / h_mm;
+    if t_mm > 0.0 {
+        let th = t_mm / h_mm;
+        let coth = 1.0 / (6.517 * u).sqrt().tanh();
+        let du1 = th / std::f64::consts::PI * (1.0 + 4.0 * std::f64::consts::E / (th * coth * coth)).ln();
+        let dur = 0.5 * (1.0 + 1.0 / (er - 1.0).max(0.0).sqrt().cosh()) * du1;
+        u += dur;
+    }
+    let a = 1.0
+        + ((u.powi(4) + (u / 52.0).powi(2)) / (u.powi(4) + 0.432)).ln() / 49.0
+        + (1.0 + (u / 18.1).powi(3)).ln() / 18.7;
+    let b = 0.564 * ((er - 0.9) / (er + 3.0)).powf(0.053);
+    let er_eff = (er + 1.0) / 2.0 + (er - 1.0) / 2.0 * (1.0 + 10.0 / u).powf(-a * b);
+    let f = 6.0 + (2.0 * std::f64::consts::PI - 6.0) * (-(30.666 / u).powf(0.7528)).exp();
+    let z0_air = 60.0 * (f / u + (1.0 + (2.0 / u).powi(2)).sqrt()).ln();
+    z0_air / er_eff.sqrt()
+}
+
+/// Effective dielectric constant of the same microstrip (Hammerstad–Jensen).
+pub fn microstrip_er_eff(er: f64, h_mm: f64, w_mm: f64) -> f64 {
+    let u = w_mm / h_mm;
+    let a = 1.0
+        + ((u.powi(4) + (u / 52.0).powi(2)) / (u.powi(4) + 0.432)).ln() / 49.0
+        + (1.0 + (u / 18.1).powi(3)).ln() / 18.7;
+    let b = 0.564 * ((er - 0.9) / (er + 3.0)).powf(0.053);
+    (er + 1.0) / 2.0 + (er - 1.0) / 2.0 * (1.0 + 10.0 / u).powf(-a * b)
 }
 
 /// Solve microstrip width for a target Z₀ (skill 082: "solve for w given
@@ -45,8 +78,10 @@ pub fn microstrip_width_for_z0(
     (lo + hi) / 2.0
 }
 
-/// Skill 101/077: IPC-2152 current capacity.
-/// I = 0.048 × ΔT^0.44 × A^0.725 (A in mils², ΔT in °C) — verbatim.
+/// External-trace current capacity. The equation is IPC-2221's
+/// `I = 0.048 × ΔT^0.44 × A^0.725` (A in mils², ΔT in °C), which the skill
+/// labels IPC-2152. IPC-2152's charts give roughly 10–30 % LESS current for
+/// thin outer traces, so treat this as an upper bound and derate.
 pub fn ipc2152_current(delta_t_c: f64, width_mils: f64, thickness_mils: f64) -> f64 {
     let area_mils2 = width_mils * thickness_mils;
     0.048 * delta_t_c.powf(0.44) * area_mils2.powf(0.725)
@@ -115,10 +150,13 @@ pub fn ground_bounce_v(l_loop_nh: f64, di_a: f64, dt_ns: f64) -> f64 {
     l_loop_nh * di_a / dt_ns
 }
 
-/// Skill 002/081: via pair loop inductance L_loop ≈ 2×h×ln(2s/d) (nH, mm).
+/// Via pair loop inductance: two parallel vias of diameter d, spacing s,
+/// height h form a loop with L ≈ (μ₀/π)·h·ln(2s/d) = 0.4 nH/mm × h × ln(2s/d).
+/// (The skill's `2·h·ln(2s/d)` is that expression with the wrong constant:
+/// 5× too high — cross-checked 2026-10-19 against the parallel-wire
+/// inductance formula; 1.6 mm board, 1 mm spacing, 0.3 mm vias → 1.2 nH.)
 pub fn via_pair_loop_nh(h_mm: f64, s_mm: f64, d_mm: f64) -> f64 {
-    // The skill formula as stated; h = via height, s = spacing, d = diameter.
-    2.0 * h_mm * (2.0 * s_mm / d_mm).ln()
+    0.4 * h_mm * (2.0 * s_mm / d_mm).ln()
 }
 
 /// Skill 014 (Ansys): thermal resistance chain θ_JA = θ_JC + θ_CS + θ_SA.
@@ -138,7 +176,9 @@ pub fn thermal_via_count(pad_area_mm2: f64) -> usize {
 }
 
 /// Skill 025 (AMD/Xilinx): PDN impedance target.
-/// Z_target = V_ripple_max / (0.5 × I_transient_max).
+/// Z_target = V_ripple_max / (0.5 × I_transient_max) — the vendor convention
+/// that the transient step is half the maximum current. Pass the real
+/// transient current and divide by 1 if you measured it.
 pub fn pdn_target_ohms(v_ripple_max: f64, i_transient_max: f64) -> f64 {
     v_ripple_max / (0.5 * i_transient_max)
 }
@@ -314,14 +354,26 @@ mod tests {
         assert!((i - 0.97).abs() / 0.97 < 0.10, "within 10% of skill prose");
     }
 
-    /// Skill 082: Er=4.3, h=0.127mm, t=0.035mm, target Z0=50Ω → w ≈ 0.18mm.
+    /// Reference values from an independent Hammerstad–Jensen implementation
+    /// (Python, 2026-10-19): 2-layer 1.6 mm FR-4 (h 1.53, εr 4.5, 1 oz) →
+    /// 50 Ω at 2.838 mm; JLCPCB 6-layer 3313 (h 0.0994, εr 4.1) → 0.175 mm;
+    /// JLCPCB 4-layer 7628 (h 0.2104, εr 4.4) → 0.373 mm. A 1 mm trace on
+    /// the 6-layer prepreg is ~15 Ω, never negative.
     #[test]
-    fn microstrip_width_matches_skill_example() {
-        let w = microstrip_width_for_z0(50.0, 4.3, 0.127, 0.035);
-        assert!((w - 0.18).abs() < 0.03, "skill example: w≈0.18mm, got {:.3}", w);
+    fn microstrip_matches_independent_reference() {
+        let w2 = microstrip_width_for_z0(50.0, 4.5, 1.53, 0.035);
+        assert!((w2 - 2.838).abs() < 0.03, "2-layer 50Ω width {:.4}", w2);
+        let w6 = microstrip_width_for_z0(50.0, 4.1, 0.0994, 0.035);
+        assert!((w6 - 0.175).abs() < 0.005, "6-layer 50Ω width {:.4}", w6);
+        let w4 = microstrip_width_for_z0(50.0, 4.4, 0.2104, 0.035);
+        assert!((w4 - 0.373).abs() < 0.006, "4-layer 50Ω width {:.4}", w4);
+        let z = microstrip_z0(4.1, 0.0994, 1.0, 0.035);
+        assert!(z > 13.0 && z < 17.0, "1mm trace on 0.1mm prepreg ≈ 15Ω, got {:.2}", z);
+        let z = microstrip_z0(4.5, 1.53, 0.25, 0.035);
+        assert!((z - 129.3).abs() < 2.0, "0.25mm on 1.6mm FR-4 ≈ 129Ω, got {:.2}", z);
         // Round-trip: the width must produce the target impedance
-        let z = microstrip_z0(4.3, 0.127, w, 0.035);
-        assert!((z - 50.0).abs() < 1.0, "round-trip Z0: {:.2}", z);
+        let z = microstrip_z0(4.3, 0.127, microstrip_width_for_z0(50.0, 4.3, 0.127, 0.035), 0.035);
+        assert!((z - 50.0).abs() < 0.5, "round-trip Z0: {:.2}", z);
     }
 
     /// Skill 082/088: f=5 GHz, Er_eff=3.5 → λ=32 mm, max stub 1.6 mm.
@@ -437,11 +489,13 @@ mod tests {
         assert!(length_match_budget_mm("UNKNOWN").is_none());
     }
 
-    /// Skill 002/081: via loop inductance grows with height and spacing.
+    /// Via loop inductance against the parallel-wire formula (μ₀/π)·h·ln(2s/d):
+    /// 1.6 mm board, 1.0 mm spacing, 0.3 mm vias → 1.21 nH.
     #[test]
-    fn via_loop_inductance_positive() {
-        let l = via_pair_loop_nh(1.6, 2.0, 0.3);
-        assert!(l > 0.0, "via loop L must be positive, got {}", l);
+    fn via_loop_inductance_matches_reference() {
+        let l = via_pair_loop_nh(1.6, 1.0, 0.3);
+        assert!((l - 1.214).abs() < 0.02, "expected 1.21 nH, got {:.3}", l);
+        assert!(via_pair_loop_nh(1.6, 2.0, 0.3) > l, "grows with spacing");
     }
 
     /// Skill 101: congestion — overlapping nets raise the metric.

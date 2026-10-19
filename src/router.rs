@@ -76,6 +76,8 @@ pub struct RouteResult {
     pub fanouts: usize,
     /// Fine-pitch signal pads given a pre-assigned escape via
     pub escapes: usize,
+    /// Escape vias no route used (left in place; harmless)
+    pub escapes_unused: usize,
 }
 
 impl RouteResult {
@@ -95,7 +97,7 @@ impl RouteResult {
             s.push_str(&format!(", {} plane fanouts", self.fanouts));
         }
         if self.escapes > 0 {
-            s.push_str(&format!(", {} escape vias", self.escapes));
+            s.push_str(&format!(", {} escape vias ({} unused)", self.escapes, self.escapes_unused));
         }
         s
     }
@@ -459,8 +461,7 @@ impl Router {
     /// the stackup (clamped to the fab scope); power → power width; else default.
     fn width_for_net(&self, net: &str) -> f64 {
         if let Some(z0) = self.impedance_targets.get(net) {
-            let s = &self.stackup;
-            let w = crate::formulas::microstrip_width_for_z0(*z0, s.er, s.h_mm, s.copper_thickness_mm);
+            let w = self.stackup.width_for_z0(*z0);
             let fab_min = crate::materials::FabLimits::default().min_trace_mm;
             return w.clamp(fab_min.max(self.config.trace_width), 3.0);
         }
@@ -872,6 +873,27 @@ impl Router {
             }
         }
 
+        // Escape vias that routing did not use stay in place: a via with
+        // copper on one layer is electrically harmless (KiCad notes it as
+        // via_dangling, a warning). Removing them after the fact broke
+        // connections whose routes started on the via body — live-verified.
+        let unused_escapes = {
+            let mut used: std::collections::HashSet<(i32, i32, u8)> = std::collections::HashSet::new();
+            for r in &state.routed {
+                for c in &r.cells {
+                    used.insert((c.x, c.y, c.layer));
+                }
+            }
+            let vr = self.copper_cells(self.config.via_size) + 1;
+            state.escapes.iter().filter(|e| {
+                let stub_layer = e.cells.first().map(|c| c.layer).unwrap_or(0);
+                !e.via.map(|(vx, vy)| (0..nlayers as u8).any(|l| l != stub_layer && (-vr..=vr).any(|dx| (-vr..=vr).any(|dy| used.contains(&(vx + dx, vy + dy, l)))))).unwrap_or(false)
+            }).count()
+        };
+        if std::env::var("SOMEDA_ROUTE_DEBUG").is_ok() {
+            eprintln!("route-debug: {} of {} escape vias unused by routing (kept)", unused_escapes, state.escapes.len());
+        }
+
         // ─── Emit ───
         let mut result = RouteResult::default();
         result.total_edges = edges.len();
@@ -908,6 +930,7 @@ impl Router {
             }
             result.escapes += 1;
         }
+        result.escapes_unused = unused_escapes;
         for &k in &state.failed {
             let (_, e, _, _, nid) = edges[k];
             result.unrouted.push(UnroutedNet {

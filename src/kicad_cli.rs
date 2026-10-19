@@ -57,10 +57,29 @@ impl DrcSummary {
         s
     }
 
-    /// Clean = no error-severity findings and no unconnected items.
-    /// Warnings (including missing-library notes) are reported, not failed.
+    /// Finding codes a fab would act on even though KiCad rates them as
+    /// warnings by default: silk on pads or over the edge (the fab clips or
+    /// rejects it), touching courtyards, keep-out violations, copper necks.
+    pub const FAB_BLOCKING: &'static [&'static str] = &[
+        "silk_over_copper",
+        "silk_overlap",
+        "silk_edge_clearance",
+        "courtyards_overlap",
+        "items_not_allowed",
+        "connection_width",
+        "solder_mask_bridge",
+    ];
+
+    /// Count of findings whose code is fab-blocking regardless of severity.
+    pub fn fab_blocking(&self) -> usize {
+        self.by_code.iter().filter(|(c, _)| Self::FAB_BLOCKING.contains(&c.as_str())).map(|(_, n)| *n).sum()
+    }
+
+    /// Clean = no error-severity findings, no unconnected items, and no
+    /// fab-blocking findings. Other warnings (missing-library notes) are
+    /// reported, not failed.
     pub fn is_clean(&self) -> bool {
-        self.errors == 0 && self.unconnected == 0
+        self.errors == 0 && self.unconnected == 0 && self.fab_blocking() == 0
     }
 }
 
@@ -68,8 +87,8 @@ impl std::fmt::Display for DrcSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} error(s), {} warning(s), {} unconnected",
-            self.errors, self.warnings, self.unconnected
+            "{} error(s), {} warning(s), {} unconnected, {} fab-blocking",
+            self.errors, self.warnings, self.unconnected, self.fab_blocking()
         )?;
         let real: Vec<String> = self
             .by_code
@@ -233,8 +252,11 @@ impl KiCadCli {
             layers.push(l.to_string());
         }
         let list = layers.join(",");
+        // --subtract-soldermask: silkscreen is clipped at every mask
+        // opening, so no legend can print on a pad (JLCPCB does the same
+        // in its DFM; doing it here keeps the Gerbers honest).
         self.run(&[
-            "pcb", "export", "gerbers", "--check-zones", "--layers", &list,
+            "pcb", "export", "gerbers", "--check-zones", "--subtract-soldermask", "--layers", &list,
             "--output", output_dir, pcb_file,
         ])
     }
@@ -326,6 +348,15 @@ mod tests {
         let s = DrcSummary::parse(text);
         assert!(s.is_clean());
         assert_eq!(s.warnings, 1);
+    }
+
+    #[test]
+    fn silk_on_pads_is_not_clean_even_as_warning() {
+        let text = "** Found 1 DRC violations **\n[silk_over_copper]: Silkscreen clipped by solder mask\n    Rule: board setup; warning\n    @(1 mm, 1 mm): Reference field of C1\n\n** Found 0 unconnected pads **\n";
+        let s = DrcSummary::parse(text);
+        assert_eq!(s.errors, 0);
+        assert_eq!(s.fab_blocking(), 1);
+        assert!(!s.is_clean(), "silk over a pad must fail the gate");
     }
 
     #[test]

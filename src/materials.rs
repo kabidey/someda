@@ -187,9 +187,29 @@ pub struct Stackup {
     pub copper_thickness_mm: f64,
     pub mask_er: f64,
     pub mask_thickness_mm: f64,
+    /// The fab's own 50 Ω single-ended outer-layer width for this stackup,
+    /// when published: a field solver with solder mask and plating, which
+    /// the bare closed form does not model. None = use the closed form.
+    pub fab_50ohm_width_mm: Option<f64>,
+    /// Where that number comes from.
+    pub fab_width_source: &'static str,
 }
 
 impl Stackup {
+    /// Outer-layer microstrip width for a Z₀ target on this stackup. The
+    /// fab-calibrated 50 Ω width wins when known (scaled by the closed-form
+    /// ratio for other targets); otherwise Hammerstad–Jensen.
+    pub fn width_for_z0(&self, z0: f64) -> f64 {
+        let closed = crate::formulas::microstrip_width_for_z0(z0, self.er, self.h_mm, self.copper_thickness_mm);
+        match self.fab_50ohm_width_mm {
+            Some(w50) => {
+                let closed50 = crate::formulas::microstrip_width_for_z0(50.0, self.er, self.h_mm, self.copper_thickness_mm);
+                w50 * closed / closed50
+            }
+            None => closed,
+        }
+    }
+
     /// The JLCPCB preset for a copper layer count: 2 (1.6mm FR-4),
     /// 4 (JLC04161H-7628) or 6 (JLC06161H-3313). Other counts fall back to
     /// the 6-layer outer-prepreg physics.
@@ -210,6 +230,8 @@ impl Stackup {
                 copper_thickness_mm: 0.035,
                 mask_er: ER_SOLDERMASK,
                 mask_thickness_mm: 0.0254,
+                fab_50ohm_width_mm: None,
+                fab_width_source: "closed form (no published JLCPCB 7628 width verified)",
             },
             _ => Stackup {
                 name: "JLC06161H-3313",
@@ -220,6 +242,12 @@ impl Stackup {
                 copper_thickness_mm: 0.035,
                 mask_er: ER_SOLDERMASK,
                 mask_thickness_mm: 0.0254,
+                // JLCPCB impedance calculator, 50 Ω single-ended on L1 over
+                // L2 for the JLC06161-3313B stackup as reported on
+                // forum.kicad.info/t/69673 (not re-run against the calculator
+                // here); the bare Hammerstad–Jensen form gives 0.175 mm
+                fab_50ohm_width_mm: Some(0.1425),
+                fab_width_source: "JLCPCB impedance calculator via forum.kicad.info/t/69673 (JLC06161-3313B)",
             },
         }
     }
@@ -242,6 +270,8 @@ impl Default for Stackup {
             copper_thickness_mm: 0.035, // 1 oz
             mask_er: ER_SOLDERMASK,
             mask_thickness_mm: 0.0254, // ~1 mil over traces
+            fab_50ohm_width_mm: None,
+            fab_width_source: "closed form (Hammerstad–Jensen)",
         }
     }
 }
@@ -312,9 +342,11 @@ mod tests {
         let s6 = Stackup::for_layers(6);
         assert_eq!(s6.name, "JLC06161H-3313");
         assert!((s6.h_mm - 0.0994).abs() < 1e-9 && (s6.er - 4.1).abs() < 1e-9);
-        // 50Ω on the 6-layer outer prepreg solves to a routable ~0.15mm trace
+        // 50Ω on the 6-layer outer prepreg: fab-calibrated 0.1425mm; closed form ~0.175mm
+        assert!((s6.width_for_z0(50.0) - 0.1425).abs() < 1e-9);
         let w = crate::formulas::microstrip_width_for_z0(50.0, s6.er, s6.h_mm, s6.copper_thickness_mm);
-        assert!(w > 0.10 && w < 0.25, "6-layer 50Ω width {:.3}mm", w);
+        assert!(w > 0.16 && w < 0.19, "6-layer closed-form 50Ω width {:.3}mm", w);
+        assert!(s4.width_for_z0(50.0) > 0.35 && s4.width_for_z0(50.0) < 0.39);
     }
 
     #[test]
@@ -322,6 +354,9 @@ mod tests {
         let s = Stackup::default();
         assert!((s.finished_thickness_mm - 1.6).abs() < 1e-9);
         assert!((s.h_mm - 1.53).abs() < 1e-9, "h = full 1.53mm core for 2-layer");
+        // 50Ω on this stackup solves to ~2.84mm (Hammerstad–Jensen); JLCPCB quotes ~2.9mm
+        let w = crate::formulas::microstrip_width_for_z0(50.0, s.er, s.h_mm, s.copper_thickness_mm);
+        assert!(w > 2.7 && w < 3.0, "2-layer 50Ω width {:.3}", w);
         assert!((s.copper_thickness_mm - 0.035).abs() < 1e-9, "1 oz");
     }
 }

@@ -163,6 +163,7 @@ impl LibFootprint {
             pads,
             courtyard: self.courtyard,
             keepouts,
+            ref_text: None,
             source: Some(sexp),
         }
     }
