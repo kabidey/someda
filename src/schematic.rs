@@ -128,9 +128,15 @@ impl Schematic {
 
     /// Absolute position of a pin on a placed instance.
     pub fn pin_absolute(&self, inst: &Instance, pin: &LibPin) -> (f64, f64) {
+        // KiCad renders lib-symbol pins with an inverted Y: a pin stored at
+        // (px, py) in the sub-symbol appears at instance origin + (px, −py)
+        // (live-verified: wires targeting the rendered position connected in
+        // KiCad while our unmirrored ERC saw every pin floating).
         let r = inst.rot_deg.to_radians();
-        let ox = pin.x * r.cos() - pin.y * r.sin();
-        let oy = pin.x * r.sin() + pin.y * r.cos();
+        let mx = pin.x;
+        let my = -pin.y;
+        let ox = mx * r.cos() - my * r.sin();
+        let oy = mx * r.sin() + my * r.cos();
         (inst.x + ox, inst.y + oy)
     }
 

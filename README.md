@@ -111,3 +111,19 @@ kicad-cli pcb export gerbers → fab/circuit-F_Cu.gtl (routed copper), .drl, .gb
 
 KiCad's own DRC drove two router fixes (grid must encode fab geometry; Manhattan-only
 moves) — the honest-done loop working exactly as the skills demand.
+
+## v0.5.0 — The Physics-Aware Design Harness
+
+The design now carries physics end to end, per the harness directive:
+
+| Module | What it does |
+|--------|--------------|
+| `netfreq.rs` | Every NET knows its frequency: declared in the plan (freq_hz/role), derived from component specs ("2.4GHz", "NE555", "74HC00"), or classified by name (power=DC, clock, RF, high-speed). Transmission-line and 3W/5W decisions read this. |
+| `materials.rs` | JLCPCB's actual materials and scope (fetched 2026-10-19): FR-4 Er 4.5, 7628/3313/2116 prepregs, soldermask Er 3.8, 4/4mil min, 0.15/0.25 vias, ±10% impedance — the fab contract every design is checked against. |
+| `si.rs` | Microwave stability on the ROUTED board: stray L and C measured per net from actual geometry (trace L/C per mm, 0.5nH vias, pad C), SWR from Z0 mismatch vs target, λ/20 stub resonance, net LC self-resonance (oscillation risk), crosstalk parallel-run analysis. |
+| `thermal.rs` | Power dissipation parsed per component; θJA package classes; junction temps vs limits; thermal via budgets; copper balance; thermal-aware area claims. |
+| Router upgrades | Impedance-controlled nets route at width SOLVED from the microstrip equation on the JLCPCB stackup (50Ω → 1.44mm on 1.6mm FR-4); impedance nets route first; neck-down near fine-pitch pads; width-aware pad clearance; stackup counsel when the solved width says "use a thinner dielectric". |
+
+Live-verified with an RF fixture (2.4GHz path + 555): the harness flagged the
+naive board's SWR 2.16 at default width, then the router solved the RF trace
+to 50Ω and KiCad DRC passed clean. The honest-done loop applied to physics.

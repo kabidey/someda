@@ -25,6 +25,7 @@ pub struct PlannedComponent {
     /// Reference designator: R1, C1, U1, ...
     pub reference: String,
     /// Component value: "10k", "100nF", "LM358", ...
+    /// May carry explicit power: "0.25W resistor", "3W LED"
     pub value: String,
     /// Symbol library name: "Device:R", "Device:C", ...
     pub lib_id: String,
@@ -33,6 +34,9 @@ pub struct PlannedComponent {
     /// Board placement in mm (optional; the placer assigns if absent)
     pub x_mm: Option<f64>,
     pub y_mm: Option<f64>,
+    /// Power dissipation (W). Optional: parsed from value if absent.
+    #[serde(default)]
+    pub power_w: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +45,15 @@ pub struct PlannedNet {
     pub name: String,
     /// Connected pins as "REF:PIN" strings: ["R1:1", "R2:2"]
     pub pins: Vec<String>,
+    /// Optional: the highest frequency this net carries (Hz). The plan
+    /// declares it when the circuit's intent knows it (e.g. 2.4e9 for RF);
+    /// otherwise it is derived from member component specs.
+    #[serde(default)]
+    pub freq_hz: Option<f64>,
+    /// Optional: the circuit role — power | ground | clock | rf |
+    /// highspeed | analog | digital. Otherwise derived from the name.
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 /// The system prompt for circuit planning. The LLM sees the JSON contract
@@ -52,10 +65,11 @@ Return EXACTLY this JSON structure, no other text:
   "name": "short project name",
   "description": "one-line description",
   "components": [
-    {"reference": "R1", "value": "10k", "lib_id": "Device:R", "footprint": "Resistor_SMD:R_0805_2012Metric", "x_mm": 50, "y_mm": 50}
+    {"reference": "R1", "value": "10k", "lib_id": "Device:R", "footprint": "Resistor_SMD:R_0805_2012Metric", "power_w": 0.25}
   ],
   "nets": [
-    {"name": "VCC", "pins": ["R1:1", "R2:2"]}
+    {"name": "VCC", "pins": ["R1:1", "R2:2"]},
+    {"name": "RF_OUT", "pins": ["U1:3", "J1:1"], "freq_hz": 2400000000, "role": "rf"}
   ]
 }
 
@@ -64,6 +78,9 @@ Rules:
 - Every pin listed in a net must belong to a listed component
 - Every component pin must appear in exactly one net or be deliberately unconnected (omit it)
 - Power nets are named "VCC" and "GND" (use these exact names)
+- Declare each net's "freq_hz" when the circuit's intent knows it (clocks, RF, high-speed interfaces); leave it out when unknown
+- Declare "role" (power|ground|clock|rf|highspeed|analog|digital) when the net name alone is ambiguous
+- Declare "power_w" for components that dissipate noticeably (regulators, power LEDs, resistors in power paths)
 - Include decoupling capacitors (100nF) on every IC's power pins
 - Use standard values: E12 series for resistors, standard capacitor values
 - Place components at reasonable x_mm/y_mm coordinates (0-100mm range)
@@ -120,10 +137,22 @@ pub fn build(
     let mut stages = Vec::new();
 
     // ─── Stage 1: Plan (LLM) ───
-    println!("─── Stage 1: Planning circuit with LLM ───");
-    let raw = gateway
-        .chat_json(PLANNER_SYSTEM_PROMPT, description)
-        .map_err(|e| OrchestrateError::Gateway(e.to_string()))?;
+    println!("─── Stage 1: Planning circuit ───");
+    // SOMEDA_PLAN_FILE: inject a plan for testing the full pipeline offline.
+    // The LLM path and this path converge immediately after — same contract,
+    // same validation, same deterministic execution.
+    let raw = match std::env::var("SOMEDA_PLAN_FILE") {
+        Ok(path) => {
+            println!("  (plan injected from {} — SOMEDA_PLAN_FILE)", path);
+            let text = fs::read_to_string(&path)
+                .map_err(|e| OrchestrateError::Io(format!("read {}: {}", path, e)))?;
+            serde_json::from_str(&text)
+                .map_err(|e| OrchestrateError::PlanInvalid(format!("plan file: {}", e)))?
+        }
+        Err(_) => gateway
+            .chat_json(PLANNER_SYSTEM_PROMPT, description)
+            .map_err(|e| OrchestrateError::Gateway(e.to_string()))?,
+    };
 
     let plan: CircuitPlan = serde_json::from_value(raw)
         .map_err(|e| OrchestrateError::PlanInvalid(format!("LLM output does not match the contract: {}", e)))?;
@@ -197,12 +226,37 @@ pub fn build(
     }
 
     // ─── Stage 2c: Autorouting (skill 101: SomRoute defaults) ───
-    println!("─── Stage 2c: Autorouting (trace 0.25mm, clearance 0.2mm, via 0.6/0.3) ───");
+    // Frequency-aware: nets with impedance targets get their width SOLVED
+    // from the microstrip physics on the JLCPCB stackup (the RF path is
+    // 50Ω by construction, not by luck).
+    println!("─── Stage 2c: Autorouting (trace 0.25mm, clearance 0.2mm, via 0.6/0.3; impedance nets solved) ───");
     let route_summary;
     let unrouted_count;
     {
         let nl = crate::netlist::Netlist::from_board(&board);
-        let router = crate::router::Router::new(crate::router::RouterConfig::default());
+        let mut router = crate::router::Router::new(crate::router::RouterConfig::default())
+            .stackup_with(crate::materials::Stackup::default());
+        // Declare impedance targets from the net signals (plan contract)
+        for net in &plan.nets {
+            let mut member_values: Vec<&str> = Vec::new();
+            for pin in &net.pins {
+                if let Some((refdes, _)) = pin.split_once(':') {
+                    if let Some(c) = plan.components.iter().find(|c| c.reference == refdes) {
+                        member_values.push(&c.value);
+                        member_values.push(&c.lib_id);
+                    }
+                }
+            }
+            let sig = crate::netfreq::net_signal(
+                &net.name, &member_values, net.freq_hz, net.role.as_deref(),
+            );
+            if let Some(z0) = sig.z_target {
+                if sig.needs_impedance_control() {
+                    router = router.with_impedance_target(&net.name, z0);
+                    println!("  net {}: {:.0}Ω target → width solved", net.name, z0);
+                }
+            }
+        }
         let route = router.route(&board, &nl);
         route_summary = route.summary_line();
         unrouted_count = route.unrouted.len();
@@ -230,6 +284,152 @@ pub fn build(
             stage: "route".into(),
             success: route.unrouted.is_empty(),
             detail: route_summary.clone(),
+        });
+    }
+
+    // ─── Stage 2d: physics-aware design audit (freq / SI / thermal) ───
+    // Every net's frequency is known (declared or component-spec); every
+    // component's power too. This stage MEASURES the routed board: stray
+    // L/C per net, SWR vs impedance targets, stub resonance, crosstalk,
+    // and thermal junctions — the microwave-stability gate.
+    println!("─── Stage 2d: physics audit (frequency / SI / thermal) ───");
+    {
+        let stackup = crate::materials::Stackup::default();
+        let fab = crate::materials::FabLimits::default();
+
+        // Per-net signals: frequency + role from the plan contract
+        let mut signals = Vec::new();
+        for net in &plan.nets {
+            let mut member_values: Vec<&str> = Vec::new();
+            for pin in &net.pins {
+                if let Some((refdes, _)) = pin.split_once(':') {
+                    if let Some(c) = plan.components.iter().find(|c| c.reference == refdes) {
+                        member_values.push(&c.value);
+                        member_values.push(&c.lib_id);
+                    }
+                }
+            }
+            let sig = crate::netfreq::net_signal(
+                &net.name,
+                &member_values,
+                net.freq_hz,
+                net.role.as_deref(),
+            );
+            let par = crate::si::measure_stray(&board, &sig);
+            signals.push((sig, par));
+        }
+
+        // Stackup counsel: 50Ω on 1.6mm FR-4 needs ~1.44mm traces — when a
+        // net's solved width exceeds 1mm, the honest engineering advice is
+        // a thin-dielectric stackup (4-layer, ~0.2mm core → ~0.4mm traces).
+        {
+            let st = crate::materials::Stackup::default();
+            for (sig, _) in &signals {
+                if let Some(z0) = sig.z_target {
+                    if sig.needs_impedance_control() {
+                        let w = crate::formulas::microstrip_width_for_z0(
+                            z0, st.er, st.h_mm, st.copper_thickness_mm,
+                        );
+                        if w > 1.0 {
+                            println!(
+                                "  [info] stackup-counsel {}: {:.0}Ω needs {:.2}mm traces on 1.6mm FR-4 — consider a 4-layer thin-dielectric stackup (~0.2mm core → ~0.4mm traces)",
+                                sig.name, z0, w
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Print the per-net frequency table (the awareness itself)
+        for (sig, par) in &signals {
+            println!(
+                "  net {:>8}: {:>9} role={:<10} z_target={:?} len={:.1}mm vias={}",
+                sig.name,
+                if sig.freq_hz >= 1e9 {
+                    format!("{:.1}GHz", sig.freq_hz / 1e9)
+                } else if sig.freq_hz >= 1e6 {
+                    format!("{:.0}MHz", sig.freq_hz / 1e6)
+                } else if sig.freq_hz > 0.0 {
+                    format!("{:.0}kHz", sig.freq_hz / 1e3)
+                } else {
+                    "DC".to_string()
+                },
+                format!("{:?}", sig.role).to_lowercase(),
+                sig.z_target,
+                par.length_mm,
+                par.vias
+            );
+        }
+
+        // SI audit (stray L/C + SWR + stubs + crosstalk)
+        let si = crate::si::audit(&board, &signals, &stackup, &fab);
+        let si_errors = si.findings.iter().filter(|f| f.severity == "error").count();
+        let si_warnings = si.findings.iter().filter(|f| f.severity == "warning").count();
+        for f in &si.findings {
+            println!("  [{}] {} {}: {}", f.severity, f.code, f.net, f.detail);
+        }
+        stages.push(StageResult {
+            stage: "si-audit".into(),
+            success: si_errors == 0,
+            detail: format!(
+                "{} error(s), {} warning(s); stray L/C measured per net",
+                si_errors, si_warnings
+            ),
+        });
+
+        // Thermal audit
+        let profiles: Vec<crate::thermal::ThermalProfile> = plan
+            .components
+            .iter()
+            .map(|c| crate::thermal::ThermalProfile {
+                reference: c.reference.clone(),
+                power_w: c
+                    .power_w
+                    .unwrap_or_else(|| crate::thermal::power_from_value(&c.value)),
+                theta_ja_c_per_w: crate::thermal::package_theta_ja(
+                    c.footprint.as_deref().unwrap_or(""),
+                ),
+                t_j_max_c: 125.0,
+            })
+            .collect();
+        let courtyard: Vec<f64> = plan.components.iter().map(|_| 60.0).collect();
+        let powers: Vec<f64> = profiles.iter().map(|p| p.power_w).collect();
+        let (w, h) = board
+            .outline_bbox()
+            .map(|(x0, y0, x1, y1)| (x1 - x0, y1 - y0))
+            .unwrap_or((100.0, 80.0));
+        let thermal = crate::thermal::audit(
+            &profiles,
+            25.0,
+            &courtyard,
+            w * h,
+            0.5, // copper coverage estimate pre-pour
+            0.5,
+        );
+        let th_errors = thermal.findings.iter().filter(|f| f.severity == "error").count();
+        let th_warnings = thermal.findings.iter().filter(|f| f.severity == "warning").count();
+        for f in &thermal.findings {
+            println!("  [{}] {} {}: {}", f.severity, f.code, f.subject, f.detail);
+        }
+        stages.push(StageResult {
+            stage: "thermal-audit".into(),
+            success: th_errors == 0,
+            detail: format!("{} error(s), {} warning(s)", th_errors, th_warnings),
+        });
+
+        // Fab-scope: the routed geometry must fit JLCPCB
+        let via_checks = fab.check_via(0.3, 0.6, stackup.finished_thickness_mm);
+        let trace_checks = fab.check_trace(0.25, 0.2);
+        let fab_ok = via_checks.is_empty() && trace_checks.is_empty();
+        stages.push(StageResult {
+            stage: "fab-scope".into(),
+            success: fab_ok,
+            detail: if fab_ok {
+                "routed geometry fits JLCPCB 4/4mil, 0.15/0.25 via, ±10% impedance scope".into()
+            } else {
+                format!("{:?} {:?}", via_checks, trace_checks)
+            },
         });
     }
 
@@ -667,11 +867,42 @@ fn parse_pin(pin_ref: &str, plan: &CircuitPlan) -> Option<(f64, f64)> {
 pub fn generate_board_model(plan: &CircuitPlan) -> crate::board::Board {
     let mut board = crate::board::Board::default();
 
-    // Board outline from a fixed hobby-size A100x80 with margin — the
-    // placer owns real placement, the outline follows the area budget
-    // (skill 102: board area = Σ courtyards / target density).
+    // Board outline from the area budget (skill 102) + PHYSICS HEADROOM:
+    // impedance-controlled nets route at solved widths (50Ω on 1.6mm FR-4
+    // is ~1.44mm wide) — each RF/clock corridor claims its width × span so
+    // the board is big enough for wide traces to coexist (live-verified:
+    // two RF nets at 1.44mm + 3.3-cell halos could not fit the 35%-density
+    // board; the router honestly reported 5 unrouted).
     let courtyard_mm2: f64 = plan.components.len() as f64 * 60.0; // ~60mm²/part
-    let area = (courtyard_mm2 / 0.35).max(4000.0); // hobby density 35%
+    let mut area = (courtyard_mm2 / 0.35).max(4000.0); // hobby density 35%
+    // RF/headroom: for every net that needs impedance control, add a
+    // corridor of (solved width + clearance) × estimated span
+    {
+        let stackup = crate::materials::Stackup::default();
+        for net in &plan.nets {
+            let mut member_values: Vec<&str> = Vec::new();
+            for pin in &net.pins {
+                if let Some((refdes, _)) = pin.split_once(':') {
+                    if let Some(c) = plan.components.iter().find(|c| c.reference == refdes) {
+                        member_values.push(&c.value);
+                        member_values.push(&c.lib_id);
+                    }
+                }
+            }
+            let sig = crate::netfreq::net_signal(
+                &net.name, &member_values, net.freq_hz, net.role.as_deref(),
+            );
+            if let Some(z0) = sig.z_target {
+                if sig.needs_impedance_control() {
+                    let w = crate::formulas::microstrip_width_for_z0(
+                        z0, stackup.er, stackup.h_mm, stackup.copper_thickness_mm,
+                    );
+                    // corridor: width+clearance both sides, 60mm typical span
+                    area += (w + 0.4) * 60.0;
+                }
+            }
+        }
+    }
     let w = (area / 0.8).sqrt(); // aspect 0.8
     let h = area / w;
     let (min_x, min_y, max_x, max_y) = (0.0, 0.0, w, h);

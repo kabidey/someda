@@ -183,6 +183,7 @@ fn cmd_ai(args: &[String]) {
         eprintln!("  SOMEDA_BASE_URL / OPENAI_BASE_URL API base URL (default: OpenAI)");
         eprintln!("  SOMEDA_MODEL / OPENAI_MODEL      model name (default: gpt-4o-mini)");
         eprintln!("  SOMEDA_KICAD_CLI                 kicad-cli binary path (default: kicad-cli)");
+        eprintln!("  SOMEDA_PLAN_FILE                 inject a plan JSON offline (build only)");
         eprintln!();
         eprintln!("Works with any OpenAI-compatible API: OpenAI, Azure, vLLM,");
         eprintln!("Ollama (/v1 mode), LM Studio, llama.cpp server, etc.");
@@ -197,20 +198,35 @@ fn cmd_ai(args: &[String]) {
         exit(1);
     };
 
+    let plan_file = std::env::var("SOMEDA_PLAN_FILE").ok();
+
     let gateway = match someda::gateway::Gateway::from_env() {
-        Ok(g) => g,
+        Ok(g) => Some(g),
         Err(e) => {
-            eprintln!("error: {}", e);
-            exit(1);
+            if plan_file.is_none() {
+                eprintln!("error: {} (or set SOMEDA_PLAN_FILE to inject a plan offline)", e);
+                exit(1);
+            }
+            None
         }
     };
 
-    println!("model: {} at {}", gateway.model, gateway.base_url);
+    if let Some(g) = &gateway {
+        println!("model: {} at {}", g.model, g.base_url);
+    }
+    let offline_gateway = someda::gateway::Gateway::offline_placeholder();
 
     match sub {
         "plan" => {
-            // Plan only: print the JSON contract
-            let plan_json = gateway
+            // Plan only: print the JSON contract (needs a real gateway)
+            let g = match &gateway {
+                Some(g) => g,
+                None => {
+                    eprintln!("error: ai plan needs an API key (SOMEDA_PLAN_FILE only applies to build)");
+                    exit(1);
+                }
+            };
+            let plan_json = g
                 .chat_json(someda::orchestrator::PLANNER_SYSTEM_PROMPT, &description)
                 .unwrap_or_else(|e| { eprintln!("error: {}", e); exit(1); });
             println!("{}", serde_json::to_string_pretty(&plan_json).unwrap());
@@ -222,7 +238,8 @@ fn cmd_ai(args: &[String]) {
             let dir = std::path::Path::new(&project_dir);
             let cli = someda::kicad_cli::KiCadCli::new(dir);
 
-            let result = someda::orchestrator::build(&gateway, &cli, dir, &description)
+            let gw = gateway.as_ref().unwrap_or(&offline_gateway);
+            let result = someda::orchestrator::build(gw, &cli, dir, &description)
                 .unwrap_or_else(|e| { eprintln!("error: {}", e); exit(1); });
 
             println!();

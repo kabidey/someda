@@ -24,6 +24,20 @@ pub struct Gateway {
     pub timeout: Duration,
 }
 
+impl Gateway {
+    /// A non-functional gateway for offline plan-injection runs
+    /// (SOMEDA_PLAN_FILE). Any chat call on it fails loudly — it exists
+    /// only so orchestrator::build can take a &Gateway without an API key.
+    pub fn offline_placeholder() -> Gateway {
+        Gateway {
+            base_url: "offline://plan-injection".into(),
+            api_key: String::new(),
+            model: "(plan file)".into(),
+            timeout: Duration::from_secs(1),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum GatewayError {
     NotConfigured(String),

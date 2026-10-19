@@ -148,11 +148,59 @@ impl Ord for Node {
 /// The grid router.
 pub struct Router {
     pub config: RouterConfig,
+    /// Per-net impedance targets (Ω): nets listed here get their trace width
+    /// SOLVED from the microstrip width-for-Z0 equation on the JLCPCB stackup
+    /// — the router routes keeping the physics in mind (live-verified:
+    /// the 0.25mm default gave RF nets Z0≈108Ω vs the 50Ω target, SWR 2.16).
+    pub impedance_targets: std::collections::HashMap<String, f64>,
+    /// Stackup the width solver uses (JLCPCB 1.6mm FR-4, Er 4.5 by default).
+    pub stackup: crate::materials::Stackup,
 }
 
 impl Router {
     pub fn new(config: RouterConfig) -> Router {
-        Router { config }
+        Router {
+            config,
+            impedance_targets: std::collections::HashMap::new(),
+            stackup: crate::materials::Stackup::default(),
+        }
+    }
+
+    /// Set the stackup the width solver uses (chainable).
+    pub fn stackup_with(mut self, s: crate::materials::Stackup) -> Router {
+        self.stackup = s;
+        self
+    }
+
+    /// Declare an impedance-controlled net: the router sizes its traces.
+    pub fn with_impedance_target(
+        mut self,
+        net: &str,
+        z0: f64,
+    ) -> Router {
+        self.impedance_targets.insert(net.to_string(), z0);
+        self
+    }
+
+    /// Solve this net's trace width for its Z0 target on the stackup.
+    /// Falls back to the default width when the solved width violates the
+    /// fab scope (a 50Ω target on 1.6mm FR-4 needs ~2.7mm — wide but in scope).
+    fn width_for_net(&self, net: &str) -> f64 {
+        match self.impedance_targets.get(net) {
+            Some(z0) => {
+                let s = &self.stackup;
+                let w = crate::formulas::microstrip_width_for_z0(
+                    *z0,
+                    s.er,
+                    s.h_mm,
+                    s.copper_thickness_mm,
+                );
+                // Fab-scope guard: JLCPCB min width and a sane upper bound
+                let fab_min = crate::materials::FabLimits::default().min_trace_mm;
+                w.clamp(fab_min, 3.0)
+            }
+            None => self.config.trace_width,
+        }
     }
 
     /// Route every ratsnest edge. Deterministic order: shortest Manhattan
@@ -187,12 +235,19 @@ impl Router {
         // unreachable — live-verified on the 9-part stress board).
         let mut pad_cells: std::collections::HashMap<(i32, i32, bool), usize> =
             std::collections::HashMap::new();
+        // Pad registry for WIDTH-AWARE clearance: a wide (impedance-solved)
+        // trace passing near a foreign pad needs pad_half + trace_half +
+        // clearance of separation — a fixed cell halo cannot express that.
+        // (Live-verified: 1.44mm RF tracks shorted adjacent pads at 0.032mm.)
+        let mut pads: Vec<(f64, f64, f64, usize)> = Vec::new(); // (x, y, half, net)
         for fp in &board.footprints {
             for pad in &fp.pads {
                 if let Some((net_id, _)) = pad.net {
                     let gx = (pad.x / self.config.grid).round() as i32;
                     let gy = (pad.y / self.config.grid).round() as i32;
                     pad_cells.insert((gx, gy, true), net_id);
+                    let half = pad.width.max(pad.height) / 2.0;
+                    pads.push((pad.x, pad.y, half, net_id));
                 }
             }
         }
@@ -251,8 +306,16 @@ impl Router {
                 || name.eq_ignore_ascii_case("+5V")
                 || name.eq_ignore_ascii_case("VBUS")
         };
+        // IMPEDANCE-CONTROLLED NETS FIRST — they are the most width-constrained
+        // (1.44mm traces + halos need room; VCC/GND can always weave later).
+        let is_impedance = |name: &str| self.impedance_targets.contains_key(name);
         let mut edges: Vec<&RatsnestEdge> = netlist.edges.iter().collect();
         edges.sort_by(|a, b| {
+            match (is_impedance(&a.net), is_impedance(&b.net)) {
+                (true, false) => return std::cmp::Ordering::Less,
+                (false, true) => return std::cmp::Ordering::Greater,
+                _ => {}
+            }
             match (is_power(&a.net), is_power(&b.net)) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
@@ -268,7 +331,26 @@ impl Router {
             let net_pair = (nid, edge.net.clone());
             let start = (edge.from_x, edge.from_y);
             let goal = (edge.to_x, edge.to_y);
-            match self.astar(start, goal, nid, &occupied, board_outline) {
+            let mut net_width = self.width_for_net(&edge.net);
+            // NECK-DOWN near fine-pitch pads: a controlled-Z trace wider
+            // than the pad pitch cannot land on the pad without clearing
+            // its neighbor (live-verified: 1.44mm RF trace on 1.27mm-pitch
+            // J1 shorted the adjacent pad). Skill 101 fanout practice: the
+            // final approach uses the narrow width; electrically it is a
+            // stub ≪ λ/4 at these lengths.
+            let near_foreign_pad = |x: f64, y: f64| -> bool {
+                pads.iter().any(|&(px, py, phalf, pnet)| {
+                    pnet != nid
+                        && (x - px).abs() < phalf + net_width
+                        && (y - py).abs() < phalf + net_width
+                })
+            };
+            if near_foreign_pad(edge.from_x, edge.from_y)
+                || near_foreign_pad(edge.to_x, edge.to_y)
+            {
+                net_width = self.config.trace_width;
+            }
+            match self.astar(start, goal, nid, &occupied, board_outline, &pads, net_width) {
                 Some(path) => {
                     let mut prev: Option<Cell> = None;
                     for cell in path {
@@ -305,7 +387,7 @@ impl Router {
                                 y1: p.y as f64 * self.config.grid,
                                 x2: cell.x as f64 * self.config.grid,
                                 y2: cell.y as f64 * self.config.grid,
-                                width: self.config.trace_width,
+                                width: net_width,
                             });
                         }
                         prev = Some(cell);
@@ -314,6 +396,11 @@ impl Router {
                     // occupied (rasterize each segment fully, not just its
                     // endpoints — an endpoint-only stamp let later nets cut
                     // through earlier tracks; live-verified by KiCad DRC).
+                    // WIDTH-AWARE: an impedance-solved trace (e.g. 1.44mm
+                    // for 50Ω on 1.6mm FR-4) spans multiple 0.5mm cells — its
+                    // halo grows with the width so neighbors keep ≥0.2mm
+                    // edge clearance (live-verified: 111 clearance violations
+                    // when wide traces used the single-cell stamp).
                     for seg in result.segments.iter().filter(|s| s.net.0 == nid) {
                         let (x1, y1) = (
                             (seg.x1 / self.config.grid).round() as i32,
@@ -323,7 +410,29 @@ impl Router {
                             (seg.x2 / self.config.grid).round() as i32,
                             (seg.y2 / self.config.grid).round() as i32,
                         );
-                        // Bresenham rasterization (Manhattan segments: axis-aligned)
+                        // Halo radius in cells: SYMMETRIC wide-trace
+                        // separation — the stamp must reserve
+                        // own_half + clearance + foreign_half (the worst
+                        // case of another impedance-solved net passing by).
+                        // own_half-only under-reserved by 0.72mm and wide
+                        // RF pairs touched at 0.06mm (live-verified).
+                        // Halo reservation applies to WIDE traces only.
+                        // Default 0.25mm traces stamp exactly their path cell
+                        // — the v0.4.3 behavior (a halo radius on default
+                        // traces walled the dense stress board: 3 unrouted;
+                        // live-verified bisect). Clearance between default
+                        // tracks is already guaranteed by the 0.5mm grid
+                        // being > 2×(0.125 half-width) + 0.2.
+                        let halo = if seg.width > self.config.trace_width + 1e-9 {
+                            (((seg.width / 2.0
+                                + self.config.clearance
+                                + seg.width / 2.0)
+                                / self.config.grid)
+                                .ceil() as i32)
+                            .max(0)
+                        } else {
+                            0
+                        };
                         let front = seg.layer == "F.Cu";
                         let (dx, dy) = (x2 - x1, y2 - y1);
                         let steps = dx.abs().max(dy.abs());
@@ -333,14 +442,19 @@ impl Router {
                             } else {
                                 (x1, y1 + dy.signum() * i)
                             };
-                            occupied
-                                .entry((cx, cy, front))
-                                .and_modify(|n| {
-                                    if *n != nid {
-                                        *n = usize::MAX;
-                                    }
-                                })
-                                .or_insert(nid);
+                            // Stamp the full width halo across the trace
+                            for hx in -halo..=halo {
+                                for hy in -halo..=halo {
+                                    occupied
+                                            .entry((cx + hx, cy + hy, front))
+                                            .and_modify(|n| {
+                                                if *n != nid {
+                                                    *n = usize::MAX;
+                                                }
+                                            })
+                                            .or_insert(nid);
+                                }
+                            }
                         }
                     }
                     // Via halo: a 0.6mm via pad extends past its cell —
@@ -385,6 +499,7 @@ impl Router {
     }
 
     /// A* between two points; 8-directional moves on F.Cu, via hop to B.Cu.
+    #[allow(clippy::too_many_arguments)]
     fn astar(
         &self,
         start: (f64, f64),
@@ -392,6 +507,8 @@ impl Router {
         net: usize,
         occupied: &std::collections::HashMap<(i32, i32, bool), usize>,
         outline: Option<(f64, f64, f64, f64)>,
+        pads: &[(f64, f64, f64, usize)],
+        trace_width: f64,
     ) -> Option<Vec<Cell>> {
         let snap = |v: f64| (v / self.config.grid).round() as i32;
         let start_cell = Cell {
@@ -407,6 +524,12 @@ impl Router {
 
         // Edge clearance: cells outside the outline minus margin are blocked
         let _edge_cells = self.config.edge_clearance / self.config.grid;
+        // The width-aware pad registry applies ONLY to wide (impedance-solved)
+        // traces: for default 0.25mm traces the pre-stamped pad halos already
+        // govern (live-verified: applying it to 0.25 nets walled the 1.27mm
+        // DIP columns and unrouted N1/N2 on the stress board).
+        let apply_pad_registry = trace_width > self.config.trace_width + 1e-9;
+        let trace_half = trace_width / 2.0;
         let is_free = |c: &Cell| -> bool {
             if let Some((x0, y0, x1, y1)) = outline {
                 let x = c.x as f64 * self.config.grid;
@@ -417,6 +540,19 @@ impl Router {
                     || y > y1 - self.config.edge_clearance
                 {
                     return false;
+                }
+            }
+            // WIDTH-AWARE pad clearance: a wide trace must keep
+            // pad_half + trace_half + clearance from foreign pads
+            let (px, py) = (c.x as f64 * self.config.grid, c.y as f64 * self.config.grid);
+            for &(pad_x, pad_y, pad_half, pad_net) in pads {
+                if apply_pad_registry && pad_net != net {
+                    let dx = (px - pad_x).abs();
+                    let dy = (py - pad_y).abs();
+                    let need = pad_half + trace_half + self.config.clearance;
+                    if dx < need && dy < need {
+                        return false;
+                    }
                 }
             }
             match occupied.get(&(c.x, c.y, c.front)) {

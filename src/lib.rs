@@ -22,3 +22,7 @@ pub mod router;
 pub mod boardplan;
 pub mod bringup;
 pub mod formulas;
+pub mod materials;
+pub mod netfreq;
+pub mod si;
+pub mod thermal;
