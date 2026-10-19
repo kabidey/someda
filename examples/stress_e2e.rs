@@ -12,7 +12,7 @@ fn main() {
     let nl = someda::netlist::Netlist::from_board(&board);
     let (w, h) = board.outline_bbox().map(|(x0,y0,x1,y1)| (x1-x0, y1-y0)).unwrap();
     let placer = someda::placer::Placer::new(w, h);
-    let solved = placer.arrange(&board, &nl, &someda::placer::PlacementIntent::default());
+    let solved = placer.arrange_courtyards(&board, &nl, &someda::placer::PlacementIntent::default());
     for s in &solved {
         if let Some(fp) = board.footprints.iter_mut().find(|f| f.reference == s.reference) {
             let (dx, dy) = (s.x - fp.x, s.y - fp.y);
