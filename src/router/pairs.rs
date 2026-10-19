@@ -281,14 +281,20 @@ impl Router {
             for (vi, l) in vp.iter().zip([layer; 6]) {
                 pads[*vi as usize].layers = vec![l];
             }
-            let term = |cells: &Vec<Cell>, first: bool| -> Cell { if first { cells[0] } else { *cells.last().unwrap() } };
-            // Terminal cells = first/last copper cell of each track
-            let (tps, tpe, tns, tne) = (term(&p_cells, true), term(&p_cells, false), term(&n_cells, true), term(&n_cells, false));
+            // Terminal cells = the exact polyline endpoints (the rasterizer's
+            // cell order is not the polyline order — live-verified: a tail
+            // aimed at a cell inside the corridor)
+            let (tps, tpe, tns, tne) = (
+                Self::cell_at(p_track[0], layer),
+                Self::cell_at(*p_track.last().unwrap(), layer),
+                Self::cell_at(n_track[0], layer),
+                Self::cell_at(*n_track.last().unwrap(), layer),
+            );
             for (vi, c) in [(vp[0], tps), (vp[1], tpe), (vp[3], tns), (vp[4], tne)] {
                 pads[vi as usize].x = c.x as f64 * pitch;
                 pads[vi as usize].y = c.y as f64 * pitch;
             }
-            self.stamp_pair(&mut g2, &corridor, side, layer, &p_cells, &n_cells, pn, nn, w, w_eff, vp, gap_of[pn]);
+            self.stamp_pair(&mut g2, &corridor, side, layer, &p_cells, &n_cells, [tps, tpe, tns, tne], pn, nn, w, w_eff, vp, gap_of[pn]);
             // Tails
             let mut tails: Vec<RoutedEdge> = Vec::new();
             let mut ok = true;
@@ -359,7 +365,7 @@ impl Router {
                 }
                 if changed {
                     let mut g3 = grid.clone();
-                    self.stamp_pair(&mut g3, &corridor, side, layer, &p_cells, &n_cells, pn, nn, w, w_eff, vp, gap_of[pn]);
+                    self.stamp_pair(&mut g3, &corridor, side, layer, &p_cells, &n_cells, [tps, tpe, tns, tne], pn, nn, w, w_eff, vp, gap_of[pn]);
                     for t in &tails {
                         self.stamp_path(&mut g3, &t.cells, t.net, t.width, t.from_pad);
                     }
@@ -484,7 +490,7 @@ impl Router {
             let (px, py) = perp(d);
             let s = if behind { -1 } else { 1 };
             for j in [-k, 0, k] {
-                for step in 1..=2 {
+                for step in 1..=straight_len {
                     let q = Cell { x: c.x + s * step * dx + j * px, y: c.y + s * step * dy + j * py, layer: c.layer };
                     let Some(i) = grid.idx(q.x, q.y, q.layer) else { return false };
                     let o = grid.owner[i];
@@ -736,7 +742,13 @@ impl Router {
     /// pad id (terminals first/last cells get the start/end ids, the rest
     /// the body id), crosstalk halo for both nets, near maps.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn stamp_pair(&self, grid: &mut Grid, corridor: &[Cell], side: i32, layer: u8, p_cells: &[Cell], n_cells: &[Cell], pn: usize, nn: usize, w: f64, w_eff: f64, vp: [u32; 6], gap: f64) {
+    /// Cell under a polyline point (cell units).
+    fn cell_at(p: (f64, f64), layer: u8) -> Cell {
+        Cell { x: p.0.round() as i32, y: p.1.round() as i32, layer }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn stamp_pair(&self, grid: &mut Grid, corridor: &[Cell], side: i32, layer: u8, p_cells: &[Cell], n_cells: &[Cell], terms: [Cell; 4], pn: usize, nn: usize, w: f64, w_eff: f64, vp: [u32; 6], gap: f64) {
         let (tp, tn) = (pn as u32 + 1, nn as u32 + 1);
         let halo = self.halo_cells(w_eff);
         let dirs: Vec<u8> = corridor.windows(2).map(|s| {
@@ -751,10 +763,10 @@ impl Router {
                     let sv = dx * p.0 + dy * p.1;
                     let tag = if sv == 0 { BLOCK } else if (sv > 0) == (side > 0) { tp } else { tn };
                     if tag == BLOCK {
-                        grid.claim(c.x + dx, c.y + dy, layer, tp);
-                        grid.claim(c.x + dx, c.y + dy, layer, tn);
+                        grid.claim_halo(c.x + dx, c.y + dy, layer, tp);
+                        grid.claim_halo(c.x + dx, c.y + dy, layer, tn);
                     } else {
-                        grid.claim(c.x + dx, c.y + dy, layer, tag);
+                        grid.claim_halo(c.x + dx, c.y + dy, layer, tag);
                     }
                     if let Some(ix) = grid.idx(c.x + dx, c.y + dy, layer) {
                         grid.corridor[ix] = true;
@@ -777,16 +789,19 @@ impl Router {
                 }
             }
         }
-        // Copper
-        let n_p = p_cells.len();
-        for (i, c) in p_cells.iter().enumerate() {
-            let id = if i == 0 { vp[0] } else if i + 1 == n_p { vp[1] } else { vp[2] };
+        // Copper: terminal cells carry the start/end virtual pad ids (the
+        // tails' goals), everything else the body id
+        for c in p_cells {
+            let id = if *c == terms[0] { vp[0] } else if *c == terms[1] { vp[1] } else { vp[2] };
             grid.force(c.x, c.y, layer, tp, id);
         }
-        let n_n = n_cells.len();
-        for (i, c) in n_cells.iter().enumerate() {
-            let id = if i == 0 { vp[3] } else if i + 1 == n_n { vp[4] } else { vp[5] };
+        for c in n_cells {
+            let id = if *c == terms[2] { vp[3] } else if *c == terms[3] { vp[4] } else { vp[5] };
             grid.force(c.x, c.y, layer, tn, id);
+        }
+        for (i, t) in terms.iter().enumerate() {
+            let (tag, id) = if i < 2 { (tp, vp[i]) } else { (tn, vp[i + 1]) };
+            grid.force(t.x, t.y, layer, tag, id);
         }
         // Crosstalk halo of the pair (both nets, mate-aware) + near maps.
         // The rule is measured from each TRACK, which sits o cells off the
@@ -989,7 +1004,13 @@ impl Router {
             let w_eff = pc.pitch_mm + w;
             let p_cells = self.rasterize(&pr.p_track, pr.layer, w, pitch);
             let n_cells = self.rasterize(&pr.n_track, pr.layer, w, pitch);
-            self.stamp_pair(grid, &pr.corridor, pr.side, pr.layer, &p_cells, &n_cells, pr.p_net, pr.n_net, w, w_eff, pr.vpads, gap_of[pr.p_net]);
+            let terms = [
+                Self::cell_at(pr.p_track[0], pr.layer),
+                Self::cell_at(*pr.p_track.last().unwrap(), pr.layer),
+                Self::cell_at(pr.n_track[0], pr.layer),
+                Self::cell_at(*pr.n_track.last().unwrap(), pr.layer),
+            ];
+            self.stamp_pair(grid, &pr.corridor, pr.side, pr.layer, &p_cells, &n_cells, terms, pr.p_net, pr.n_net, w, w_eff, pr.vpads, gap_of[pr.p_net]);
             for t in &pr.tails {
                 self.stamp_path(grid, &t.cells, t.net, t.width, t.from_pad);
             }

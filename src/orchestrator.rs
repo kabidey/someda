@@ -718,6 +718,23 @@ pub fn build(
         stages.push(StageResult { stage: "pairs".into(), success: pairs_ok, detail: pairs_detail.clone() });
     }
     let _ = &route_pairs;
+    // Developer switch: SOMEDA_STOP_AFTER=route writes the board and stops
+    // before the audits and kicad-cli (fast routing iteration).
+    if std::env::var("SOMEDA_STOP_AFTER").map(|v| v == "route").unwrap_or(false) {
+        let pcb_path = project_dir.join("circuit.kicad_pcb");
+        std::fs::create_dir_all(project_dir).ok();
+        std::fs::write(&pcb_path, board.to_kicad_pcb()).map_err(|e| OrchestrateError::Io(e.to_string()))?;
+        for stage in &stages {
+            println!("  {} [{}] {}", if stage.success { "✓" } else { "✗" }, stage.stage, stage.detail);
+        }
+        return Ok(BuildResult {
+            plan,
+            project_dir: project_dir.display().to_string(),
+            schematic_file: String::new(),
+            board_file: pcb_path.display().to_string(),
+            stages,
+        });
+    }
 
     // ─── Stage 2d: physics-aware design audit (freq / SI / thermal) ───
     // Every net's frequency is known (declared or component-spec); every

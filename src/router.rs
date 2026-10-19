@@ -462,6 +462,19 @@ impl Grid {
             }
         }
     }
+    /// Claim a clearance-halo cell: like `claim`, but a cell reserved as
+    /// another net's escape lane keeps its owner (a BLOCKed lane would
+    /// strand that pin — live-verified with 3-cell pair halos).
+    #[inline]
+    fn claim_halo(&mut self, x: i32, y: i32, l: u8, net_tag: u32) {
+        if x >= 0 && y >= 0 && (x as usize) < self.w && (y as usize) < self.h {
+            let lane = self.lane[y as usize * self.w + x as usize];
+            if lane != 0 && lane != net_tag {
+                return;
+            }
+        }
+        self.claim(x, y, l, net_tag);
+    }
     #[inline]
     fn force(&mut self, x: i32, y: i32, l: u8, net_tag: u32, pad_id: u32) {
         if let Some(i) = self.idx(x, y, l) {
@@ -710,8 +723,8 @@ impl Router {
         let mut dsu = Dsu::new(pads.len());
         self.stamp_static(&mut grid, &pads, bx1 - bx0, by1 - by0);
         self.stamp_keepouts(&mut grid, board, bx0, by0);
-        self.escape_vias(&mut grid, &pads, &plane_ids, &pair_net_ids, &mut state);
-        self.fanout_planes(&mut grid, &pads, &plane_ids, &mut state, &net_name);
+        // Pairs first — the most constrained copper on the board leaves the
+        // fine-pitch bands before escape vias and plane fanouts fill them.
         {
             let refs_of_net = |n: usize| -> Vec<String> {
                 let mut v: Vec<String> = pads.iter().filter(|p| p.net == Some(n) && !p.virtual_pad).map(|p| p.reference.clone()).collect();
@@ -723,6 +736,8 @@ impl Router {
             let refs_fn = |n: usize| -> Vec<String> { refs.get(n).cloned().unwrap_or_default() };
             self.route_pairs(&mut grid, &mut pads, &mut dsu, &mut state, &net_id, &gap_by_net, &refs_fn);
         }
+        self.escape_vias(&mut grid, &pads, &plane_ids, &pair_net_ids, &mut state);
+        self.fanout_planes(&mut grid, &pads, &plane_ids, &mut state, &net_name);
         let exempt_rects: Vec<ExemptRect> = self
             .breakout_rects(&pads)
             .into_iter()
@@ -918,6 +933,7 @@ impl Router {
                 let mut dsu2 = Dsu::new(pads.len());
                 self.stamp_static(&mut g2, &pads, bx1 - bx0, by1 - by0);
                 self.stamp_keepouts(&mut g2, board, bx0, by0);
+                self.replay_pairs(&mut g2, &mut dsu2, &pads, &state.pairs, &gap_by_net);
                 self.replay_fanouts(&mut g2, &pads, &state.escapes);
                 for e in &state.escapes {
                     for c in &e.cells {
@@ -927,7 +943,6 @@ impl Router {
                     }
                 }
                 self.replay_fanouts(&mut g2, &pads, &state.fanouts);
-                self.replay_pairs(&mut g2, &mut dsu2, &pads, &state.pairs, &gap_by_net);
                 for r in &trial_routed {
                     self.stamp_path(&mut g2, &r.cells, r.net, r.width, r.from_pad);
                     let eb = edges.iter().find(|x| x.0 == r.edge_index).map(|x| x.3).unwrap_or(r.from_pad);
@@ -1625,7 +1640,7 @@ impl Router {
         for c in cells {
             for dy in -halo..=halo {
                 for dx in -halo..=halo {
-                    grid.claim(c.x + dx, c.y + dy, c.layer, tag);
+                    grid.claim_halo(c.x + dx, c.y + dy, c.layer, tag);
                 }
             }
             for dy in -body..=body {
