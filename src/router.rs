@@ -714,7 +714,13 @@ impl Router {
                 v
             };
             let pair_nets: Vec<Option<(usize, usize)>> = self.config.pairs.iter().map(|pc| match (net_id(&pc.p), net_id(&pc.n)) { (Some(a), Some(b)) => Some((a, b)), _ => None }).collect();
-            let pair_refs: Vec<Vec<String>> = pair_nets.iter().map(|pn| pn.map(|(a, b)| { let mut r = refs_of(a); r.extend(refs_of(b)); r.sort(); r.dedup(); r }).unwrap_or_default()).collect();
+            // Only a small pass-through part (an ESD array, series
+            // resistors/capacitors: ≤ 8 pads) chains two pairs into one
+            // signal; the SoC and the connectors are shared by every pair
+            // and must NOT merge them (live-verified: merged MIPI pairs let
+            // bumps short into each other).
+            let small_part = |r: &str| pads.iter().filter(|p| p.reference == r && !p.virtual_pad).count() <= 8;
+            let pair_refs: Vec<Vec<String>> = pair_nets.iter().map(|pn| pn.map(|(a, b)| { let mut r = refs_of(a); r.extend(refs_of(b)); r.sort(); r.dedup(); r.retain(|x| small_part(x)); r }).unwrap_or_default()).collect();
             let mut fam: Vec<usize> = (0..pair_nets.len()).collect();
             fn root(f: &mut Vec<usize>, i: usize) -> usize { let mut i = i; while f[i] != i { f[i] = f[f[i]]; i = f[i]; } i }
             for i in 0..pair_nets.len() {
