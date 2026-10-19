@@ -378,7 +378,7 @@ pub fn validate_plan(plan: &CircuitPlan) -> Result<(), OrchestrateError> {
     }
     let refs: std::collections::HashSet<&str> =
         plan.components.iter().map(|c| c.reference.as_str()).collect();
-    for net in &plan.nets {
+    for (net_index, net) in plan.nets.iter().enumerate() {
         for pin in &net.pins {
             let ref_des = pin.split(':').next().unwrap_or("");
             if !refs.contains(ref_des) {
@@ -414,7 +414,7 @@ pub fn verify_pin_coverage(
     plan: &CircuitPlan,
     board: &crate::board::Board,
 ) -> Result<(), OrchestrateError> {
-    for net in &plan.nets {
+    for (net_index, net) in plan.nets.iter().enumerate() {
         for pin in &net.pins {
             let (refdes, num) = match pin.split_once(':') {
                 Some(x) => x,
@@ -453,8 +453,12 @@ pub fn generate_schematic(plan: &CircuitPlan) -> String {
     let mut symbols = String::new();
 
     for (i, comp) in plan.components.iter().enumerate() {
-        let x = comp.x_mm.unwrap_or(50.0 + (i % 2) as f64 * 60.0);
-        let y = comp.y_mm.unwrap_or(50.0 + (i / 2) as f64 * 40.0);
+        // KiCad schematic grid: 1.27 mm (50 mil). Snap the symbol origin so
+        // every pin endpoint (origin ± 5.08 / ± 2.54k) lands ON grid —
+        // endpoint_off_grid violations disappear (live-verified).
+        let snap = |v: f64| (v / 1.27).round() * 1.27;
+        let x = snap(comp.x_mm.unwrap_or(50.8 + (i % 2) as f64 * 63.5));
+        let y = snap(comp.y_mm.unwrap_or(50.8 + (i / 2) as f64 * 38.1));
 
         // Embed a minimal lib symbol for this component type
         let lib_name = &comp.lib_id;
@@ -465,16 +469,47 @@ pub fn generate_schematic(plan: &CircuitPlan) -> String {
             "    (symbol \"{}\" (pin_names (offset 0.254))\n      (symbol \"{}\"\n",
             lib_name, sub_name
         ));
-        // Two pins for passives, more for ICs (simplified: 2 pins)
-        lib_symbols.push_str(
-            "        (pin passive line (at -5.08 0 0) (length 5.08)\n\
-             (name \"1\" (effects (font (size 1.27 1.27))))\n\
-             (number \"1\" (effects (font (size 1.27 1.27)))))\n\
-             (pin passive line (at 5.08 0 180) (length 5.08)\n\
-             (name \"2\" (effects (font (size 1.27 1.27))))\n\
-             (number \"2\" (effects (font (size 1.27 1.27)))))\n\
-             )\n    )\n"
-        );
+        // ONE SYMBOL PIN PER PLAN-REFERENCED PIN — mirror of the board fix.
+        // (Live-validated: the 2-pin-only schematic dropped U1:3/U1:8,
+        // so ERC saw pins_not_connected for pins the plan actually uses.)
+        let mut pin_nums: Vec<String> = Vec::new();
+        for (net_index, net) in plan.nets.iter().enumerate() {
+            for pin in &net.pins {
+                if let Some((refdes, num)) = pin.split_once(':') {
+                    if refdes == comp.reference && !pin_nums.iter().any(|p| p == num) {
+                        pin_nums.push(num.to_string());
+                    }
+                }
+            }
+        }
+        if pin_nums.is_empty() {
+            pin_nums.push("1".into());
+            pin_nums.push("2".into());
+        }
+        // Pin geometry: 2 pins inline; >2 pins on a DIP rectangle
+        // (left column top-to-bottom, right column bottom-to-top)
+        let n = pin_nums.len();
+        for (pi, pin_num) in pin_nums.iter().enumerate() {
+            let (px, py, ang) = if n <= 2 {
+                if pi == 0 { (-5.08, 0.0, 0) } else { (5.08, 0.0, 180) }
+            } else {
+                let half = (n + 1) / 2;
+                let pitch = 2.54;
+                if pi < half {
+                    (-5.08, (half as f64 - 1.0 - pi as f64) * pitch, 0)
+                } else {
+                    let k = n - 1 - pi;
+                    (5.08, (k as f64 - (half as f64 - 1.0)) * pitch, 180)
+                }
+            };
+            lib_symbols.push_str(&format!(
+                "        (pin passive line (at {:.2} {:.2} {}) (length 5.08)\n\
+                 (name \"{}\" (effects (font (size 1.27 1.27))))\n\
+                 (number \"{}\" (effects (font (size 1.27 1.27)))))\n",
+                px, py, ang, pin_num, pin_num
+            ));
+        }
+        lib_symbols.push_str("             )\n    )\n");
 
         symbols.push_str(&format!(
             "  (symbol (lib_id \"{}\") (at {:.2} {:.2} 0) (unit 1)\n\
@@ -488,29 +523,88 @@ pub fn generate_schematic(plan: &CircuitPlan) -> String {
     out.push_str(&lib_symbols);
     out.push_str("  )\n");
 
-    // Wires from nets: connect pins of the same net with wires
+    // Wires from nets: Manhattan channel routing (per-net rows below the grid)
     let mut wire_id = 0;
-    for net in &plan.nets {
+    // Channel rows start 30mm below the lowest symbol and stack 5mm per net
+    let snap_grid = |v: f64| (v / 1.27).round() * 1.27;
+    let n_rows = (plan.components.len() as f64 / 2.0).ceil().max(1.0);
+    let channel_base = snap_grid(50.8 + n_rows * 38.1 + 12.7);
+    let channel_gap = 5.08;
+    for (net_index, net) in plan.nets.iter().enumerate() {
         if net.pins.len() < 2 {
             continue;
         }
-        // Connect pins in a chain: pin1 → pin2 → pin3...
+        // MANHATTAN CHANNEL ROUTING (schematic bus): every net gets a
+        // dedicated horizontal channel row far below the component grid.
+        // pin → vertical drop to the channel → horizontal run → vertical
+        // rise to the target pin. Straight runs THROUGH other components'
+        // pins created real shorts (live-verified: GND's horizontal passed
+        // through R1:1, joining VCC and GND — multiple_net_names).
+        // Channel rows are per-net unique: crossings without shared
+        // endpoints do not connect in KiCad.
+        let channel_y = channel_base - net_index as f64 * channel_gap;
         for pair in net.pins.windows(2) {
             let p1 = parse_pin(&pair[0], &plan);
             let p2 = parse_pin(&pair[1], &plan);
             if let (Some((x1, y1)), Some((x2, y2))) = (p1, p2) {
+                // Vertical drop from pin1 to channel
                 out.push_str(&format!(
                     "  (wire (pts (xy {:.2} {:.2}) (xy {:.2} {:.2})) (uuid wire_{}) )\n",
-                    x1, y1, x2, y2, wire_id
+                    x1, y1, x1, channel_y, wire_id
+                ));
+                wire_id += 1;
+                // Horizontal run in the channel
+                out.push_str(&format!(
+                    "  (wire (pts (xy {:.2} {:.2}) (xy {:.2} {:.2})) (uuid wire_{}) )\n",
+                    x1, channel_y, x2, channel_y, wire_id
+                ));
+                wire_id += 1;
+                // Vertical rise to pin2
+                out.push_str(&format!(
+                    "  (wire (pts (xy {:.2} {:.2}) (xy {:.2} {:.2})) (uuid wire_{}) )\n",
+                    x2, channel_y, x2, y2, wire_id
                 ));
                 wire_id += 1;
             }
         }
-        // Label the net at the first pin
-        if let Some((lx, ly)) = net.pins.first().and_then(|p| parse_pin(p, &plan)) {
+        // Label the net on a DEDICATED STUB: a 1.27mm wire sticking out from
+        // the first pin, perpendicular to the net's first wire, with the
+        // label at the stub's far end. The stub belongs to exactly one net
+        // and touches no other wire — label collisions are structurally
+        // impossible (live-verified: every on-wire placement collided with
+        // a neighboring net's crossing or column).
+        // Stub direction: OUTWARD from the symbol body (pin left of origin
+        // → −x, right → +x). Vertical stubs on a pin column collide with
+        // the vertical L-wire runs (live-verified: GND+VCC labels joined on
+        // U1's left column). Outward stubs point into empty space.
+        if let Some((x1, y1)) = net.pins.first().and_then(|p| parse_pin(p, &plan)) {
+            let comp_idx = plan
+                .components
+                .iter()
+                .position(|c| c.reference == net.pins[0].split(':').next().unwrap_or(""));
+            let outward = match comp_idx {
+                Some(i) => {
+                    let snap = |v: f64| (v / 1.27).round() * 1.27;
+                    let cx = snap(
+                        plan.components[i]
+                            .x_mm
+                            .unwrap_or(50.8 + (i % 2) as f64 * 63.5),
+                    );
+                    if x1 < cx { -1.0 } else { 1.0 }
+                }
+                None => -1.0,
+            };
+            let stub_len = 1.27;
+            let (sx, sy) = (x1 + outward * stub_len, y1);
             out.push_str(&format!(
-                "  (label \"{}\" (at {:.2} {:.2} 0))\n",
-                net.name, lx, ly
+                "  (wire (pts (xy {:.2} {:.2}) (xy {:.2} {:.2})) (uuid wire_{}) )\n",
+                x1, y1, sx, sy, wire_id
+            ));
+            wire_id += 1;
+            let rot = if outward < 0.0 { 0 } else { 180 };
+            out.push_str(&format!(
+                "  (label \"{}\" (at {:.2} {:.2} {}))\n",
+                net.name, sx, sy, rot
             ));
         }
     }
@@ -525,13 +619,44 @@ fn parse_pin(pin_ref: &str, plan: &CircuitPlan) -> Option<(f64, f64)> {
     let (ref_des, pin_num) = pin_ref.split_once(':')?;
     let idx = plan.components.iter().position(|c| c.reference == ref_des)?;
     let comp = &plan.components[idx];
-    let x = comp.x_mm.unwrap_or(50.0 + (idx % 2) as f64 * 60.0);
-    let y = comp.y_mm.unwrap_or(50.0 + (idx / 2) as f64 * 40.0);
-    // Pin 1 left, pin 2 right (simplified 2-pin model)
-    match pin_num {
-        "1" => Some((x - 5.08, y)),
-        "2" => Some((x + 5.08, y)),
-        _ => Some((x, y)), // other pins at center (simplified)
+    let snap = |v: f64| (v / 1.27).round() * 1.27;
+    let x = snap(comp.x_mm.unwrap_or(50.8 + (idx % 2) as f64 * 63.5));
+    let y = snap(comp.y_mm.unwrap_or(50.8 + (idx / 2) as f64 * 38.1));
+
+    // Mirror of generate_schematic's pin placement: compute this component's
+    // plan-referenced pin list, then place pin N exactly where the symbol did.
+    let mut pin_nums: Vec<String> = Vec::new();
+    for (net_index, net) in plan.nets.iter().enumerate() {
+        for pin in &net.pins {
+            if let Some((r, n_)) = pin.split_once(':') {
+                if r == comp.reference && !pin_nums.iter().any(|p| p == n_) {
+                    pin_nums.push(n_.to_string());
+                }
+            }
+        }
+    }
+    if pin_nums.is_empty() {
+        pin_nums.push("1".into());
+        pin_nums.push("2".into());
+    }
+    let n = pin_nums.len();
+    let pi = pin_nums.iter().position(|p| p == pin_num)?;
+    if n <= 2 {
+        // Inline: pin 0 left, pin 1 right (matches the symbol)
+        if pi == 0 { Some((x - 5.08, y)) } else { Some((x + 5.08, y)) }
+    } else {
+        // DIP rectangle: same math as generate_schematic, with the KiCad
+        // Y-mirror applied — a lib pin stored at file-y +2.54 RENDERS at
+        // origin −2.54 (live-verified: ERC saw U1 pin1 at 48.26 for origin
+        // 50.8). Wires must target the RENDERED position.
+        let half = (n + 1) / 2;
+        let pitch = 2.54;
+        if pi < half {
+            Some((x - 5.08, y - (half as f64 - 1.0 - pi as f64) * pitch))
+        } else {
+            let k = n - 1 - pi;
+            Some((x + 5.08, y + (half as f64 - 1.0 - k as f64) * pitch))
+        }
     }
 }
 
@@ -577,7 +702,7 @@ pub fn generate_board_model(plan: &CircuitPlan) -> crate::board::Board {
         // only pads "1"/"2" existed. Every plan pin must land on copper.)
         // Collect every pin this component needs, in plan order, deduped:
         let mut pin_nums: Vec<String> = Vec::new();
-        for net in &plan.nets {
+        for (net_index, net) in plan.nets.iter().enumerate() {
             for pin in &net.pins {
                 if let Some((refdes, num)) = pin.split_once(':') {
                     if refdes == comp.reference && !pin_nums.iter().any(|p| p == num) {
@@ -687,8 +812,12 @@ pub fn generate_board(plan: &CircuitPlan) -> String {
 
     // Footprints
     for (i, comp) in plan.components.iter().enumerate() {
-        let x = comp.x_mm.unwrap_or(50.0 + (i % 2) as f64 * 60.0);
-        let y = comp.y_mm.unwrap_or(50.0 + (i / 2) as f64 * 40.0);
+        // KiCad schematic grid: 1.27 mm (50 mil). Snap the symbol origin so
+        // every pin endpoint (origin ± 5.08 / ± 2.54k) lands ON grid —
+        // endpoint_off_grid violations disappear (live-verified).
+        let snap = |v: f64| (v / 1.27).round() * 1.27;
+        let x = snap(comp.x_mm.unwrap_or(50.8 + (i % 2) as f64 * 63.5));
+        let y = snap(comp.y_mm.unwrap_or(50.8 + (i / 2) as f64 * 38.1));
         let footprint = comp.footprint.as_deref().unwrap_or("someda:DEFAULT");
 
         // Find nets for this component's pins
