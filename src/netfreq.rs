@@ -303,6 +303,32 @@ mod tests {
     }
 
     #[test]
+    fn freq_parsing_adversarial_values() {
+        // Real BOM-style value strings
+        assert!((freq_from_component("16MHz crystal").unwrap() - 16.0e6).abs() < 1e3);
+        assert!((freq_from_component("8MHZ XTAL").unwrap() - 8.0e6).abs() < 1e3);
+        assert!((freq_from_component("27.12MHz").unwrap() - 27.12e6).abs() < 1e4);
+        assert!((freq_from_component("433MHz module").unwrap() - 433.0e6).abs() < 1e5);
+        assert!((freq_from_component("10pF 50V").is_none()), "no frequency in a plain cap");
+        assert!((freq_from_component("2.4GHZ Antenna").unwrap() - 2.4e9).abs() < 1e6);
+        assert!((freq_from_component("915mhz LORA").unwrap() - 915.0e6).abs() < 1e5);
+        // MHz inside a part number, not a spec: conservative part classes
+        assert!((freq_from_component("STM32F103").unwrap() - 240.0e6).abs() < 1e6);
+    }
+
+    #[test]
+    fn declared_role_overrides_name_class() {
+        // "N1" names default to digital; a declared rf role wins
+        let s = net_signal("N1", &[], None, Some("rf"));
+        assert_eq!(s.role, NetRole::Rf);
+        assert_eq!(s.z_target, Some(50.0));
+        // ...and clock role on an unnamed net picks up clock budgets
+        let c = net_signal("X2", &["100MHz"], None, Some("clock"));
+        assert_eq!(c.role, NetRole::Clock);
+        assert!(c.needs_impedance_control(), "100MHz clock needs Z control");
+    }
+
+    #[test]
     fn crosstalk_spacing_follows_role() {
         let rf = net_signal("RF_OUT", &["2.4GHz"], None, None);
         let slow = net_signal("N1", &["NE555"], None, None);

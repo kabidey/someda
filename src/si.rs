@@ -42,9 +42,15 @@ pub struct StrayParasitics {
 /// internal+external approximation; we use the widely-cited IPC form:
 ///   L (nH/mm) = 0.2 * ln(2*h/(0.8*w + t) + sqrt(1 + (2h/w)^2))
 pub fn trace_l_per_mm(w_mm: f64, h_mm: f64, t_mm: f64) -> f64 {
-    0.2 * ((2.0 * h_mm / (0.8 * w_mm + t_mm))
-        + (1.0 + (2.0 * h_mm / w_mm).powi(2)).sqrt())
-        .ln()
+    // Self-consistent with C': both derive from the SAME (Z0, Er_eff)
+    // transmission-line pair — L' = Z0/v', C' = 1/(Z0·v'), v' = c/√Er_eff.
+    // (The earlier standalone log model disagreed with the C' path by 14% —
+    // caught by the L'C' = Er_eff/c² identity check during validation.)
+    let er = 4.5; // the JLCPCB FR-4 class the stackup carries
+    let z0 = microstrip_z0(er, h_mm, w_mm, t_mm);
+    let er_eff = (er + 1.0) / 2.0 + (er - 1.0) / 2.0 * (1.0 + 12.0 * h_mm / w_mm).powf(-0.5);
+    let v = 3.0e11 / er_eff.sqrt(); // mm/s
+    z0 / v * 1e9 // nH/mm
 }
 
 /// Microstrip capacitance per unit length (pF/mm) from Z0 and the
@@ -338,6 +344,24 @@ mod tests {
         assert!((swr(50.0, 62.5) - 1.25).abs() < 0.01);
         // Open: SWR → ∞ handled by limit
         assert!(swr(50.0, 1e9) > 100.0);
+    }
+
+    /// The L'C' pair must satisfy the transmission-line identity
+    /// L'·C'·c² = Er_eff (both derived from the same Z0/Er_eff model).
+    #[test]
+    fn lc_pair_satisfies_identity() {
+        let (w, h, t, er) = (0.25, 1.53, 0.035, 4.5);
+        let l = trace_l_per_mm(w, h, t); // nH/mm
+        let z0 = microstrip_z0(er, h, w, t);
+        let c = trace_c_per_mm(w, h, er, z0); // pF/mm
+        let er_eff_lc = (3.0e11_f64).powi(2) * l * 1e-9 * c * 1e-12;
+        let er_eff_hj = (er + 1.0) / 2.0 + (er - 1.0) / 2.0 * (1.0 + 12.0 * h / w).powf(-0.5);
+        assert!(
+            (er_eff_lc - er_eff_hj).abs() / er_eff_hj < 0.01,
+            "L'C' identity broken: pair says {:.2}, HJ says {:.2}",
+            er_eff_lc,
+            er_eff_hj
+        );
     }
 
     #[test]

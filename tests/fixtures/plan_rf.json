@@ -1,17 +1,72 @@
 {
   "name": "2.4GHz RF switch + 555",
-  "description": "One 50-ohm RF path (realistic module class) plus a 555 status blinker",
+  "description": "2.4GHz path + 555 blinker \u2014 demonstrates the physics harness: on 2-layer 1.6mm FR-4 a 50\u03a9 single-ended trace needs 2.78mm width, which cannot land on 1.27mm-pitch SMA pads without neck-downs; the harness flags the SWR and counsels a 4-layer thin-dielectric stackup (the JLCPCB-recommended flow for 50\u03a9 RF).",
   "components": [
-    {"reference": "U1", "value": "2.4GHz switch", "lib_id": "RF:SWITCH", "footprint": "Package_TO_SOT_SMD:SOT-23"},
-    {"reference": "J1", "value": "SMA", "lib_id": "Connector:SMA", "footprint": "Connector:SMA"},
-    {"reference": "C1", "value": "100pF", "lib_id": "Device:C", "footprint": "Capacitor_SMD:C_0402"},
-    {"reference": "R1", "value": "1W LED resistor", "lib_id": "Device:R", "footprint": "Resistor_SMD:R_1206", "power_w": 1.0},
-    {"reference": "U2", "value": "NE555", "lib_id": "Timer:NE555", "footprint": "Package_DIP:DIP-8"}
+    {
+      "reference": "U1",
+      "value": "2.4GHz switch",
+      "lib_id": "RF:SWITCH",
+      "footprint": "Package_TO_SOT_SMD:SOT-23"
+    },
+    {
+      "reference": "J1",
+      "value": "SMA",
+      "lib_id": "Connector:SMA",
+      "footprint": "Connector:SMA"
+    },
+    {
+      "reference": "C1",
+      "value": "100pF",
+      "lib_id": "Device:C",
+      "footprint": "Capacitor_SMD:C_0402"
+    },
+    {
+      "reference": "R1",
+      "value": "1W LED resistor",
+      "lib_id": "Device:R",
+      "footprint": "Resistor_SMD:R_1206",
+      "power_w": 1.0
+    },
+    {
+      "reference": "U2",
+      "value": "NE555",
+      "lib_id": "Timer:NE555",
+      "footprint": "Package_DIP:DIP-8"
+    }
   ],
   "nets": [
-    {"name": "RF_IN", "pins": ["J1:1", "U1:1", "C1:1"], "freq_hz": 2400000000, "role": "rf"},
-    {"name": "VCC", "pins": ["U1:2", "R1:1", "U2:1"]},
-    {"name": "GND", "pins": ["U1:3", "J1:3", "U2:8"]},
-    {"name": "OUT", "pins": ["U2:3", "R1:2"]}
+    {
+      "name": "RF_IN",
+      "pins": [
+        "J1:1",
+        "U1:1",
+        "C1:1"
+      ],
+      "freq_hz": 2400000000,
+      "role": "rf"
+    },
+    {
+      "name": "VCC",
+      "pins": [
+        "U1:2",
+        "R1:1",
+        "U2:1"
+      ]
+    },
+    {
+      "name": "GND",
+      "pins": [
+        "U1:3",
+        "J1:3",
+        "U2:8"
+      ]
+    },
+    {
+      "name": "OUT",
+      "pins": [
+        "U2:3",
+        "R1:2"
+      ]
+    }
   ]
 }

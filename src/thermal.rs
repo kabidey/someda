@@ -250,6 +250,29 @@ mod tests {
     }
 
     #[test]
+    fn power_parsing_adversarial() {
+        // Real BOM value strings with wattage markers
+        assert!((power_from_value("R 0.125W") - 0.125).abs() < 1e-9);
+        assert!((power_from_value("10R 2W wirewound") - 2.0).abs() < 1e-9);
+        assert!((power_from_value("LDO 250mW") - 0.25).abs() < 1e-9);
+        assert_eq!(power_from_value("1uF"), 0.0, "no false positive on uF");
+        assert_eq!(power_from_value("10nF 50V"), 0.0, "50V is a voltage not watts");
+        assert_eq!(power_from_value("NE555"), 0.0);
+    }
+
+    #[test]
+    fn theta_ja_matches_datasheet_classes() {
+        // Cross-checked against typical datasheet values:
+        // DIP-8 ~85-100, SOIC-8 ~100-180, SOT-23 ~250-350, QFN ~20-45
+        assert_eq!(package_theta_ja("Package_DIP:DIP-8"), 85.0);
+        assert_eq!(package_theta_ja("Package_SO:SOIC-8"), 120.0);
+        assert_eq!(package_theta_ja("SOT-23"), 250.0);
+        assert!(package_theta_ja("QFN-32") <= 45.0);
+        // TO-220 without heatsink: datasheet 60-70
+        assert!((package_theta_ja("TO-220") - 65.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn thermal_comfortable_silent() {
         // 0.01W signal diode: no findings
         let profiles = vec![ThermalProfile {

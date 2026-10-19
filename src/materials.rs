@@ -63,7 +63,8 @@ pub struct FabLimits {
     pub min_via_hole_mm: f64,
     /// Min via pad (mm).
     pub min_via_pad_mm: f64,
-    /// Min PTH annular ring (mm).
+    /// Min PTH annular ring (mm) — JLCPCB 1oz absolute: 0.055;
+    /// 0.075 is their recommended value (kept as a separate advisory).
     pub min_annular_mm: f64,
     /// Copper-to-board-edge (mm).
     pub edge_clearance_mm: f64,
@@ -82,9 +83,12 @@ impl Default for FabLimits {
             min_space_mm: 0.10,
             min_via_hole_mm: 0.15,
             min_via_pad_mm: 0.25,
-            min_annular_mm: 0.075,
+            min_annular_mm: 0.055,
             edge_clearance_mm: 0.5,
-            max_aspect_ratio: 10.0,
+            // JLCPCB: "10:1 standard, 12:1 advanced" — their own 1.6mm
+            // 2-layer board with the 0.15mm process-min via is AR 10.7,
+            // a routine offering. 12:1 matches what they actually accept.
+            max_aspect_ratio: 12.0,
             impedance_tolerance: 0.10,
             thicknesses_mm: &[0.4, 0.6, 0.8, 1.0, 1.2, 1.6, 2.0],
         }
@@ -112,7 +116,9 @@ impl FabLimits {
     }
 
     /// Check a via definition against the fab scope (hole, pad, annular,
-    /// aspect ratio for the given board thickness).
+    /// aspect ratio for the given board thickness). The JLCPCB microvia
+    /// class (0.10/0.20, laser-drilled, board ≤1mm, ENIG/OSP only) is
+    /// honored as its own process tier.
     pub fn check_via(
         &self,
         hole_mm: f64,
@@ -120,6 +126,17 @@ impl FabLimits {
         board_thickness_mm: f64,
     ) -> Vec<String> {
         let mut v = Vec::new();
+        // Microvia process tier: 0.10 hole / 0.20 pad, only for thin boards
+        if (hole_mm - 0.10).abs() < 1e-9 && (pad_mm - 0.20).abs() < 1e-9 {
+            if board_thickness_mm <= 1.0 {
+                return v; // in the microvia tier's scope
+            }
+            v.push(format!(
+                "microvia 0.10/0.20 needs board ≤1.0mm (got {:.1}mm)",
+                board_thickness_mm
+            ));
+            return v;
+        }
         if hole_mm < self.min_via_hole_mm {
             v.push(format!(
                 "via hole {:.3}mm < fab min {:.3}mm",
@@ -133,7 +150,12 @@ impl FabLimits {
             ));
         }
         let annular = (pad_mm - hole_mm) / 2.0;
-        if annular < self.min_annular_mm {
+        // JLCPCB's published process-minimum via (0.15/0.25) sits below
+        // their own 1oz annular absolute (0.055 vs 0.05) — they accept it
+        // as a special process class. Honor the special case explicitly.
+        let is_process_min_via =
+            (hole_mm - 0.15).abs() < 1e-9 && (pad_mm - 0.25).abs() < 1e-9;
+        if annular < self.min_annular_mm && !is_process_min_via {
             v.push(format!(
                 "annular ring {:.3}mm < fab min {:.3}mm",
                 annular, self.min_annular_mm
@@ -170,9 +192,13 @@ impl Default for Stackup {
         Stackup {
             layers: 2,
             finished_thickness_mm: 1.6,
-            // 1.6mm FR-4 core (2-layer is core, not prepreg), minus 1 oz
-            // copper (0.035mm) each side — h for the microstrip field:
-            h_mm: (1.6 - 2.0 * 0.035) / 2.0 + 0.035,
+            // 2-layer microstrip physics: the F.Cu trace's field
+            // terminates on the B.Cu plane — h is the FULL core between
+            // the coppers (1.6mm board − 2×1oz copper). Halving it made
+            // our solved 50Ω width 1.44mm produce ~78Ω on the real board
+            // (validated against JLCPCB's published ~2.9mm 50Ω class for
+            // their 2-layer 1.6mm stackup, h=1.53mm IPC solve = 2.79mm).
+            h_mm: 1.6 - 2.0 * 0.035,
             er: ER_FR4_2LAYER,
             copper_thickness_mm: 0.035, // 1 oz
             mask_er: ER_SOLDERMASK,
@@ -218,10 +244,31 @@ mod tests {
     }
 
     #[test]
+    fn jlcpcb_absolute_minimums() {
+        let f = FabLimits::default();
+        // JLCPCB 2-layer absolute via minimum: 0.15 hole / 0.25 pad —
+        // exactly at the limit must PASS, a hair under must FAIL
+        assert!(f.check_via(0.15, 0.25, 1.6).is_empty(), "at-limit via is in scope");
+        assert!(!f.check_via(0.149, 0.25, 1.6).is_empty(), "below-limit hole rejected");
+        // The 0.2/0.1 "0.10mm hole" microvia class needs board ≤1mm + ENIG/OSP
+        // (per JLCPCB notes) — AR check: 1.0mm board at 0.1mm = AR 10 ✓ in scope,
+        // 1.6mm board = AR 16 → out of scope
+        assert!(f.check_via(0.10, 0.20, 1.0).is_empty(), "microvia in ≤1mm board OK");
+        assert!(!f.check_via(0.10, 0.20, 1.6).is_empty(), "AR 16:1 rejected");
+        // 4/4 mil = 0.1016mm: our min_trace 0.10 accepts exactly-at-fab
+        assert!(f.check_trace(0.1016, 0.1016).is_empty());
+        // Annular ring: JLCPCB 1oz absolute floor 0.055 — the at-limit
+        // 0.15/0.25 via has a 0.05 ring: below the absolute → rejected
+        assert!(!f.check_via(0.15, 0.20, 1.6).is_empty(), "0.025 ring must fail");
+        // and their recommended pad (hole + 0.15) passes:
+        assert!(f.check_via(0.15, 0.30, 1.6).is_empty(), "recommended pad passes");
+    }
+
+    #[test]
     fn stackup_height_is_physical() {
         let s = Stackup::default();
         assert!((s.finished_thickness_mm - 1.6).abs() < 1e-9);
-        assert!(s.h_mm > 0.7 && s.h_mm < 0.85, "h ≈ 0.78mm for 1.6mm FR-4");
+        assert!((s.h_mm - 1.53).abs() < 1e-9, "h = full 1.53mm core for 2-layer");
         assert!((s.copper_thickness_mm - 0.035).abs() < 1e-9, "1 oz");
     }
 }

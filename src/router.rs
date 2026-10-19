@@ -338,11 +338,24 @@ impl Router {
             // J1 shorted the adjacent pad). Skill 101 fanout practice: the
             // final approach uses the narrow width; electrically it is a
             // stub ≪ λ/4 at these lengths.
+            // NECK-DOWN criterion: fire ONLY when a full-width trace
+            // LANDING on this specific pad would physically graze its
+            // nearest foreign pad (pad-to-pad clearance violated), not
+            // merely because a foreign pad exists within one trace-width
+            // (that over-triggered on the corrected 2.78mm stackup and
+            // necked every RF edge — live-verified).
             let near_foreign_pad = |x: f64, y: f64| -> bool {
                 pads.iter().any(|&(px, py, phalf, pnet)| {
+                    let own_half = pads
+                        .iter()
+                        .find(|&&(qx, qy, _, qn)| {
+                            qn == nid && (qx - x).abs() < 0.01 && (qy - y).abs() < 0.01
+                        })
+                        .map(|&(_, _, oh, _)| oh)
+                        .unwrap_or(0.5);
                     pnet != nid
-                        && (x - px).abs() < phalf + net_width
-                        && (y - py).abs() < phalf + net_width
+                        && (x - px).abs() < phalf + own_half + self.config.clearance + net_width / 2.0
+                        && (y - py).abs() < phalf + own_half + self.config.clearance + net_width / 2.0
                 })
             };
             if near_foreign_pad(edge.from_x, edge.from_y)
