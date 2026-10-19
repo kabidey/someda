@@ -122,13 +122,23 @@ pub fn audit(plan: &CircuitPlan, board: &Board) -> Vec<StabilityFinding> {
             let u = n.to_ascii_uppercase();
             u.contains("VIN") || u.contains("VBUS") || u.ends_with("_IN") || u == "IN" || u.contains("INPUT")
         };
+        // An LDO steps down: its output is the lowest-voltage rail on its
+        // pins (the input rail usually carries the most capacitance, which
+        // is why capacitance was the wrong tie-breaker — live-verified:
+        // ME6211's +1V8 output judged by the +3V3 input's capacitors).
         let vout: Option<String> = fed_by_inductor.or_else(|| {
-            candidates
-                .iter()
-                .copied()
-                .filter(|n| !input_like(n))
-                .max_by(|a, b| cap_on_net_uf(plan, a, &ground).0.partial_cmp(&cap_on_net_uf(plan, b, &ground).0).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|n| n.to_string())
+            let volts = |n: &str| crate::orchestrator::rail_volts(n);
+            let mut rails: Vec<&str> = candidates.iter().copied().filter(|n| !input_like(n)).collect();
+            rails.sort_by(|a, b| {
+                let (va, vb) = (volts(a), volts(b));
+                match (va, vb) {
+                    (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => cap_on_net_uf(plan, b, &ground).0.partial_cmp(&cap_on_net_uf(plan, a, &ground).0).unwrap_or(std::cmp::Ordering::Equal),
+                }
+            });
+            rails.first().map(|n| n.to_string())
         });
         let Some(vout) = vout else { continue };
         let vout = vout.as_str();
@@ -221,6 +231,25 @@ mod tests {
         let cap = f.iter().find(|x| x.code == "regulator-output-cap").unwrap();
         assert_eq!(cap.severity, "error", "{}", cap.detail);
         assert!(cap.detail.contains("+3V3") && cap.detail.contains("4.7"), "{}", cap.detail);
+    }
+
+    #[test]
+    fn ldo_output_is_its_lowest_rail_not_the_best_decoupled_one() {
+        // ME6211: +3V3 in (three capacitors), +1V8 out (one 10 µF)
+        let plan = CircuitPlan {
+            name: "t".into(),
+            description: String::new(),
+            components: vec![comp("U4", "ME6211C18M5G", "Regulator_Linear:ME6211C18M5"), comp("C1", "10uF", "Device:C"), comp("C2", "10uF", "Device:C"), comp("C3", "10uF", "Device:C"), comp("C4", "0.47uF", "Device:C")],
+            nets: vec![net("+3V3", &["U4:1", "U4:3", "C1:1", "C2:1", "C3:1"]), net("GND", &["U4:2", "C1:2", "C2:2", "C3:2", "C4:2"]), net("+1V8", &["U4:5", "C4:1"])],
+            layers: None,
+            board: None,
+            planes: None,
+            pairs: None,
+        };
+        let f = audit(&plan, &Board::default());
+        let cap = f.iter().find(|x| x.code == "regulator-output-cap").unwrap();
+        assert!(cap.detail.contains("output +1V8"), "{}", cap.detail);
+        assert_eq!(cap.severity, "error", "0.47 µF on the output is below the 1 µF minimum: {}", cap.detail);
     }
 
     #[test]
