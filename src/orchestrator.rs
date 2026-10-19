@@ -2049,7 +2049,11 @@ fn build_si_context(
         }
         let (ra, rb) = (role_of(pins[0].0), role_of(pins[1].0));
         let is_decoupler = matches!((&ra, &rb), (crate::netfreq::NetRole::Power, crate::netfreq::NetRole::Ground) | (crate::netfreq::NetRole::Ground, crate::netfreq::NetRole::Power));
-        if !is_decoupler {
+        // The mounting-loop model (stub → via → plane) needs a plane on at
+        // least one side; on a board whose rails are traces the loop is
+        // the whole trace path and the PDN sweep judges it instead.
+        let on_plane = plane_specs.iter().any(|p| p.net == pins[0].0 || p.net == pins[1].0);
+        if !is_decoupler || !on_plane {
             continue;
         }
         // Strict (error) only for a capacitor that actually sits at its IC
