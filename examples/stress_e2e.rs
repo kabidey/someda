@@ -1,5 +1,5 @@
 fn main() {
-    let arg = std::env::args().nth(1).unwrap_or_else(|| "plan.json".to_string());
+    let arg = std::env::args().nth(1).unwrap_or_else(|| "examples/plan_555.json".to_string());
     let plan_json = std::fs::read_to_string(&arg).expect("plan");
     let plan: someda::orchestrator::CircuitPlan = serde_json::from_str(&plan_json).expect("valid plan");
     someda::orchestrator::validate_plan(&plan).expect("plan validates");
