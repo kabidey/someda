@@ -29,6 +29,12 @@ fn run(state: &mut AppState, ev: Event) {
                 let gw = someda::gateway::Gateway::new(state.protocol(), &state.config.base_url, &state.config.api_key, &state.config.model);
                 effect = state.apply(Event::ModelReplied(gw.chat_with_temperature(&call.system, &call.user, Some(0.1)).map_err(|e| e.to_string())));
             }
+            Effect::CheckPlan { plan, custom_symbols } => {
+                let t = std::time::Instant::now();
+                let r = someda::app::interview::check_plan(plan, &custom_symbols);
+                println!("   plan check: {} ms", t.elapsed().as_millis());
+                effect = state.apply(Event::PlanChecked(Box::new(r)));
+            }
             Effect::FetchLibraries { footprints, system_model_dir } => {
                 let r = someda::app::libfetch::fetch_for(&footprints, system_model_dir.as_deref());
                 println!("   libraries: {}", r.summary());

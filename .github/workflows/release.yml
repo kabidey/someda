@@ -36,7 +36,7 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Linux GUI build dependencies (winit/glow)
         if: runner.os == 'Linux'
-        run: sudo apt-get update -q && sudo apt-get install -y -q libxkbcommon-dev libwayland-dev libxcb1-dev libgl1-mesa-dev
+        run: sudo apt-get update -q && sudo apt-get install -y -q libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
       - run: cargo test --locked
       - run: cargo build --release --target ${{ matrix.target }} --locked
       - run: cargo build --release --target ${{ matrix.target }} --locked --features app --bin someda-app

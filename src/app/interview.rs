@@ -130,14 +130,21 @@ pub struct Interview {
     /// Question batches the model may still ask before it must plan.
     pub question_rounds_left: usize,
     pub error: Option<String>,
+    /// References the user accepted as custom parts: pins as in the plan,
+    /// not verified against a library symbol (the engine builds from the
+    /// footprint and writes its own schematic symbol).
+    pub custom_symbols: Vec<String>,
 }
+
+/// The answer that keeps a part custom.
+pub const KEEP_CUSTOM: &str = "Keep it as a custom part (pins as in the plan, not checked against a library symbol)";
 
 pub const MAX_MODEL_ROUNDS: usize = 8;
 pub const MAX_QUESTION_ROUNDS: usize = 3;
 
 impl Default for Interview {
     fn default() -> Self {
-        Interview { phase: Phase::Describe, turns: Vec::new(), pending: Vec::new(), selections: Vec::new(), plan: None, check: None, model_rounds: 0, question_rounds_left: MAX_QUESTION_ROUNDS, error: None }
+        Interview { phase: Phase::Describe, turns: Vec::new(), pending: Vec::new(), selections: Vec::new(), plan: None, check: None, model_rounds: 0, question_rounds_left: MAX_QUESTION_ROUNDS, error: None, custom_symbols: Vec::new() }
     }
 }
 
@@ -146,6 +153,15 @@ impl Default for Interview {
 pub struct ModelCall {
     pub system: String,
     pub user: String,
+}
+
+/// What to do next after a reply or an answer: ask the model, run the
+/// (slow, library-reading) plan check off the UI thread, or nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Step {
+    Ask(ModelCall),
+    Check(CircuitPlan),
+    Done,
 }
 
 impl Interview {
@@ -157,45 +173,61 @@ impl Interview {
         self.call()
     }
 
-    /// The model's raw reply: questions or a plan.
+    /// The model's raw reply: questions or a plan (the plan is checked here, synchronously).
     pub fn model_replied(&mut self, raw: Result<String, String>) -> Option<ModelCall> {
+        match self.model_replied_step(raw) {
+            Step::Ask(c) => Some(c),
+            Step::Check(plan) => self.accept_plan(plan),
+            Step::Done => None,
+        }
+    }
+
+    /// The model's raw reply, with the plan check left to the caller
+    /// (`check_plan` on a worker thread, then `apply_check`).
+    pub fn model_replied_step(&mut self, raw: Result<String, String>) -> Step {
         let raw = match raw {
             Ok(r) => r,
             Err(e) => {
                 self.error = Some(e);
                 self.phase = if self.plan.is_some() { Phase::Review } else { Phase::Describe };
-                return None;
+                return Step::Done;
             }
         };
         let json = match crate::gateway::Gateway::extract_json(&raw) {
             Ok(j) => j,
-            Err(e) => return self.retry_or_fail(format!("The model did not answer in JSON ({}). Reply with JSON only.", e)),
+            Err(e) => return self.retry_or_fail(format!("The model did not answer in JSON ({}). Reply with JSON only.", e)).map(Step::Ask).unwrap_or(Step::Done),
         };
         if let Some(qs) = json.get("questions").and_then(|q| q.as_array()) {
             let mut questions: Vec<Question> = qs.iter().filter_map(|q| serde_json::from_value(q.clone()).ok()).collect();
             questions.retain(|q| !q.text.trim().is_empty() && q.options.len() >= 2);
             questions.truncate(6);
             if questions.is_empty() || self.question_rounds_left == 0 {
-                return self.retry_or_fail("Enough is known. Produce the plan now, as {\"plan\": {...}} only.".into());
+                return self.retry_or_fail("Enough is known. Produce the plan now, as {\"plan\": {...}} only.".into()).map(Step::Ask).unwrap_or(Step::Done);
             }
             self.question_rounds_left -= 1;
             self.selections = questions.iter().map(|q| (q.recommended.filter(|r| *r < q.options.len()), String::new())).collect();
             self.pending = questions;
             self.phase = Phase::Questions;
-            return None;
+            return Step::Done;
         }
         let plan_value = json.get("plan").cloned().unwrap_or(json);
         let plan: CircuitPlan = match serde_json::from_value(plan_value) {
             Ok(p) => p,
-            Err(e) => return self.retry_or_fail(format!("The plan does not match the contract: {}. Fix it and reply with {{\"plan\": {{...}}}} only.", e)),
+            Err(e) => return self.retry_or_fail(format!("The plan does not match the contract: {}. Fix it and reply with {{\"plan\": {{...}}}} only.", e)).map(Step::Ask).unwrap_or(Step::Done),
         };
-        self.accept_plan(plan)
+        self.phase = Phase::Thinking;
+        Step::Check(plan)
     }
 
     /// Run the engine checks on a plan; fix what can be fixed, ask the user
     /// what needs a choice, send the rest back to the model.
     pub fn accept_plan(&mut self, plan: CircuitPlan) -> Option<ModelCall> {
-        let (plan, check) = check_plan(plan);
+        let (plan, check) = check_plan(plan, &self.custom_symbols);
+        self.apply_check(plan, check)
+    }
+
+    /// Apply a finished check (see `check_plan`).
+    pub fn apply_check(&mut self, plan: CircuitPlan, check: PlanCheck) -> Option<ModelCall> {
         for f in &check.fixes {
             self.turns.push(Turn::Engine(format!("fixed: {}", f)));
         }
@@ -204,12 +236,20 @@ impl Interview {
         let mut qs: Vec<Question> = Vec::new();
         for i in &check.issues {
             match i {
-                Issue::SymbolMissing { reference, lib_id, candidates } if !candidates.is_empty() => qs.push(Question {
+                Issue::SymbolMissing { reference, lib_id, candidates } => qs.push(Question {
                     id: format!("symbol:{}", reference),
-                    text: format!("{}: the symbol \"{}\" is not in the KiCad libraries. Which part is it?", reference, lib_id),
-                    options: candidates.clone(),
+                    text: if candidates.is_empty() {
+                        format!("{}: no KiCad library symbol is called \"{}\". Type the right \"Lib:Name\", or keep it custom.", reference, lib_id)
+                    } else {
+                        format!("{}: the symbol \"{}\" is not in the KiCad libraries. Which part is it?", reference, lib_id)
+                    },
+                    options: {
+                        let mut o = candidates.clone();
+                        o.push(KEEP_CUSTOM.to_string());
+                        o
+                    },
                     recommended: Some(0),
-                    why: "The pinout comes from the library symbol; a wrong symbol is a wrong pinout.".into(),
+                    why: "The pinout is checked against the library symbol; a custom part is built from its footprint with the pins the plan names.".into(),
                     allow_other: true,
                 }),
                 Issue::FootprintMissing { reference, footprint, candidates } if !candidates.is_empty() => qs.push(Question {
@@ -223,7 +263,7 @@ impl Interview {
                 _ => {}
             }
         }
-        let model_fixable: Vec<&Issue> = check.issues.iter().filter(|i| !matches!(i, Issue::SymbolMissing { candidates, .. } | Issue::FootprintMissing { candidates, .. } if !candidates.is_empty())).collect();
+        let model_fixable: Vec<&Issue> = check.issues.iter().filter(|i| !matches!(i, Issue::SymbolMissing { .. }) && !matches!(i, Issue::FootprintMissing { candidates, .. } if !candidates.is_empty())).collect();
         if !qs.is_empty() {
             self.selections = qs.iter().map(|q| (q.recommended, String::new())).collect();
             self.pending = qs;
@@ -258,8 +298,17 @@ impl Interview {
     /// Submit the answers: engine questions are applied to the plan directly;
     /// model questions go back to the model with the transcript.
     pub fn submit(&mut self) -> Option<ModelCall> {
+        match self.submit_step() {
+            Step::Ask(c) => Some(c),
+            Step::Check(plan) => self.accept_plan(plan),
+            Step::Done => None,
+        }
+    }
+
+    /// Like `submit`, with the plan check left to the caller.
+    pub fn submit_step(&mut self) -> Step {
         if !self.answers_complete() {
-            return None;
+            return Step::Done;
         }
         let answers: Vec<Answer> = self
             .pending
@@ -275,7 +324,11 @@ impl Interview {
             let mut plan = self.plan.clone().unwrap_or_else(|| serde_json::from_str("{\"name\":\"\",\"description\":\"\",\"components\":[],\"nets\":[]}").unwrap());
             for a in &answers {
                 if let Some(r) = a.id.strip_prefix("symbol:") {
-                    if let Some(c) = plan.components.iter_mut().find(|c| c.reference == r) {
+                    if a.text == KEEP_CUSTOM {
+                        if !self.custom_symbols.iter().any(|c| c == r) {
+                            self.custom_symbols.push(r.to_string());
+                        }
+                    } else if let Some(c) = plan.components.iter_mut().find(|c| c.reference == r) {
                         c.lib_id = a.text.clone();
                     }
                 } else if let Some(r) = a.id.strip_prefix("footprint:") {
@@ -284,11 +337,12 @@ impl Interview {
                     }
                 }
             }
-            return self.accept_plan(plan);
+            self.phase = Phase::Thinking;
+            return Step::Check(plan);
         }
         self.phase = Phase::Thinking;
         self.model_rounds += 1;
-        Some(self.call())
+        Step::Ask(self.call())
     }
 
     fn retry_or_fail(&mut self, correction: String) -> Option<ModelCall> {
@@ -339,14 +393,14 @@ impl Interview {
 
 /// The engine's checks on a plan. Returns the plan with the engine's own
 /// substitutions applied and the verdict.
-pub fn check_plan(mut plan: CircuitPlan) -> (CircuitPlan, PlanCheck) {
+pub fn check_plan(mut plan: CircuitPlan, custom_symbols: &[String]) -> (CircuitPlan, PlanCheck) {
     let mut check = PlanCheck::default();
     if let Err(e) = validate_plan(&plan) {
         check.issues.push(Issue::Invalid(e.to_string()));
     }
     for c in plan.components.iter_mut() {
         // symbol: exact, else one unambiguous candidate (NE555 + DIP → NE555P), else ask
-        if !super::symbols::exists(&c.lib_id) {
+        if !custom_symbols.contains(&c.reference) && !super::symbols::exists(&c.lib_id) {
             let cands = super::symbols::closest(&c.lib_id, 6);
             let pick = pick_by_package(&cands, c.footprint.as_deref());
             match pick {
@@ -381,15 +435,20 @@ pub fn check_plan(mut plan: CircuitPlan) -> (CircuitPlan, PlanCheck) {
     }
     // pins against symbols and footprints
     for c in &plan.components {
-        let sym = super::symbols::load(&c.lib_id).ok();
+        let sym = if custom_symbols.contains(&c.reference) { None } else { super::symbols::load(&c.lib_id).ok() };
         let fp = c.footprint.as_deref().and_then(|f| crate::footprint_lib::load(f).ok());
+        let pads: Vec<String> = fp.as_ref().map(|f| f.pads.iter().map(|p| p.number.clone()).collect()).unwrap_or_default();
         if let Some(s) = &sym {
             check.pin_maps.insert(c.reference.clone(), format!("{}: {}", s.lib_id, super::symbols::pin_map_line(s)));
+        } else if custom_symbols.contains(&c.reference) {
+            check.pin_maps.insert(c.reference.clone(), format!("{} (custom part, pads from the footprint): {}", c.lib_id, pads.join(" ")));
         }
         let used: Vec<String> = plan.nets.iter().flat_map(|n| n.pins.iter()).filter_map(|p| p.split_once(':')).filter(|(r, _)| *r == c.reference).map(|(_, pin)| pin.to_string()).collect();
         if let Some(s) = &sym {
             for pin in &used {
-                if s.pin(pin).is_none() {
+                // a pad the footprint has but the symbol does not (mounting
+                // pads, shields) is mechanical, not a wrong pin
+                if s.pin(pin).is_none() && !pads.iter().any(|p| p == pin) {
                     check.issues.push(Issue::PinNotOnSymbol { reference: c.reference.clone(), pin: pin.clone(), lib_id: s.lib_id.clone(), pins: super::symbols::pin_map_line(s) });
                 }
             }
@@ -401,8 +460,7 @@ pub fn check_plan(mut plan: CircuitPlan) -> (CircuitPlan, PlanCheck) {
                 }
             }
         }
-        if let Some(f) = &fp {
-            let pads: Vec<String> = f.pads.iter().map(|p| p.number.clone()).collect();
+        if fp.is_some() {
             for pin in &used {
                 if !pads.iter().any(|p| p == pin) {
                     check.issues.push(Issue::PinNotOnFootprint { reference: c.reference.clone(), pin: pin.clone(), footprint: c.footprint.clone().unwrap_or_default(), pads: pads.join(" ") });

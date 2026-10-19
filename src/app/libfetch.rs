@@ -122,13 +122,41 @@ pub fn models_referenced(kicad_mod: &str) -> Vec<String> {
     out
 }
 
+/// A library or footprint/model name: letters, digits, `_ . + -` only
+/// (what KiCad's own libraries use), never `..`.
+fn safe_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 200 && !s.contains("..") && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-'))
+}
+
+/// `dest` must stay inside `root` after normalization.
+fn inside(root: &Path, dest: &Path) -> bool {
+    let norm = |p: &Path| -> PathBuf {
+        let mut out = PathBuf::new();
+        for c in p.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
+    };
+    norm(dest).starts_with(norm(root))
+}
+
 fn fetch_footprint(lib_id: &str) -> Outcome {
     let Some((lib, name)) = lib_id.split_once(':') else { return Outcome::Missing("not Lib:Name".into()) };
-    if lib.contains("..") || name.contains("..") || lib.contains('/') || name.contains('/') {
+    if !safe_name(lib) || !safe_name(name) {
         return Outcome::Missing("invalid name".into());
     }
-    let url = KICAD_FP_RAW.replace("{lib}", lib).replace("{name}", name);
-    let dest = footprint_dir().join(format!("{}.pretty", lib)).join(format!("{}.kicad_mod", name));
+    let url = KICAD_FP_RAW.replace("{lib}", &percent(lib)).replace("{name}", &percent(name));
+    let root = footprint_dir();
+    let dest = root.join(format!("{}.pretty", lib)).join(format!("{}.kicad_mod", name));
+    if !inside(&root, &dest) {
+        return Outcome::Missing("invalid path".into());
+    }
     match download(&url, &dest) {
         Ok(()) => match std::fs::read_to_string(&dest).ok().and_then(|t| crate::footprint_lib::parse_kicad_mod(&t).ok()) {
             Some(_) => Outcome::Fetched(dest),
@@ -142,15 +170,40 @@ fn fetch_footprint(lib_id: &str) -> Outcome {
 }
 
 fn fetch_model(rel: &str) -> Outcome {
-    if rel.contains("..") {
+    // exactly `<Lib>.3dshapes/<Name>.<step|stp|wrl>`
+    let ok = match rel.split_once('/') {
+        Some((dir, file)) => {
+            safe_name(dir) && dir.ends_with(".3dshapes") && safe_name(file) && file.rsplit_once('.').map(|(_, ext)| matches!(ext.to_ascii_lowercase().as_str(), "step" | "stp" | "wrl")).unwrap_or(false)
+        }
+        None => false,
+    };
+    if !ok {
         return Outcome::Missing("invalid path".into());
     }
-    let url = KICAD_3D_RAW.replace("{rel}", rel);
-    let dest = model_dir().join(rel);
+    let (dir, file) = rel.split_once('/').unwrap();
+    let url = KICAD_3D_RAW.replace("{rel}", &format!("{}/{}", percent(dir), percent(file)));
+    let root = model_dir();
+    let dest = root.join(dir).join(file);
+    if !inside(&root, &dest) {
+        return Outcome::Missing("invalid path".into());
+    }
     match download(&url, &dest) {
         Ok(()) => Outcome::Fetched(dest),
         Err(e) => Outcome::Missing(e),
     }
+}
+
+/// Percent-encode a path segment (RFC 3986 unreserved characters kept).
+fn percent(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
 }
 
 fn download(url: &str, dest: &Path) -> Result<(), String> {
@@ -178,6 +231,12 @@ mod tests {
         assert_eq!(models_referenced(t), vec!["Resistor_SMD.3dshapes/R_0603_1608Metric.step".to_string(), "A.3dshapes/B.wrl".to_string()]);
         assert!(matches!(fetch_footprint("bad"), Outcome::Missing(_)));
         assert!(matches!(fetch_footprint("../x:y"), Outcome::Missing(_)));
+        assert!(matches!(fetch_footprint("Lib:a/b"), Outcome::Missing(_)));
+        assert!(matches!(fetch_model("../../etc/passwd"), Outcome::Missing(_)));
+        assert!(matches!(fetch_model("Lib.3dshapes/x.exe"), Outcome::Missing(_)));
+        assert!(matches!(fetch_model("Lib/x.step"), Outcome::Missing(_)));
+        assert!(safe_name("R_0603_1608Metric") && !safe_name("a b") && !safe_name("x..y"));
+        assert_eq!(percent("A+B C"), "A%2BB%20C");
     }
 
     /// Network: fetches a real footprint and its model into a temp data dir.

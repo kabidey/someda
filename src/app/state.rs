@@ -4,7 +4,7 @@
 
 use super::config::AppConfig;
 use super::deps::{InstallPlan, Report};
-use super::interview::{Interview, ModelCall, Phase};
+use super::interview::{Interview, ModelCall, Phase, PlanCheck, Step};
 use super::project::{self, Project};
 use super::providers::{self, Protocol};
 use super::runner::{self, BuildEvent, BuildRequest, BuildSummary};
@@ -73,6 +73,8 @@ pub enum Event {
     Select { question: usize, option: Option<usize>, other: String },
     SubmitAnswers,
     ModelReplied(Result<String, String>),
+    /// The worker finished `check_plan` (plan with engine fixes applied, verdict).
+    PlanChecked(Box<(CircuitPlan, PlanCheck)>),
     /// Review → (fetch what the libraries lack) → build.
     StartBuild,
     LibrariesFetched(super::libfetch::FetchReport),
@@ -102,6 +104,8 @@ pub enum Effect {
     Install(InstallPlan),
     /// Send this to the model; the reply comes back as `ModelReplied`.
     AskModel(ModelCall),
+    /// Run `interview::check_plan` off the UI thread; the result comes back as `PlanChecked`.
+    CheckPlan { plan: CircuitPlan, custom_symbols: Vec<String> },
     /// Start the engine; lines come back as `BuildOutput`.
     SpawnBuild(BuildRequest),
     /// Fetch these footprints (and their 3D models) from KiCad's repositories.
@@ -194,6 +198,18 @@ impl AppState {
             }
         }
         self.interview.plan.clone()
+    }
+
+    fn after_step(&mut self, step: Step, iv_phase: Phase, custom: Vec<String>) -> Effect {
+        match step {
+            Step::Ask(c) => self.after_model_call(Some(c), iv_phase),
+            Step::Check(plan) => {
+                self.busy = Busy::Thinking;
+                self.status = "Checking every part against the KiCad libraries…".into();
+                Effect::CheckPlan { plan, custom_symbols: custom }
+            }
+            Step::Done => self.after_model_call(None, iv_phase),
+        }
     }
 
     fn after_model_call(&mut self, call: Option<ModelCall>, iv_phase: Phase) -> Effect {
@@ -437,25 +453,38 @@ impl AppState {
             }
             Event::SubmitAnswers => {
                 if let Some(iv) = self.edit_interview.as_mut() {
-                    let call = iv.submit();
-                    let phase = iv.phase;
-                    let eff = self.after_model_call(call, phase);
+                    let step = iv.submit_step();
+                    let (phase, custom) = (iv.phase, iv.custom_symbols.clone());
+                    let eff = self.after_step(step, phase, custom);
                     self.settle_edit();
                     return eff;
                 }
-                let call = self.interview.submit();
-                let phase = self.interview.phase;
-                self.after_model_call(call, phase)
+                let step = self.interview.submit_step();
+                let (phase, custom) = (self.interview.phase, self.interview.custom_symbols.clone());
+                self.after_step(step, phase, custom)
             }
             Event::ModelReplied(r) => {
                 if let Some(iv) = self.edit_interview.as_mut() {
-                    let call = iv.model_replied(r);
+                    let step = iv.model_replied_step(r);
+                    let (phase, custom) = (iv.phase, iv.custom_symbols.clone());
+                    let eff = self.after_step(step, phase, custom);
+                    self.settle_edit();
+                    return eff;
+                }
+                let step = self.interview.model_replied_step(r);
+                let (phase, custom) = (self.interview.phase, self.interview.custom_symbols.clone());
+                self.after_step(step, phase, custom)
+            }
+            Event::PlanChecked(boxed) => {
+                let (plan, check) = *boxed;
+                if let Some(iv) = self.edit_interview.as_mut() {
+                    let call = iv.apply_check(plan, check);
                     let phase = iv.phase;
                     let eff = self.after_model_call(call, phase);
                     self.settle_edit();
                     return eff;
                 }
-                let call = self.interview.model_replied(r);
+                let call = self.interview.apply_check(plan, check);
                 let phase = self.interview.phase;
                 self.after_model_call(call, phase)
             }
@@ -630,7 +659,10 @@ mod tests {
           "components":[{"reference":"R1","value":"10k","lib_id":"Device:R","footprint":"Resistor_SMD:R_0603_1608Metri"},
                         {"reference":"R2","value":"10k","lib_id":"Device:R","footprint":"Resistor_SMD:R_0603_1608Metric"}],
           "nets":[{"name":"A","pins":["R1:1","R2:1"]},{"name":"GND","pins":["R1:2","R2:2"]}]}}"#;
-        assert_eq!(s.apply(Event::ModelReplied(Ok(plan.into()))), Effect::None);
+        let eff = s.apply(Event::ModelReplied(Ok(plan.into())));
+        let Effect::CheckPlan { plan: p, custom_symbols } = eff else { panic!("{:?}", eff) };
+        let (p, c) = super::super::interview::check_plan(p, &custom_symbols);
+        assert_eq!(s.apply(Event::PlanChecked(Box::new((p, c)))), Effect::None);
         assert_eq!(s.interview.phase, Phase::Review, "{:?}", s.interview.error);
         // build: libraries are checked first, then the plan is saved as v1 and the engine is spawned
         match s.apply(Event::StartBuild) {
@@ -655,7 +687,10 @@ mod tests {
         s.apply(Event::EditRequested);
         assert!(matches!(s.apply(Event::EditPrompt("make R1 22k".into())), Effect::AskModel(_)));
         let edited = plan.replace("\"value\":\"10k\",\"lib_id\":\"Device:R\",\"footprint\":\"Resistor_SMD:R_0603_1608Metri\"", "\"value\":\"22k\",\"lib_id\":\"Device:R\",\"footprint\":\"Resistor_SMD:R_0603_1608Metric\"");
-        assert_eq!(s.apply(Event::ModelReplied(Ok(edited))), Effect::None);
+        let eff = s.apply(Event::ModelReplied(Ok(edited)));
+        let Effect::CheckPlan { plan: p, custom_symbols } = eff else { panic!("{:?}", eff) };
+        let (p, c) = super::super::interview::check_plan(p, &custom_symbols);
+        assert_eq!(s.apply(Event::PlanChecked(Box::new((p, c)))), Effect::None);
         assert!(s.proposal.is_some(), "{:?}", s.status);
         assert!(s.proposal_diff.iter().any(|l| l.contains("R1") && l.contains("22k")), "{:?}", s.proposal_diff);
         match s.apply(Event::ConfirmEdit) {

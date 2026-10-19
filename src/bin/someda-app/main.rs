@@ -79,6 +79,12 @@ impl App {
                     let _ = tx.send(Event::ModelReplied(r));
                 });
             }
+            Effect::CheckPlan { plan, custom_symbols } => {
+                std::thread::spawn(move || {
+                    let r = someda::app::interview::check_plan(plan, &custom_symbols);
+                    let _ = tx.send(Event::PlanChecked(Box::new(r)));
+                });
+            }
             Effect::FetchLibraries { footprints, system_model_dir } => {
                 std::thread::spawn(move || {
                     let r = someda::app::libfetch::fetch_for(&footprints, system_model_dir.as_deref());

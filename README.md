@@ -60,9 +60,11 @@ Double-click it and it walks you through:
    the difference and confirm; the engine builds the next version (every version's plan and
    outputs are kept).
 
-Verified on Linux under a virtual display with the 555 quick start (all six gates, then an
-edit and all six gates again). The Windows and macOS binaries are built by the same release
-workflow but their KiCad install flows have not been executed on those systems yet.
+Verified on Linux under a virtual display with the 555 quick start against an
+OpenAI-compatible server (all six gates, then an edit and all six gates again). The Anthropic
+path implements the published Messages API but was not round-tripped against the live service
+in that environment. The Windows and macOS binaries are built by the same release workflow;
+their KiCad install flows have not been executed on those systems yet.
 
 ## Install
 

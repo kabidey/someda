@@ -254,11 +254,20 @@ pub fn edit(ui: &mut egui::Ui, st: &AppState, prompt: &mut String) -> Pending {
             // the engine needs a choice (e.g. a part the libraries lack)
             for (i, q) in iv.pending.iter().enumerate() {
                 ui.label(egui::RichText::new(&q.text).strong());
-                let (sel, _) = iv.selections.get(i).cloned().unwrap_or((None, String::new()));
+                let (sel, other) = iv.selections.get(i).cloned().unwrap_or((None, String::new()));
                 for (oi, opt) in q.options.iter().enumerate() {
                     if ui.radio(sel == Some(oi), opt).clicked() {
                         out.push(Event::Select { question: i, option: Some(oi), other: String::new() });
                     }
+                }
+                if q.allow_other {
+                    let mut txt = other.clone();
+                    ui.horizontal(|ui| {
+                        ui.radio(sel.is_none() && !other.trim().is_empty(), "other:");
+                        if ui.add(egui::TextEdit::singleline(&mut txt).desired_width(360.0)).changed() {
+                            out.push(Event::Select { question: i, option: None, other: txt.clone() });
+                        }
+                    });
                 }
             }
             if ui.add_enabled(iv.answers_complete(), egui::Button::new("Continue ▶")).clicked() {

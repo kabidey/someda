@@ -6,7 +6,29 @@
 //! checked against it before anything is built.
 
 use crate::sexp::{parse, Sexp};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Parsed libraries, by file path: a 9000-line library is parsed once per
+/// process, not once per part (live-measured: 4.9 s for a 132-part plan
+/// without this).
+fn cache() -> &'static Mutex<HashMap<PathBuf, Arc<Sexp>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<Sexp>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn parsed(path: &Path) -> Result<Arc<Sexp>, String> {
+    if let Some(d) = cache().lock().ok().and_then(|c| c.get(path).cloned()) {
+        return Ok(d);
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let doc = Arc::new(parse(&text).map_err(|e| e.to_string())?);
+    if let Ok(mut c) = cache().lock() {
+        c.insert(path.to_path_buf(), doc.clone());
+    }
+    Ok(doc)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pin {
@@ -45,12 +67,16 @@ pub fn resolve(lib_id: &str) -> Option<PathBuf> {
 pub fn load(lib_id: &str) -> Result<Symbol, String> {
     let (lib, name) = lib_id.split_once(':').ok_or_else(|| format!("'{}' is not Lib:Name", lib_id))?;
     let path = resolve(lib_id).ok_or_else(|| format!("symbol library '{}' is not installed", lib))?;
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-    load_from_text(&text, lib, name)
+    let doc = parsed(&path)?;
+    load_from_doc(&doc, lib, name)
 }
 
 pub fn load_from_text(text: &str, lib: &str, name: &str) -> Result<Symbol, String> {
     let doc = parse(text).map_err(|e| e.to_string())?;
+    load_from_doc(&doc, lib, name)
+}
+
+fn load_from_doc(doc: &Sexp, lib: &str, name: &str) -> Result<Symbol, String> {
     let items = doc.as_tagged("kicad_symbol_lib").ok_or("not a kicad_symbol_lib")?;
     let find = |want: &str| -> Option<&[Sexp]> {
         items.iter().find_map(|it| {
@@ -105,8 +131,7 @@ fn numeric_key(s: &str) -> (u32, u64) {
 /// Symbol names in a library (for the "which part?" question).
 pub fn list_library(lib: &str) -> Vec<String> {
     let Some(path) = super::deps::symbol_dirs().into_iter().map(|d| d.join(format!("{}.kicad_sym", lib))).find(|p| p.is_file()) else { return vec![] };
-    let Ok(text) = std::fs::read_to_string(&path) else { return vec![] };
-    let Ok(doc) = parse(&text) else { return vec![] };
+    let Ok(doc) = parsed(&path) else { return vec![] };
     let Some(items) = doc.as_tagged("kicad_symbol_lib") else { return vec![] };
     let mut names: Vec<String> = items.iter().filter_map(|it| it.as_tagged("symbol")?.first()?.str_value().map(|s| s.to_string())).collect();
     names.sort();
@@ -182,9 +207,20 @@ pub fn closest(lib_id: &str, limit: usize) -> Vec<String> {
         out.push(format!("{}:{}", lib, n));
     }
     if out.is_empty() {
-        for other in libraries() {
-            if other != lib && list_library(&other).iter().any(|n| n == name) {
-                out.push(format!("{}:{}", other, name));
+        // exact name in another library: a text scan, no parse (224 libraries)
+        let needle = format!("(symbol \"{}\"", name);
+        for d in super::deps::symbol_dirs() {
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().and_then(|x| x.to_str()) == Some("kicad_sym")).collect();
+            files.sort();
+            for f in files {
+                let Some(other) = f.file_stem().and_then(|x| x.to_str()) else { continue };
+                if other == lib {
+                    continue;
+                }
+                if std::fs::read_to_string(&f).map(|t| t.contains(&needle)).unwrap_or(false) {
+                    out.push(format!("{}:{}", other, name));
+                }
             }
         }
     }
