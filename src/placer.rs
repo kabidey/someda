@@ -164,7 +164,7 @@ fn overlaps(a: Rect, b: Rect, gap: f64) -> bool {
 
 impl Placer {
     pub fn new(board_w: f64, board_h: f64) -> Placer {
-        Placer { board_w, board_h, pitch: 10.0, gap: 0.6, margin: 0.5, escape_ring: 3.0 }
+        Placer { board_w, board_h, pitch: 10.0, gap: 0.6, margin: 0.5, escape_ring: 3.6 }
     }
 
     /// Courtyard-aware placement from real footprint geometry.

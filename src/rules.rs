@@ -57,9 +57,11 @@ impl DesignRules {
                 trace_width_mm: 0.127,
                 power_trace_width_mm: 0.4,
                 clearance_mm: 0.127,
-                via_diameter_mm: 0.5,
-                via_drill_mm: 0.3,
-                hole_to_hole_mm: 0.5,
+                // JLCPCB multilayer via minimum 0.2 hole / 0.35 pad: the only
+                // via that fits between 0.4mm-pitch escape stubs
+                via_diameter_mm: 0.35,
+                via_drill_mm: 0.2,
+                hole_to_hole_mm: 0.45,
                 hole_clearance_mm: 0.2,
                 edge_clearance_mm: 0.5,
                 solder_mask_min_width_mm: 0.1,

@@ -74,6 +74,8 @@ pub struct RouteResult {
     pub total_edges: usize,
     /// Plane-net pads fanned out to a via (or reaching the plane directly)
     pub fanouts: usize,
+    /// Fine-pitch signal pads given a pre-assigned escape via
+    pub escapes: usize,
 }
 
 impl RouteResult {
@@ -91,6 +93,9 @@ impl RouteResult {
         );
         if self.fanouts > 0 {
             s.push_str(&format!(", {} plane fanouts", self.fanouts));
+        }
+        if self.escapes > 0 {
+            s.push_str(&format!(", {} escape vias", self.escapes));
         }
         s
     }
@@ -150,6 +155,8 @@ pub struct RouterConfig {
     pub escape_mm: f64,
     /// Soft-cost band beyond the fine-pitch pad tips (mm).
     pub escape_band_mm: f64,
+    /// Extra cost per sideways step inside an escape band (grid units).
+    pub band_side_cost: f64,
 }
 
 impl Default for RouterConfig {
@@ -175,8 +182,9 @@ impl Default for RouterConfig {
             fanout_max_mm: 3.0,
             rip_up_passes: 2,
             via_cost_mm: 2.0,
-            escape_mm: 1.5,
-            escape_band_mm: 3.5,
+            escape_mm: 1.0,
+            escape_band_mm: 3.2,
+            band_side_cost: 4.0,
         }
     }
 }
@@ -209,8 +217,9 @@ impl RouterConfig {
             fanout_max_mm: 3.0,
             rip_up_passes: 3,
             via_cost_mm: 2.0,
-            escape_mm: 1.5,
-            escape_band_mm: 3.5,
+            escape_mm: 1.0,
+            escape_band_mm: 3.2,
+            band_side_cost: 4.0,
         }
     }
 }
@@ -289,6 +298,12 @@ struct Grid {
     /// Per cell/layer extra step cost (×0.25 grid units): the escape bands
     /// around fine-pitch parts are expensive to run along, cheap to cross.
     cost: Vec<u8>,
+    /// 2D: net tag owning an escape lane through this cell (0 = none).
+    /// No via of another net may sit within its halo of a lane.
+    lane: Vec<u32>,
+    /// Per cell/layer: escape band orientation — 1 = lanes run along x
+    /// (sideways = y moves are penalized), 2 = lanes along y, 0 = none.
+    band_axis: Vec<u8>,
 }
 
 impl Grid {
@@ -303,6 +318,8 @@ impl Grid {
             copper_pad: vec![0; n],
             via_forbidden: vec![0; w * h],
             cost: vec![0; n],
+            lane: vec![0; w * h],
+            band_axis: vec![0; n],
         }
     }
     #[inline]
@@ -585,6 +602,7 @@ impl Router {
         let mut state = RouteState {
             routed: Vec::new(),
             fanouts: Vec::new(),
+            escapes: Vec::new(),
             failed: Vec::new(),
             fanout_failed: Vec::new(),
         };
@@ -592,6 +610,7 @@ impl Router {
         let mut dsu = Dsu::new(pads.len());
         self.stamp_static(&mut grid, &pads, bx1 - bx0, by1 - by0);
         self.stamp_keepouts(&mut grid, board, bx0, by0);
+        self.escape_vias(&mut grid, &pads, &plane_ids, &mut state);
         self.fanout_planes(&mut grid, &pads, &plane_ids, &mut state, &net_name);
         // Plane pads that found no via site are routed as ordinary
         // connections to the nearest member of their net that did.
@@ -691,7 +710,17 @@ impl Router {
                 }
                 victims.sort_by(|p, q| q.1.cmp(&p.1).then(p.0.cmp(&q.0)));
                 victims.truncate(6);
-                let victim_indexes: Vec<usize> = victims.iter().map(|v| v.0).collect();
+                // Rip every routed edge of a victim's NET: later edges of
+                // that net may end on the victim's copper (route-to-net),
+                // and would dangle without it (live-verified by KiCad).
+                let victim_nets: Vec<usize> = victims.iter().map(|v| state.routed[v.0].net).collect();
+                let victim_indexes: Vec<usize> = state
+                    .routed
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| victim_nets.contains(&r.net))
+                    .map(|(i, _)| i)
+                    .collect();
                 let ripped: Vec<RoutedEdge> = victim_indexes.iter().map(|&i| state.routed[i].clone()).collect();
                 let mut trial_routed: Vec<RoutedEdge> = state
                     .routed
@@ -705,6 +734,14 @@ impl Router {
                 let mut dsu2 = Dsu::new(pads.len());
                 self.stamp_static(&mut g2, &pads, bx1 - bx0, by1 - by0);
                 self.stamp_keepouts(&mut g2, board, bx0, by0);
+                self.replay_fanouts(&mut g2, &pads, &state.escapes);
+                for e in &state.escapes {
+                    for c in &e.cells {
+                        if c.x >= 0 && c.y >= 0 && (c.x as usize) < g2.w && (c.y as usize) < g2.h {
+                            g2.lane[c.y as usize * g2.w + c.x as usize] = e.net as u32 + 1;
+                        }
+                    }
+                }
                 self.replay_fanouts(&mut g2, &pads, &state.fanouts);
                 for r in &trial_routed {
                     self.stamp_path(&mut g2, &r.cells, r.net, r.width, r.from_pad);
@@ -743,6 +780,25 @@ impl Router {
                     grid = g2;
                     dsu = dsu2;
                 }
+            }
+        }
+        // ─── Final retries: later rip-ups reshape the board; every edge
+        // still failed gets plain attempts until no progress ───
+        loop {
+            let before = state.failed.len();
+            let failed_now = state.failed.clone();
+            for k in failed_now {
+                let (ei, e, a, b, nid) = edges[k];
+                let width = edge_width(e, a, b);
+                if let Some(cells) = self.route_edge(&mut grid, &pads, &mut dsu, a, b, nid, width) {
+                    self.stamp_path(&mut grid, &cells, nid, width, a);
+                    dsu.union(a, b);
+                    state.routed.push(RoutedEdge { edge_index: ei, cells, width, net: nid, from_pad: a });
+                    state.failed.retain(|&f| f != k);
+                }
+            }
+            if state.failed.len() >= before {
+                break;
             }
         }
         let _ = (&grid, &dsu);
@@ -789,7 +845,7 @@ impl Router {
                 };
                 if verbose {
                     for (label, pd) in [("from", pa), ("to", pb)] {
-                        let r = (2.0 / pitch) as i32;
+                        let r = (3.5 / pitch) as i32;
                         let (gx, gy) = ((pd.x / pitch).round() as i32, (pd.y / pitch).round() as i32);
                         eprintln!("route-debug: occupancy around {} {}:{} (net tag {}; '.' free, '#' block, 'o' own net, 'x' other net, 'O' own copper, 'X' other copper):", label, pd.reference, pd.number, edges[k].4 + 1);
                         for l in 0..grid.layers as u8 {
@@ -837,6 +893,20 @@ impl Router {
                 });
             }
             result.fanouts += 1;
+        }
+        for e in &state.escapes {
+            let name = net_name(e.net);
+            self.emit_path(&mut result, &e.cells, (e.net, name.clone()), self.config.trace_width, bx0, by0);
+            if let Some((vx, vy)) = e.via {
+                result.vias.push(Via {
+                    net: (e.net, name),
+                    x: vx as f64 * pitch + bx0,
+                    y: vy as f64 * pitch + by0,
+                    size: self.config.via_size,
+                    drill: self.config.via_drill,
+                });
+            }
+            result.escapes += 1;
         }
         for &k in &state.failed {
             let (_, e, _, _, nid) = edges[k];
@@ -1002,6 +1072,33 @@ impl Router {
                 }
             }
         }
+        // PAD PROXIMITY COST: cells hugging any pad (0.45mm beyond its
+        // halo) cost extra, so traces of other nets do not wrap a pad and
+        // box it in before its own connections are routed (live-verified:
+        // targets sealed by a ring of earlier traces).
+        {
+            let ring = 0.45;
+            for p in pads {
+                if p.npth {
+                    continue;
+                }
+                let (rx, ry) = (p.hx + self.config.clearance + tw2 + ring, p.hy + self.config.clearance + tw2 + ring);
+                let (gx0, gx1) = (((p.x - rx) / pitch).floor() as i32, ((p.x + rx) / pitch).ceil() as i32);
+                let (gy0, gy1) = (((p.y - ry) / pitch).floor() as i32, ((p.y + ry) / pitch).ceil() as i32);
+                for &l in &p.layers {
+                    for y in gy0..=gy1 {
+                        for x in gx0..=gx1 {
+                            let (cx, cy) = (x as f64 * pitch, y as f64 * pitch);
+                            if (cx - p.x).abs() <= rx && (cy - p.y).abs() <= ry {
+                                if let Some(i) = grid.idx(x, y, l) {
+                                    grid.cost[i] = grid.cost[i].max(8);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // ESCAPE BAND: the region from the fine-pitch pad tips outward to
         // `escape_band_mm` is expensive to traverse on the pads' layer, so
         // other nets' traces do not run along a pin row and wall the lane
@@ -1009,7 +1106,6 @@ impl Router {
         // every remaining pin of a side).
         {
             let band = self.config.escape_band_mm;
-            let band_cost = 12u8; // 3 grid units per cell
             for p in pads {
                 if !p.fine_pitch || p.npth || p.through {
                     continue;
@@ -1031,7 +1127,7 @@ impl Router {
                         for t in -span..=span {
                             let (x, y) = if along_x { (gx, gy + t) } else { (gx + t, gy) };
                             if let Some(i) = grid.idx(x, y, l) {
-                                grid.cost[i] = grid.cost[i].max(band_cost);
+                                grid.band_axis[i] = if along_x { 1 } else { 2 };
                             }
                         }
                     }
@@ -1071,6 +1167,9 @@ impl Router {
                             }
                             if grid.owner[i] == FREE {
                                 grid.owner[i] = tag;
+                            }
+                            if grid.owner[i] == tag && x >= 0 && y >= 0 && (x as usize) < grid.w && (y as usize) < grid.h {
+                                grid.lane[y as usize * grid.w + x as usize] = tag;
                             }
                         }
                     }
@@ -1227,6 +1326,17 @@ impl Router {
             return false;
         }
         let r = self.via_halo_cells();
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let (lx, ly) = (x + dx, y + dy);
+                if lx >= 0 && ly >= 0 && (lx as usize) < grid.w && (ly as usize) < grid.h {
+                    let lane = grid.lane[ly as usize * grid.w + lx as usize];
+                    if lane != 0 && lane != tag {
+                        return false; // would wall another pin's escape lane
+                    }
+                }
+            }
+        }
         for l in 0..grid.layers as u8 {
             for dy in -r..=r {
                 for dx in -r..=r {
@@ -1238,6 +1348,82 @@ impl Router {
             }
         }
         true
+    }
+
+    /// ESCAPE VIAS: every fine-pitch SIGNAL pad gets a straight stub out of
+    /// its lane to a pre-assigned via, depth-staggered over three rows so
+    /// adjacent 0.4mm-pitch pins' vias never touch (0.35mm vias keep
+    /// 0.366mm of blocking radius: a neighbour's stub passes at 0.4mm).
+    /// The pin's connection then starts on the inner layers where there is
+    /// room, instead of fighting for the pin-row surface.
+    fn escape_vias(&self, grid: &mut Grid, pads: &[RPad], plane_ids: &[usize], state: &mut RouteState) {
+        let pitch = self.config.grid;
+        let via_r = self.config.via_size / 2.0;
+        let step = (2 * self.via_halo_cells() + 1) as f64 * pitch + pitch;
+        for p in pads {
+            if !p.fine_pitch || p.npth || p.through {
+                continue;
+            }
+            let Some(net) = p.net else { continue };
+            if plane_ids.contains(&net) {
+                continue;
+            }
+            let tag = net as u32 + 1;
+            let along_x = p.hx >= p.hy;
+            let dir = if along_x { (p.x - p.fp_cx).signum() } else { (p.y - p.fp_cy).signum() };
+            if dir == 0.0 {
+                continue;
+            }
+            let tip = if along_x { p.hx } else { p.hy };
+            let Some(&layer) = p.layers.first() else { continue };
+            let k0 = (p.id % 3) as f64;
+            let mut placed = false;
+            for attempt in 0..9 {
+                let row = ((k0 as i32 + attempt) % 3) as f64;
+                let depth = tip + self.config.escape_mm + via_r + 0.1 + row * step + (attempt / 3) as f64 * 3.0 * step;
+                if depth > tip + self.config.escape_band_mm + 3.0 * step {
+                    break;
+                }
+                let (sx, sy) = if along_x { (p.x + dir * depth, p.y) } else { (p.x, p.y + dir * depth) };
+                let (gx, gy) = ((sx / pitch).round() as i32, (sy / pitch).round() as i32);
+                if !self.via_ok(grid, gx, gy, tag) {
+                    continue;
+                }
+                // the stub: pad centre cell → via cell, every cell free or own
+                let (px, py) = ((p.x / pitch).round() as i32, (p.y / pitch).round() as i32);
+                let mut cells: Vec<Cell> = Vec::new();
+                let n = if along_x { (gx - px).abs() } else { (gy - py).abs() };
+                let mut ok = true;
+                for i in 0..=n {
+                    let c = if along_x {
+                        Cell { x: px + i * (gx - px).signum(), y: py, layer }
+                    } else {
+                        Cell { x: px, y: py + i * (gy - py).signum(), layer }
+                    };
+                    let o = grid.owner_at(c);
+                    if o != FREE && o != tag {
+                        ok = false;
+                        break;
+                    }
+                    cells.push(c);
+                }
+                if !ok {
+                    continue;
+                }
+                self.stamp_path(grid, &cells, net, self.config.trace_width, p.id);
+                self.stamp_via(grid, gx, gy, net, p.id);
+                // the stub is this pad's lane now: nobody else's via near it
+                for c in &cells {
+                    if c.x >= 0 && c.y >= 0 && (c.x as usize) < grid.w && (c.y as usize) < grid.h {
+                        grid.lane[c.y as usize * grid.w + c.x as usize] = tag;
+                    }
+                }
+                state.escapes.push(Fanout { pad: p.id, net, cells, via: Some((gx, gy)) });
+                placed = true;
+                break;
+            }
+            let _ = placed;
+        }
     }
 
     /// Plane nets: every SMD pad gets a stub + via; through-hole pads reach
@@ -1275,17 +1461,40 @@ impl Router {
             }
             let tag = net as u32 + 1;
             let Some(&layer) = p.layers.first() else { continue };
-            // BFS from the pad's copper cells on its layer to the nearest
-            // legal via site (or existing plane-net copper that is not a pad).
+            // Cost-aware search (Dijkstra on the cell cost grid) from the
+            // pad's copper cells on its layer to the nearest legal via site
+            // or existing plane-net copper that is not a pad. Fine-pitch
+            // pads prefer sites INSIDE the footprint (under the body: no
+            // cost band there) and never drop the via inside their own
+            // escape lane — a via at a lane end walls the neighbouring
+            // lanes (live-verified: searches dying after <100 expansions).
             let starts = self.pad_cells(grid, p, layer);
-            let mut queue: std::collections::VecDeque<(Cell, i32)> = std::collections::VecDeque::new();
+            let lane_zone = |c: &Cell| -> bool {
+                if !p.fine_pitch {
+                    return false;
+                }
+                let (cx, cy) = (c.x as f64 * self.config.grid, c.y as f64 * self.config.grid);
+                let along_x = p.hx >= p.hy;
+                let dir = if along_x { (p.x - p.fp_cx).signum() } else { (p.y - p.fp_cy).signum() };
+                let out = if along_x { (cx - p.x) * dir } else { (cy - p.y) * dir };
+                let side = if along_x { (cy - p.y).abs() } else { (cx - p.x).abs() };
+                out > 0.0 && out < (if along_x { p.hx } else { p.hy }) + self.config.escape_mm + self.config.via_size && side < 1.0
+            };
+            let mut heap: BinaryHeap<Node> = BinaryHeap::new();
             let mut came: std::collections::HashMap<Cell, Cell> = std::collections::HashMap::new();
+            let mut best: std::collections::HashMap<Cell, f64> = std::collections::HashMap::new();
             for s in &starts {
-                queue.push_back((*s, 0));
+                heap.push(Node { cell: *s, f_score: 0.0 });
                 came.insert(*s, *s);
+                best.insert(*s, 0.0);
             }
             let mut found: Option<(Cell, bool)> = None;
-            while let Some((c, d)) = queue.pop_front() {
+            while let Some(node) = heap.pop() {
+                let c = node.cell;
+                let d = node.f_score;
+                if d > *best.get(&c).unwrap_or(&f64::INFINITY) + 1e-9 {
+                    continue;
+                }
                 let in_pad = grid.idx(c.x, c.y, c.layer).map(|i| grid.copper_pad[i] == p.id + 1).unwrap_or(false);
                 if !in_pad {
                     // existing copper of this plane net (a via or stub) counts as connected
@@ -1294,23 +1503,26 @@ impl Router {
                         found = Some((c, false));
                         break;
                     }
-                    if self.via_ok(grid, c.x, c.y, tag) && self.plane_reaches(&net_name_of(net), c.x, c.y) {
+                    if !lane_zone(&c) && self.via_ok(grid, c.x, c.y, tag) && self.plane_reaches(&net_name_of(net), c.x, c.y) {
                         found = Some((c, true));
                         break;
                     }
                 }
-                if d >= max_cells {
+                if d >= max_cells as f64 * 4.0 {
                     continue;
                 }
                 for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                     let n = Cell { x: c.x + dx, y: c.y + dy, layer: c.layer };
-                    if came.contains_key(&n) {
+                    let o = grid.owner_at(n);
+                    if o != FREE && o != tag {
                         continue;
                     }
-                    let o = grid.owner_at(n);
-                    if o == FREE || o == tag {
+                    let extra = grid.idx(n.x, n.y, n.layer).map(|i| grid.cost[i] as f64 * 0.25).unwrap_or(0.0);
+                    let nd = d + 1.0 + extra;
+                    if nd < *best.get(&n).unwrap_or(&f64::INFINITY) {
+                        best.insert(n, nd);
                         came.insert(n, c);
-                        queue.push_back((n, d + 1));
+                        heap.push(Node { cell: n, f_score: nd });
                     }
                 }
             }
@@ -1415,6 +1627,20 @@ impl Router {
                 let o = grid.owner_at(*c);
                 return o == FREE || o == tag;
             }
+            // Wide (power) traces never enter escape lanes or bands of
+            // other nets: a 0.4mm rail through a pin row walls the pins
+            // (live-verified: pin 48 sealed by a +1V8 trace).
+            if let Some(i) = grid.idx(c.x, c.y, c.layer) {
+                if grid.band_axis[i] != 0 {
+                    return false;
+                }
+            }
+            if c.x >= 0 && c.y >= 0 && (c.x as usize) < grid.w && (c.y as usize) < grid.h {
+                let lane = grid.lane[c.y as usize * grid.w + c.x as usize];
+                if lane != 0 && lane != tag {
+                    return false;
+                }
+            }
             for dy in -body..=body {
                 for dx in -body..=body {
                     let o = grid.owner_at(Cell { x: c.x + dx, y: c.y + dy, layer: c.layer });
@@ -1469,7 +1695,15 @@ impl Router {
                 } else {
                     0.0
                 };
-                let extra = grid.idx(next.x, next.y, next.layer).map(|i| grid.cost[i] as f64 * 0.25).unwrap_or(0.0);
+                let extra = grid.idx(next.x, next.y, next.layer).map(|i| {
+                    let iso = grid.cost[i] as f64 * 0.25;
+                    let sideways = match grid.band_axis[i] {
+                        1 => dy != 0,
+                        2 => dx != 0,
+                        _ => false,
+                    };
+                    iso + if sideways { self.config.band_side_cost } else { 0.0 }
+                }).unwrap_or(0.0);
                 let tentative = g_here + 1.0 + against + extra;
                 if tentative < *g_score.get(&next).unwrap_or(&f64::INFINITY) {
                     came_from.insert(next, node.cell);
@@ -1562,6 +1796,7 @@ impl Router {
 struct RouteState {
     routed: Vec<RoutedEdge>,
     fanouts: Vec<Fanout>,
+    escapes: Vec<Fanout>,
     failed: Vec<usize>,
     fanout_failed: Vec<u32>,
 }
