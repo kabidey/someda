@@ -1252,6 +1252,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_pin_matches_authoritative_transform() {
+        // The wire-target positions (parse_pin) must equal the RENDERED pin
+        // positions (the authoritative KiCad transform applied to the lib
+        // pins the generator emits) — for every pin of a multi-pin IC.
+        let plan: CircuitPlan = serde_json::from_str(r#"{
+            "name": "t", "description": "t",
+            "components": [
+                {"reference": "U1", "value": "NE555", "lib_id": "Timer:NE555"}
+            ],
+            "nets": [
+                {"name": "VCC", "pins": ["U1:1"]},
+                {"name": "OUT", "pins": ["U1:3"]},
+                {"name": "GND", "pins": ["U1:8"]}
+            ]
+        }"#).unwrap();
+        // The generator's emission geometry (mirrors generate_schematic):
+        // pins [1,3,8], n=3, half=2:
+        //  pi0 (pin "1"): lib (-5.08, (2-1-0)*2.54) = (-5.08, 2.54)
+        //  pi1 (pin "3"): lib (-5.08, (2-1-1)*2.54) = (-5.08, 0)
+        //  pi2 (pin "8"): right col k=0: lib (5.08, (0-(2-1))*2.54) = (5.08, -2.54)
+        let expected_lib = [
+            ("1", -5.08f64, 2.54f64),
+            ("3", -5.08, 0.0),
+            ("8", 5.08, -2.54),
+        ];
+        let idx = plan.components.iter().position(|c| c.reference == "U1").unwrap();
+        let ox = 50.8; // default placement for idx 0
+        let oy = 50.8;
+        for (num, px, py) in expected_lib {
+            // parse_pin says where the wire goes:
+            let (wx, wy) = parse_pin(&format!("U1:{}", num), &plan).unwrap();
+            // authoritative render of the lib pin at rot 0: origin + (px, -py)
+            let ex = ox + px;
+            let ey = oy - py;
+            assert!(
+                (wx - ex).abs() < 0.01 && (wy - ey).abs() < 0.01,
+                "pin {}: parse_pin ({:.2},{:.2}) vs render ({:.2},{:.2})",
+                num, wx, wy, ex, ey
+            );
+        }
+    }
+
+    #[test]
     fn full_pipeline_places_and_routes() {
         // The idea-to-PCB spine: model → place → route → serialize → reparse
         let plan = sample_plan();

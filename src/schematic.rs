@@ -128,17 +128,7 @@ impl Schematic {
 
     /// Absolute position of a pin on a placed instance.
     pub fn pin_absolute(&self, inst: &Instance, pin: &LibPin) -> (f64, f64) {
-        // AUTHORITATIVE (KiCad 10.0.6 live probes at instance rot 0 and 90,
-        // pins at all four directions): a lib pin stored at (px, py) renders
-        // at origin + R(−rot)·(px, −py) — mirror the lib Y, then rotate by
-        // MINUS the instance rotation (KiCad's schematic rotation is CW).
-        // The pin's own angle is its drawn direction, never a position term.
-        let r = (-inst.rot_deg).to_radians();
-        let mx = pin.x;
-        let my = -pin.y;
-        let ox = mx * r.cos() - my * r.sin();
-        let oy = mx * r.sin() + my * r.cos();
-        (inst.x + ox, inst.y + oy)
+        pin_absolute_transform(inst, pin)
     }
 
     /// All pins of an instance, resolved from its lib symbol.
@@ -421,6 +411,23 @@ fn points_match(a: (f64, f64), b: (f64, f64)) -> bool {
     (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01
 }
 
+/// AUTHORITATIVE pin transform (KiCad 10.0.6 live probes at instance rot
+/// 0/90/180/270, pins at all four directions): a lib pin stored at (px, py)
+/// renders at origin + R(−rot)·(px, −py) — mirror the lib Y, then rotate
+/// by MINUS the instance rotation. The pin's own angle is its drawn
+/// direction, never a position term.
+pub fn pin_absolute_transform(inst: &Instance, pin: &LibPin) -> (f64, f64) {
+    let r = (-inst.rot_deg).to_radians();
+    let mx = pin.x;
+    let my = -pin.y;
+    let ox = mx * r.cos() - my * r.sin();
+    let oy = mx * r.sin() + my * r.cos();
+    (inst.x + ox, inst.y + oy)
+}
+
+#[cfg(test)]
+pub use pin_absolute_transform as sch_under_test_pin_absolute;
+
 /// True if point (px,py) lies on the segment (x1,y1)-(x2,y2) within
 /// the connection tolerance.
 fn point_on_segment(px: f64, py: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> bool {
@@ -689,6 +696,101 @@ impl std::fmt::Display for ErcReport {
 #[cfg(test)]
 mod erc_tests {
     use super::*;
+
+    /// AUTHORITATIVE pin-transform regression: live-probed KiCad 10.0.6 at
+    /// instance rotations 0/90/180/270 with pins in all four directions.
+    /// Model: render = origin + R(-rot)·(px, -py).
+    #[test]
+    fn pin_transform_matches_kicad_all_rotations() {
+        // (lib px, lib py) -> KiCad-reported absolute at origin (100,100)
+        let cases: Vec<(f64, f64, f64, (f64, f64))> = vec![
+            // rot 0 (probe: probe.kicad_sch)
+            (-5.08, 0.0, 0.0, (94.92, 100.0)),
+            (5.08, 0.0, 0.0, (105.08, 100.0)),
+            (0.0, 5.08, 0.0, (100.0, 94.92)),
+            (0.0, -5.08, 0.0, (100.0, 105.08)),
+            // rot 90 (probe90)
+            (-5.08, 0.0, 90.0, (100.0, 105.08)),
+            (5.08, 0.0, 90.0, (100.0, 94.92)),
+            (0.0, 5.08, 90.0, (94.92, 100.0)),
+            // rot 180 (probe180)
+            (-5.08, 0.0, 180.0, (105.08, 100.0)),
+            (5.08, 0.0, 180.0, (94.92, 100.0)),
+            (0.0, 5.08, 180.0, (100.0, 105.08)),
+            (0.0, -5.08, 180.0, (100.0, 94.92)),
+            // rot 270 (probe270)
+            (-5.08, 0.0, 270.0, (100.0, 94.92)),
+            (5.08, 0.0, 270.0, (100.0, 105.08)),
+            (0.0, 5.08, 270.0, (105.08, 100.0)),
+            (0.0, -5.08, 270.0, (94.92, 100.0)),
+        ];
+        for (px, py, rot, expect) in cases {
+            let inst = Instance {
+                lib_id: "Probe:SYM".into(),
+                reference: "U9".into(),
+                value: String::new(),
+                x: 100.0,
+                y: 100.0,
+                rot_deg: rot,
+                is_power: false,
+            };
+            let pin = LibPin {
+                number: "1".into(),
+                name: "A".into(),
+                electric_type: "passive".into(),
+                x: px,
+                y: py,
+                rot_deg: 0.0,
+            };
+            let (ax, ay) = sch_under_test_pin_absolute(&inst, &pin);
+            assert!(
+                (ax - expect.0).abs() < 0.01 && (ay - expect.1).abs() < 0.01,
+                "rot {} pin ({},{}) -> ({:.2},{:.2}), KiCad says {:?}",
+                rot, px, py, ax, ay, expect
+            );
+        }
+    }
+
+    /// AUTHORITATIVE connection semantics (KiCad 10.0.6 netlist export,
+    /// exact geometry probe): a pin at a wire's ENDPOINT connects; a pin
+    /// sitting MID-WIRE does NOT. derive_nets must match this.
+    #[test]
+    fn derive_nets_matches_kicad_connection_semantics() {
+        let sch = Schematic::from_kicad_sch(r##"(kicad_sch (version 20220904)
+          (lib_symbols
+            (symbol "Device:R"
+              (symbol "R_0_1"
+                (pin passive line (at -5.08 0 0) (length 3.81) (name "~") (number "1"))
+                (pin passive line (at 5.08 0 180) (length 3.81) (name "~") (number "2"))
+              )
+            )
+          )
+          (symbol (lib_id "Device:R") (at 100 50 0)
+            (property "Reference" "R1" (at 0 0 0))
+          )
+          (symbol (lib_id "Device:R") (at 115.08 50 0)
+            (property "Reference" "R2" (at 0 0 0))
+          )
+          (wire (pts (xy 94.92 50) (xy 120.16 50)))
+          (wire (pts (xy 120.16 50) (xy 130 50)))
+        )"##).unwrap();
+        let nets = derive_nets(&sch);
+        // R1:1 (endpoint 94.92) and R2:2 (endpoint 120.16) share the wire chain
+        let endpoint_net = nets.iter().find(|n| {
+            n.pins.iter().any(|(r, p, _)| r == "R1" && p == "1")
+        }).expect("R1:1 must be in a net");
+        assert!(
+            endpoint_net.pins.iter().any(|(r, p, _)| r == "R2" && p == "2"),
+            "endpoint-connected pins share a net: {:?}",
+            endpoint_net.pins
+        );
+        // R2:1 (midwire at 110.0) must NOT be in any net with the wires
+        let midwire_connected = nets.iter().any(|n| {
+            n.pins.iter().any(|(r, p, _)| r == "R2" && p == "1")
+                && n.pins.len() > 1
+        });
+        assert!(!midwire_connected, "midwire pin must stay unconnected");
+    }
 
     #[test]
     fn erc_flags_missing_decoupling() {
