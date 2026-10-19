@@ -1,6 +1,6 @@
 [package]
 name = "someda"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 description = "Clean-room KiCad-compatible EDA core with AI orchestration: s-expression board model, DRC/ERC engines, net classes, verify-before-done repair loop, LLM gateway, and kicad-cli integration"
 license = "MIT"
