@@ -453,11 +453,16 @@ impl Router {
         };
         let turn_penalty = (1.0 / self.config.grid).max(1.0); // ≈1 mm per corner: each corner costs 4·offset of skew
         let near = self.near_radius_index(gap);
+        let halo_r = self.halo_cells(2.0 * (body as f64) * self.config.grid + self.config.trace_width);
         let free_cell = |c: Cell| -> bool {
             if forbid.contains(&c) {
                 return false;
             }
             if c.x < 0 || c.y < 0 || (c.x as usize) >= grid.w || (c.y as usize) >= grid.h {
+                return false;
+            }
+            if grid.lane_adjacent_except(c.x, c.y, c.layer, &[tp, tn], halo_r) {
+                // another net's lane inside the corridor's halo
                 return false;
             }
             for dy in -body..=body {
@@ -878,7 +883,7 @@ impl Router {
             let cells = self.rasterize(&[p1, p2, p3], layer, w, pitch);
             // Every cell the bump copper + halo touches on the OUTWARD side
             // must be free or ours (inward lies the pair's own gap/mate).
-            let mut ok = true;
+            let mut ok = !cells.iter().any(|c| grid.lane_adjacent(c.x, c.y, layer, tag, halo));
             'chk: for c in &cells {
                 for dy in -halo..=halo {
                     for dx in -halo..=halo {
@@ -944,7 +949,7 @@ impl Router {
                     let o = grid.owner[i];
                     let lane = grid.lane[c.y as usize * grid.w + c.x as usize];
                     let x = grid.xt[i];
-                    (o == FREE || o == tag) && (lane == 0 || lane == tag) && (x == FREE || x == tag || x == mate || grid.tags.friendly(tag, x)) && (grid.corridor[i] == 0 || grid.tags.friendly(tag, grid.corridor[i]))
+                    (o == FREE || o == tag) && (lane == 0 || lane == tag) && (x == FREE || x == tag || x == mate || grid.tags.friendly(tag, x)) && (grid.corridor[i] == 0 || grid.tags.friendly(tag, grid.corridor[i])) && !grid.lane_adjacent(c.x, c.y, c.layer, tag, 1)
                 }
                 None => false,
             }
