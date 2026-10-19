@@ -328,6 +328,7 @@ impl BoardPlan {
                 pos: p.pos.as_deref().and_then(placer::Pos::parse),
                 rot: p.rot,
                 side_back: p.side_back,
+                            edge_at: None,
             });
         }
         for g in &self.groups {

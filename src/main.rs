@@ -98,15 +98,20 @@ fn cmd_info(b: &board::Board) {
     }
 }
 
+/// The DRC config for a board: the design rules of its layer count.
+fn drc_config_for(b: &board::Board) -> drc::DrcConfig {
+    drc::DrcConfig::from_rules(&someda::rules::DesignRules::for_layers(b.layer_count))
+}
+
 fn cmd_drc(b: &board::Board) {
-    let report = drc::run_drc(b, &drc::DrcConfig::default());
+    let report = drc::run_drc(b, &drc_config_for(b));
     print_report(&report);
     exit(if report.errors() > 0 { 1 } else { 0 });
 }
 
 fn cmd_validate(b: &board::Board) {
     println!("parse: OK");
-    let report = drc::run_drc(b, &drc::DrcConfig::default());
+    let report = drc::run_drc(b, &drc_config_for(b));
     print_report(&report);
     if report.is_clean() {
         println!("result: CLEAN — board is parseable and passes all checks");
@@ -315,7 +320,7 @@ fn cmd_netclasses(b: board::Board) {
 }
 
 fn cmd_report(b: &board::Board) {
-    let report = drc::run_drc(b, &drc::DrcConfig::default());
+    let report = drc::run_drc(b, &drc_config_for(b));
     let args: Vec<String> = std::env::args().collect();
     match args.get(3).map(|s| s.as_str()) {
         Some("json") => println!("{}", report.to_json()),

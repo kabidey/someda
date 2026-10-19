@@ -31,10 +31,16 @@ pub fn package_theta_ja(footprint_or_lib: &str) -> f64 {
         85.0 // classic plastic DIP
     } else if s.contains("SOIC-8") || s.contains("SO-8") {
         120.0
+    } else if s.contains("SOT-23-6") || s.contains("SOT-23-5") || s.contains("TSOT") {
+        200.0 // 6/5-lead SOT with a copper pour under GND: JEDEC ~200
     } else if s.contains("SOT-23") {
         250.0 // tiny SMD
-    } else if s.contains("QFN") {
+    } else if s.contains("QFN") || s.contains("DFN") || s.contains("_EP") || s.contains("THERMALVIAS") {
         40.0 // exposed pad wins
+    } else if s.contains("LQFP-128") || s.contains("LQFP-144") || s.contains("LQFP-100") {
+        45.0 // large QFP, 4-layer board JEDEC class
+    } else if s.contains("QFP") {
+        60.0
     } else if s.contains("TO-220") {
         65.0
     } else if s.contains("0402") || s.contains("0201") || s.contains("01005") {

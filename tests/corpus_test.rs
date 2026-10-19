@@ -18,7 +18,12 @@ const CORPUS: &[(&str, Option<(usize, usize)>)] = &[
     ("pic_programmer.kicad_pcb", Some((0, 6))), // real tight trace-pad clearances (0.07mm, verified)
     // Boards with real DRC findings (verified: pad outside outline in old demo files)
     ("complex_hierarchy.kicad_pcb", Some((1, 10))), // 1 pad-outside + trace-pad tight clearances
-    ("interf_u.kicad_pcb", Some((10, 80))),
+    // interf_u: the earlier 10-80 expectation came from the pre-0.6 rotation
+    // formula, which rotated footprints the wrong way. Verified against
+    // kicad-cli's IPC-D-356 export: 130/130 rotated pads match the
+    // corrected transform (0/130 matched the old one). With pads where
+    // KiCad puts them, only a few tight trace-pad clearances remain.
+    ("interf_u.kicad_pcb", Some((0, 10))),
 ];
 
 #[test]

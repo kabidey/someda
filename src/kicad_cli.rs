@@ -9,6 +9,81 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// What kicad-cli's DRC report says, counted from the report file itself.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DrcSummary {
+    pub violations: usize,
+    pub unconnected: usize,
+    pub footprint_errors: usize,
+    pub errors: usize,
+    pub warnings: usize,
+    /// Finding codes with their counts, e.g. ("clearance", 3)
+    pub by_code: Vec<(String, usize)>,
+}
+
+impl DrcSummary {
+    /// Parse the text report. Codes appear as `[code]:` lines; the line
+    /// after carries `; error` or `; warning`.
+    pub fn parse(text: &str) -> DrcSummary {
+        let mut s = DrcSummary::default();
+        let mut by_code: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("** Found ") {
+                let n: usize = rest.split_whitespace().next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                if rest.contains("DRC violation") {
+                    s.violations = n;
+                } else if rest.contains("unconnected") {
+                    s.unconnected = n;
+                } else if rest.contains("Footprint error") {
+                    s.footprint_errors = n;
+                }
+            }
+            if t.starts_with('[') {
+                if let Some(end) = t.find("]:") {
+                    let code = t[1..end].to_string();
+                    *by_code.entry(code).or_insert(0) += 1;
+                    let sev = lines.get(i + 1).map(|l| l.trim()).unwrap_or("");
+                    if sev.ends_with("; error") {
+                        s.errors += 1;
+                    } else if sev.ends_with("; warning") {
+                        s.warnings += 1;
+                    }
+                }
+            }
+        }
+        s.by_code = by_code.into_iter().collect();
+        s
+    }
+
+    /// Clean = no error-severity findings and no unconnected items.
+    /// Warnings (including missing-library notes) are reported, not failed.
+    pub fn is_clean(&self) -> bool {
+        self.errors == 0 && self.unconnected == 0
+    }
+}
+
+impl std::fmt::Display for DrcSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} error(s), {} warning(s), {} unconnected",
+            self.errors, self.warnings, self.unconnected
+        )?;
+        let real: Vec<String> = self
+            .by_code
+            .iter()
+            .filter(|(c, _)| c != "lib_footprint_issues")
+            .map(|(c, n)| format!("{}×{}", c, n))
+            .collect();
+        if !real.is_empty() {
+            write!(f, " [{}]", real.join(" "))?;
+        }
+        Ok(())
+    }
+}
+
 /// Which kicad-cli binary to invoke (configurable for testing / different installs).
 #[derive(Debug, Clone)]
 pub struct KiCadCli {
@@ -74,10 +149,49 @@ impl KiCadCli {
         self.classified(r, "lib_symbol_issues")
     }
 
-    /// Run DRC on a PCB: `kicad-cli pcb drc <file>` (same env classification).
+    /// Run DRC on a PCB with zones refilled, writing `<stem>-drc.rpt`, and
+    /// judge the result from the REPORT FILE: errors + unconnected items
+    /// fail; warnings and missing-library notes do not. (The old stdout
+    /// classification marked boards with unconnected pads as passing —
+    /// kicad-cli prints only a summary without finding codes to stdout.)
     pub fn pcb_drc(&self, pcb_file: &str) -> CliResult {
-        let r = self.run(&["pcb", "drc", "--exit-code-violations", pcb_file]);
-        self.classified(r, "lib_footprint_issues")
+        let report_name = format!(
+            "{}-drc.rpt",
+            Path::new(pcb_file).file_stem().and_then(|s| s.to_str()).unwrap_or("circuit")
+        );
+        let r = self.run(&[
+            "pcb", "drc", "--refill-zones", "--exit-code-violations",
+            "--output", &report_name, pcb_file,
+        ]);
+        let report_path = self.project_dir.join(&report_name);
+        match std::fs::read_to_string(&report_path) {
+            Ok(text) => {
+                let summary = DrcSummary::parse(&text);
+                CliResult {
+                    success: summary.is_clean(),
+                    exit_code: r.exit_code,
+                    stdout: format!("{} [report {}]", summary, report_name),
+                    stderr: r.stderr,
+                }
+            }
+            Err(e) => CliResult {
+                success: false,
+                exit_code: r.exit_code,
+                stdout: r.stdout,
+                stderr: format!("{}\n(no DRC report at {}: {})", r.stderr, report_path.display(), e),
+            },
+        }
+    }
+
+    /// Parse the DRC report kicad-cli last wrote for this board, if any.
+    pub fn last_drc_summary(&self, pcb_file: &str) -> Option<DrcSummary> {
+        let report_name = format!(
+            "{}-drc.rpt",
+            Path::new(pcb_file).file_stem().and_then(|s| s.to_str()).unwrap_or("circuit")
+        );
+        std::fs::read_to_string(self.project_dir.join(report_name))
+            .ok()
+            .map(|t| DrcSummary::parse(&t))
     }
 
     /// Classify a kicad-cli check result: if the only findings are the
@@ -110,14 +224,35 @@ impl KiCadCli {
         }
     }
 
-    /// Export Gerbers: `kicad-cli pcb export gerbers --output <dir> <file>`
-    pub fn export_gerbers(&self, pcb_file: &str, output_dir: &str) -> CliResult {
-        self.run(&["pcb", "export", "gerbers", "--output", output_dir, pcb_file])
+    /// Export the JLCPCB Gerber set: every copper layer for `layer_count`,
+    /// both masks, both pastes, both silks and the outline, with zones
+    /// checked/refilled at plot time (`--check-zones`).
+    pub fn export_gerbers(&self, pcb_file: &str, output_dir: &str, layer_count: u32) -> CliResult {
+        let mut layers: Vec<String> = crate::board::copper_layer_names(layer_count);
+        for l in ["F.Mask", "B.Mask", "F.Paste", "B.Paste", "F.SilkS", "B.SilkS", "Edge.Cuts"] {
+            layers.push(l.to_string());
+        }
+        let list = layers.join(",");
+        self.run(&[
+            "pcb", "export", "gerbers", "--check-zones", "--layers", &list,
+            "--output", output_dir, pcb_file,
+        ])
     }
 
-    /// Export drill files: `kicad-cli pcb export drill --output <dir> <file>`
+    /// Export Excellon drill files plus a PDF drill map.
     pub fn export_drill(&self, pcb_file: &str, output_dir: &str) -> CliResult {
-        self.run(&["pcb", "export", "drill", "--output", output_dir, pcb_file])
+        self.run(&[
+            "pcb", "export", "drill", "--generate-map", "--map-format", "pdf",
+            "--output", output_dir, pcb_file,
+        ])
+    }
+
+    /// Render the board to a PNG (3D view), top or bottom side.
+    pub fn render_png(&self, pcb_file: &str, output_file: &str, side: &str) -> CliResult {
+        self.run(&[
+            "pcb", "render", "--side", side, "--width", "2400", "--height", "1600",
+            "--quality", "high", "--background", "opaque", "--output", output_file, pcb_file,
+        ])
     }
 
     /// Export position files (pick-and-place): `kicad-cli pcb export pos <file>`
@@ -171,6 +306,27 @@ impl KiCadCli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REPORT: &str = "** Drc report for circuit.kicad_pcb **\n\n** Found 3 DRC violations **\n[lib_footprint_issues]: The current configuration does not include the footprint library 'Package_DIP'\n    Local override; warning\n    @(30.0000 mm, 20.0000 mm): Footprint U1\n[clearance]: Clearance violation ( clearance 0.2000 mm; actual 0.1000 mm)\n    Local override; error\n    @(1 mm, 1 mm): Track [SIG] on F.Cu\n[silk_overlap]: Silkscreen clearance\n    Rule: board setup constraints silk clearance; warning\n    @(2 mm, 2 mm): Text\n\n** Found 2 unconnected pads **\n[unconnected_items]: Missing connection between items\n    Local override; error\n    @(26.1900 mm, 20.6350 mm): Pad 1 [GND] of U1 on F.Cu\n[unconnected_items]: Missing connection between items\n    Local override; error\n    @(18.7500 mm, 2.5000 mm): Pad 1 [OUT] of R3 on F.Cu\n\n** Found 0 Footprint errors **\n";
+
+    #[test]
+    fn drc_summary_counts_errors_warnings_and_unconnected() {
+        let s = DrcSummary::parse(REPORT);
+        assert_eq!(s.violations, 3);
+        assert_eq!(s.unconnected, 2);
+        assert_eq!(s.errors, 3, "1 clearance + 2 unconnected are errors");
+        assert_eq!(s.warnings, 2, "lib note + silk overlap are warnings");
+        assert!(!s.is_clean(), "unconnected pads must never pass");
+        assert!(s.by_code.iter().any(|(c, n)| c == "unconnected_items" && *n == 2));
+    }
+
+    #[test]
+    fn drc_summary_warnings_only_is_clean() {
+        let text = "** Found 1 DRC violations **\n[lib_footprint_issues]: missing lib\n    Local override; warning\n\n** Found 0 unconnected pads **\n";
+        let s = DrcSummary::parse(text);
+        assert!(s.is_clean());
+        assert_eq!(s.warnings, 1);
+    }
 
     #[test]
     fn cli_not_available_graceful() {
