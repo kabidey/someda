@@ -300,7 +300,12 @@ impl Router {
             let mut ok = true;
             let mut failed_term: Option<Cell> = None;
             for (real, virt, term_cell) in [(pa, vp[0], tps), (na, vp[3], tns), (pb, vp[1], tpe), (nb, vp[4], tne)] {
-                let width = if pads[real as usize].fine_pitch { self.config.trace_width } else { w };
+                // Tails neck down to the design trace width: a tail wider
+                // than it carries a clearance body that cannot land on a
+                // terminal flanked by the corridor's own halo (live-verified
+                // NOPATH at every SOT-23 terminal), and a few mm of narrower
+                // single-ended breakout is standard practice.
+                let width = w.min(self.config.trace_width);
                 match self.route_edge_opt(&mut g2, pads, &mut d2, real, virt, pads[real as usize].net.unwrap(), width, true) {
                     Some(cells) => {
                         self.stamp_path(&mut g2, &cells, pads[real as usize].net.unwrap(), width, real);
@@ -446,7 +451,7 @@ impl Router {
             let (dx, dy) = DIRS[d as usize];
             dx as f64 * goal_toward.0 + dy as f64 * goal_toward.1 >= -1e-9
         };
-        let turn_penalty = (0.5 / self.config.grid).max(1.0); // ≈0.5 mm per corner
+        let turn_penalty = (1.0 / self.config.grid).max(1.0); // ≈1 mm per corner: each corner costs 4·offset of skew
         let near = self.near_radius_index(gap);
         let free_cell = |c: Cell| -> bool {
             if forbid.contains(&c) {
@@ -834,7 +839,7 @@ impl Router {
     /// (length added, bumps placed). Each bump's copper is stamped.
     #[allow(clippy::too_many_arguments)]
     fn add_bumps(&self, grid: &mut Grid, track: &mut Vec<(f64, f64)>, layer: u8, need_mm: f64, w: f64, tag: u32, mate: u32, side_sign: i32, pitch: f64, body_id: u32) -> (f64, usize) {
-        let a_max = 0.3 / pitch; // cells (fits inside the pair's own 5W halo)
+        let a_max = 0.6 / pitch; // cells; the free-space check below guards each bump
         let gain = 2.0 * (std::f64::consts::SQRT_2 - 1.0); // added length per unit depth
         let mut remaining = need_mm / pitch;
         let mut bumps = 0usize;
@@ -845,17 +850,20 @@ impl Router {
             let (vx, vy) = (b.0 - a.0, b.1 - a.1);
             let len = (vx * vx + vy * vy).sqrt();
             let axis_aligned = vx.abs() < 1e-9 || vy.abs() < 1e-9;
-            if std::env::var("SOMEDA_ROUTE_DEBUG").map(|v| v == "2").unwrap_or(false) {
+            if std::env::var("SOMEDA_ROUTE_DEBUG").map(|v| v == "3").unwrap_or(false) {
                 eprintln!("route-debug: BUMP? run {} len {:.1} axis {} remaining {:.1}", i, len, axis_aligned, remaining);
             }
             if !axis_aligned || len < 6.0 {
                 i += 1;
                 continue;
             }
-            let depth = (remaining / gain).min(a_max);
+            let mut depth = (remaining / gain).min(a_max);
+            let a_min = 0.12 / pitch;
+            let mut placed_any = false;
+            while depth >= a_min {
             let foot = 2.0 * depth; // along-track footprint of the bump
             if foot + 2.0 > len {
-                i += 1;
+                depth *= 0.5;
                 continue;
             }
             // Outward normal: away from the mate = sign given by caller
@@ -887,11 +895,11 @@ impl Router {
                     }
                 }
             }
-            if std::env::var("SOMEDA_ROUTE_DEBUG").map(|v| v == "2").unwrap_or(false) {
+            if std::env::var("SOMEDA_ROUTE_DEBUG").map(|v| v == "3").unwrap_or(false) {
                 eprintln!("route-debug: BUMP run {} len {:.1} depth {:.2} cells {} ok {}", i, len, depth, cells.len(), ok);
             }
             if !ok {
-                i += 1;
+                depth *= 0.5; // a shallower bump may fit beside a neighbour
                 continue;
             }
             for c in &cells {
@@ -908,7 +916,14 @@ impl Router {
             track.splice(i + 1..i + 1, [p1, p2, p3]);
             remaining -= depth * gain;
             bumps += 1;
-            i += 3; // continue on the remainder of this run (p3 → b)
+            placed_any = true;
+            break;
+            }
+            if placed_any {
+                i += 3; // continue on the remainder of this run (p3 → b)
+            } else {
+                i += 1;
+            }
         }
         ((need_mm / pitch - remaining) * pitch, bumps)
     }
