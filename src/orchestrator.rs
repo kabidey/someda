@@ -10,6 +10,7 @@ use crate::kicad_cli::KiCadCli;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
+use crate::board::rotate_offset;
 
 /// The circuit plan the LLM must produce (strict JSON contract).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +352,61 @@ pub fn build(
                 }
             }
         }
+        // Reference designators: above the courtyard when that spot is clear
+        // of every other part and the board edge, else below / left / right,
+        // else on F.Fab (no silk at all). Silk on a pad is a fab defect.
+        {
+            let (bw, bh) = (w, h);
+            let rects: Vec<(usize, (f64, f64, f64, f64))> = board.footprints.iter().enumerate().map(|(i, f)| (i, f.abs_bbox())).collect();
+            let mut placed_text: Vec<(f64, f64, f64, f64)> = Vec::new();
+            let mut on_fab = 0;
+            for i in 0..board.footprints.len() {
+                let fp = &board.footprints[i];
+                let text_w = (fp.reference.len() as f64 * 0.85).max(1.2);
+                let text_h = 1.0;
+                let (cx0, cy0, cx1, cy1) = fp.courtyard.unwrap_or((-1.0, -1.0, 1.0, 1.0));
+                let gap = 0.35;
+                // candidates in the footprint frame: above, below, left, right of the courtyard
+                let cands = [
+                    (0.0, cy0 - gap - text_h / 2.0),
+                    (0.0, cy1 + gap + text_h / 2.0),
+                    (cx0 - gap - text_w / 2.0, 0.0),
+                    (cx1 + gap + text_w / 2.0, 0.0),
+                ];
+                let mut chosen: Option<(f64, f64)> = None;
+                for (rx, ry) in cands {
+                    // text box in board coordinates (text stays upright: box is w×h, rotated 90 for 90/270 parts)
+                    let (ox, oy) = rotate_offset(rx, ry, fp.rotation);
+                    let (tx, ty) = (fp.x + ox, fp.y + oy);
+                    let (hw, hh) = if (fp.rotation % 180.0).abs() < 1e-6 { (text_w / 2.0, text_h / 2.0) } else { (text_h / 2.0, text_w / 2.0) };
+                    let tb = (tx - hw, ty - hh, tx + hw, ty + hh);
+                    if tb.0 < 0.6 || tb.1 < 0.6 || tb.2 > bw - 0.6 || tb.3 > bh - 0.6 {
+                        continue;
+                    }
+                    let clash = rects.iter().any(|(j, r)| {
+                        *j != i && tb.0 < r.2 + 0.15 && r.0 < tb.2 + 0.15 && tb.1 < r.3 + 0.15 && r.1 < tb.3 + 0.15
+                    }) || placed_text.iter().any(|r| {
+                        tb.0 < r.2 + 0.15 && r.0 < tb.2 + 0.15 && tb.1 < r.3 + 0.15 && r.1 < tb.3 + 0.15
+                    });
+                    if !clash {
+                        chosen = Some((rx, ry));
+                        placed_text.push(tb);
+                        break;
+                    }
+                }
+                let fpm = &mut board.footprints[i];
+                match chosen {
+                    Some((rx, ry)) => fpm.ref_text = Some((rx, ry, "F.SilkS".into())),
+                    None => {
+                        fpm.ref_text = Some((0.0, 0.0, "F.Fab".into()));
+                        on_fab += 1;
+                    }
+                }
+            }
+            if on_fab > 0 {
+                println!("  silkscreen: {} reference(s) have no clear spot and go on F.Fab instead", on_fab);
+            }
+        }
         stages.push(StageResult {
             stage: "placement".into(),
             success: overlaps == 0,
@@ -487,8 +543,8 @@ pub fn build(
             if let Some(z0) = sig.z_target {
                 if sig.needs_impedance_control() {
                     router = router.with_impedance_target(&net.name, z0);
-                    let w = crate::formulas::microstrip_width_for_z0(z0, stackup.er, stackup.h_mm, stackup.copper_thickness_mm);
-                    println!("  net {}: {:.0}Ω target → {:.3}mm on {}", net.name, z0, w, stackup.name);
+                    let w = stackup.width_for_z0(z0);
+                    println!("  net {}: {:.0}Ω target → {:.4}mm on {} ({})", net.name, z0, w, stackup.name, stackup.fab_width_source);
                 }
             }
         }
@@ -688,6 +744,29 @@ pub fn build(
         let pro_path = project_dir.join("circuit.kicad_pro");
         fs::write(&pro_path, rules.kicad_project_json("circuit.kicad_pro", &classes))
             .map_err(|e| OrchestrateError::Io(e.to_string()))?;
+        // A project fp-lib-table naming every library the board uses, so
+        // KiCad opens the project without "library not found" notes.
+        let mut libs: Vec<(String, String)> = Vec::new();
+        for c in &plan.components {
+            if let Some(f) = &c.footprint {
+                if let Some((lib, _)) = f.split_once(':') {
+                    if libs.iter().any(|(l, _)| l == lib) {
+                        continue;
+                    }
+                    if let Some(path) = crate::footprint_lib::resolve(f) {
+                        if let Some(dir) = path.parent() {
+                            libs.push((lib.to_string(), dir.display().to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        let mut table = String::from("(fp_lib_table\n  (version 7)\n");
+        for (lib, dir) in &libs {
+            table.push_str(&format!("  (lib (name \"{}\")(type \"KiCad\")(uri \"{}\")(options \"\")(descr \"\"))\n", lib, dir));
+        }
+        table.push_str(")\n");
+        fs::write(project_dir.join("fp-lib-table"), table).map_err(|e| OrchestrateError::Io(e.to_string()))?;
     }
 
     stages.push(StageResult {
@@ -856,7 +935,7 @@ pub fn build(
     let kicad_drc = if cli.is_available() { cli.last_drc_summary("circuit.kicad_pcb") } else { None };
     let drc_errors_total = drc_report.errors()
         .saturating_sub(drc_report.findings.iter().filter(|f| f.code == "segment-check-truncated").count())
-        + kicad_drc.as_ref().map(|k| k.errors.saturating_sub(k.unconnected)).unwrap_or(0);
+        + kicad_drc.as_ref().map(|k| k.errors.saturating_sub(k.unconnected) + k.fab_blocking()).unwrap_or(0);
     let shorts = kicad_drc
         .as_ref()
         .map(|k| k.by_code.iter().filter(|(c, _)| c == "shorting_items").map(|(_, n)| *n).sum())
@@ -1420,6 +1499,7 @@ fn synthetic_footprint(
         pads: Vec::new(),
         courtyard: None,
         keepouts: Vec::new(),
+        ref_text: None,
         source: None,
     };
     // ONE PAD PER PLAN-REFERENCED PIN — never a fixed 2-pad model.
