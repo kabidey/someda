@@ -1,0 +1,24 @@
+{
+  "name": "stress test",
+  "description": "8 components, 4-pin IC, high-fanout nets, an unreferenced part",
+  "components": [
+    {"reference": "U1", "value": "LM358", "lib_id": "Amplifier:LM358", "footprint": "Package_SO:SOIC-8"},
+    {"reference": "U2", "value": "74HC00", "lib_id": "Logic:74HC00", "footprint": "Package_SO:SOIC-14"},
+    {"reference": "R1", "value": "10k", "lib_id": "Device:R", "footprint": "Resistor_SMD:R_0603"},
+    {"reference": "R2", "value": "4k7", "lib_id": "Device:R", "footprint": "Resistor_SMD:R_0603"},
+    {"reference": "R3", "value": "1k", "lib_id": "Device:R", "footprint": "Resistor_SMD:R_0603"},
+    {"reference": "C1", "value": "100nF", "lib_id": "Device:C", "footprint": "Capacitor_SMD:C_0603"},
+    {"reference": "C2", "value": "10uF", "lib_id": "Device:C", "footprint": "Capacitor_SMD:C_0805"},
+    {"reference": "D1", "value": "1N4148", "lib_id": "Device:D", "footprint": "Diode_SMD:D_SOD-123"},
+    {"reference": "J1", "value": "CONN4", "lib_id": "Connector:Conn_01x04", "footprint": "Connector:PinHeader_1x04"}
+  ],
+  "nets": [
+    {"name": "VCC", "pins": ["U1:8", "U2:14", "R1:1", "C1:1", "J1:1"]},
+    {"name": "GND", "pins": ["U1:4", "U2:7", "C1:2", "C2:2", "J1:4"]},
+    {"name": "N1", "pins": ["U1:1", "U1:2", "R1:2"]},
+    {"name": "N2", "pins": ["U1:3", "R2:1", "U2:1"]},
+    {"name": "N3", "pins": ["U2:2", "U2:3", "R2:2", "R3:1"]},
+    {"name": "N4", "pins": ["U2:4", "C2:1", "D1:1"]},
+    {"name": "N5", "pins": ["D1:2", "R3:2", "J1:2", "J1:3"]}
+  ]
+}

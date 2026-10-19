@@ -290,7 +290,10 @@ impl Placer {
         // 6. Clamp all inside the outline with margin
         // Clamp inside the outline with a small mounting margin (1 mm),
         // NOT the packing pitch — semantic edge positions are legitimate.
-        let margin = 1.0;
+        // 2.5mm keeps every pad ≥1.75mm off the edge — inside KiCad's
+        // 0.5mm default edge clearance with the pad half-width included
+        // (1.0mm margin left pads at 0.25mm; live-verified violations).
+        let margin = 2.5;
         for s in &mut solved {
             s.x = s.x.clamp(margin, (self.board_w - margin).max(margin));
             s.y = s.y.clamp(margin, (self.board_h - margin).max(margin));

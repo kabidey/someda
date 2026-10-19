@@ -87,7 +87,9 @@ pub struct RouterConfig {
     /// Via pad size / drill (mm) — skill preset: 0.6 / 0.3.
     pub via_size: f64,
     pub via_drill: f64,
-    /// Board edge clearance (mm) — skill: 0.25.
+    /// Board edge clearance (mm). KiCad's board-setup default is 0.5 and
+    /// kicad-cli enforces it even when the skill quotes 0.25 — design to
+    /// the stricter number (live-verified copper_edge_clearance violations).
     pub edge_clearance: f64,
     /// Max A* expansions before honest give-up.
     pub max_expansions: usize,
@@ -106,7 +108,7 @@ impl Default for RouterConfig {
             clearance: 0.2,
             via_size: 0.6,
             via_drill: 0.3,
-            edge_clearance: 0.25,
+            edge_clearance: 0.5,
             max_expansions: 300_000,
         }
     }
@@ -160,26 +162,57 @@ impl Router {
         let mut result = RouteResult::default();
 
         // Occupancy per (x,y): net that owns the cell (usize::MAX = hard block)
-        let mut occupied: std::collections::HashMap<(i32, i32), usize> =
+        // Occupancy keyed by (x, y, FRONT-LAYER) — the two copper layers are
+        // independent routing domains. The old (x,y)-only key let F.Cu pad
+        // keepouts block B.Cu cells, so dense boards could not escape via
+        // vias (live-verified: 6/542 unrouted on the 9-part stress board).
+        let mut occupied: std::collections::HashMap<(i32, i32, bool), usize> =
             std::collections::HashMap::new();
         let mut board_outline: Option<(f64, f64, f64, f64)> = None;
         if let Some((x0, y0, x1, y1)) = board.outline_bbox() {
             board_outline = Some((x0, y0, x1, y1));
         }
 
-        // Stamp pad keep-outs: a pad blocks OTHER nets, not its own
+        // Stamp pad keep-outs in TWO PASSES. Pass 1 claims each pad's exact
+        // cell with its net (the connection point — another pad's halo must
+        // NEVER steal it: 1.27mm DIP pitch puts neighbor pads inside each
+        // other's halos, and a single-pass stamp order-dependently corrupted
+        // neighbor cells to hard-blocks, making A* goals unreachable —
+        // live-verified on the 9-part stress board). Pass 2 stamps halos
+        // only into unclaimed cells.
+        // Pad cells are CONNECTION POINTS — immutable claims. A pad cell
+        // keeps its net no matter whose halo covers it (1.27mm DIP pitch
+        // puts neighbor pads inside each other's halos; letting a halo
+        // flip a neighbor pad cell to hard-block made A* start/goal cells
+        // unreachable — live-verified on the 9-part stress board).
+        let mut pad_cells: std::collections::HashMap<(i32, i32, bool), usize> =
+            std::collections::HashMap::new();
         for fp in &board.footprints {
             for pad in &fp.pads {
                 if let Some((net_id, _)) = pad.net {
                     let gx = (pad.x / self.config.grid).round() as i32;
                     let gy = (pad.y / self.config.grid).round() as i32;
-                    // Block cells within pad radius + clearance
+                    pad_cells.insert((gx, gy, true), net_id);
+                }
+            }
+        }
+        // Halos stamp only cells no pad owns
+        for fp in &board.footprints {
+            for pad in &fp.pads {
+                if let Some((net_id, _)) = pad.net {
+                    let gx = (pad.x / self.config.grid).round() as i32;
+                    let gy = (pad.y / self.config.grid).round() as i32;
+                    // Halo = pad radius + clearance, FRONT layer only
+                    // (SMD pads are F.Cu; B.Cu routing passes beneath)
                     let r = ((pad.width.max(pad.height) / 2.0 + self.config.clearance)
                         / self.config.grid)
                         .ceil() as i32;
                     for dx in -r..=r {
                         for dy in -r..=r {
-                            let key = (gx + dx, gy + dy);
+                            let key = (gx + dx, gy + dy, true);
+                            if pad_cells.contains_key(&key) {
+                                continue; // never overwrite a pad connection point
+                            }
                             occupied
                                 .entry(key)
                                 .and_modify(|n| {
@@ -193,6 +226,10 @@ impl Router {
                 }
             }
         }
+        // Pad claims go in LAST and win
+        for (key, net_id) in &pad_cells {
+            occupied.insert(*key, *net_id);
+        }
 
         // Net name → id lookup for ratsnest edges
         let net_id = |name: &str| -> usize {
@@ -204,12 +241,26 @@ impl Router {
                 .unwrap_or(0)
         };
 
-        // Deterministic order: shortest ratsnest first
+        // Deterministic order: POWER NETS FIRST (VCC/GND are the board's
+        // highways — routing them last left them hemmed in; live-verified:
+        // 2 unrouted on the 9-part stress board), then the rest shortest-first.
+        let is_power = |name: &str| {
+            name.eq_ignore_ascii_case("VCC")
+                || name.eq_ignore_ascii_case("GND")
+                || name.eq_ignore_ascii_case("+3V3")
+                || name.eq_ignore_ascii_case("+5V")
+                || name.eq_ignore_ascii_case("VBUS")
+        };
         let mut edges: Vec<&RatsnestEdge> = netlist.edges.iter().collect();
         edges.sort_by(|a, b| {
-            a.manhattan_mm
-                .partial_cmp(&b.manhattan_mm)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            match (is_power(&a.net), is_power(&b.net)) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a
+                    .manhattan_mm
+                    .partial_cmp(&b.manhattan_mm)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            }
         });
 
         for edge in edges {
@@ -223,13 +274,29 @@ impl Router {
                     for cell in path {
                         if let Some(p) = prev {
                             if p.front != cell.front {
-                                result.vias.push(Via {
-                                    net: net_pair.clone(),
-                                    x: cell.x as f64 * self.config.grid,
-                                    y: cell.y as f64 * self.config.grid,
-                                    size: self.config.via_size,
-                                    drill: self.config.via_drill,
-                                });
+                                // Deduplicate: an A* path can hop layers at the
+                                // same coordinate twice (down+up), which would
+                                // stack two vias in one hole — kicad-cli flags
+                                // holes_co_located (live-verified).
+                                let (vx, vy) = (
+                                    cell.x as f64 * self.config.grid,
+                                    cell.y as f64 * self.config.grid,
+                                );
+                                let dup = result
+                                    .vias
+                                    .iter()
+                                    .any(|v| v.net.0 == nid
+                                        && (v.x - vx).abs() < 1e-9
+                                        && (v.y - vy).abs() < 1e-9);
+                                if !dup {
+                                    result.vias.push(Via {
+                                        net: net_pair.clone(),
+                                        x: vx,
+                                        y: vy,
+                                        size: self.config.via_size,
+                                        drill: self.config.via_drill,
+                                    });
+                                }
                             }
                             result.segments.push(TrackSegment {
                                 layer: if p.front { "F.Cu".into() } else { "B.Cu".into() },
@@ -257,6 +324,7 @@ impl Router {
                             (seg.y2 / self.config.grid).round() as i32,
                         );
                         // Bresenham rasterization (Manhattan segments: axis-aligned)
+                        let front = seg.layer == "F.Cu";
                         let (dx, dy) = (x2 - x1, y2 - y1);
                         let steps = dx.abs().max(dy.abs());
                         for i in 0..=steps {
@@ -266,7 +334,7 @@ impl Router {
                                 (x1, y1 + dy.signum() * i)
                             };
                             occupied
-                                .entry((cx, cy))
+                                .entry((cx, cy, front))
                                 .and_modify(|n| {
                                     if *n != nid {
                                         *n = usize::MAX;
@@ -284,18 +352,26 @@ impl Router {
                             (via.y / self.config.grid).round() as i32,
                         );
                         for (dx, dy) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
-                            occupied
-                                .entry((vx + dx, vy + dy))
-                                .and_modify(|n| {
-                                    if *n != nid {
-                                        *n = usize::MAX;
-                                    }
-                                })
-                                .or_insert(nid);
+                            for front in [true, false] {
+                                occupied
+                                    .entry((vx + dx, vy + dy, front))
+                                    .and_modify(|n| {
+                                        if *n != nid {
+                                            *n = usize::MAX;
+                                        }
+                                    })
+                                    .or_insert(nid);
+                            }
                         }
                     }
                 }
                 None => {
+                    if std::env::var("SOMEDA_ROUTE_DEBUG").is_ok() {
+                        eprintln!(
+                            "route-debug: FAILED net {} from ({:.2},{:.2}) to ({:.2},{:.2}) manhattan {:.1}",
+                            edge.net, start.0, start.1, goal.0, goal.1, edge.manhattan_mm
+                        );
+                    }
                     result.unrouted.push(UnroutedNet {
                         net: net_pair,
                         cause: "no path within expansion budget (placement congestion)"
@@ -314,7 +390,7 @@ impl Router {
         start: (f64, f64),
         goal: (f64, f64),
         net: usize,
-        occupied: &std::collections::HashMap<(i32, i32), usize>,
+        occupied: &std::collections::HashMap<(i32, i32, bool), usize>,
         outline: Option<(f64, f64, f64, f64)>,
     ) -> Option<Vec<Cell>> {
         let snap = |v: f64| (v / self.config.grid).round() as i32;
@@ -343,7 +419,7 @@ impl Router {
                     return false;
                 }
             }
-            match occupied.get(&(c.x, c.y)) {
+            match occupied.get(&(c.x, c.y, c.front)) {
                 None => true,
                 Some(&n) => n == net,
             }
@@ -409,13 +485,39 @@ impl Router {
                 }
             }
 
-            // Via hop (skill 101: vias ≈ 0.5 nH + DCR — expensive, allowed)
+            // Via hop (skill 101: vias ≈ 0.5 nH + DCR — expensive, allowed).
+            // A via pad (Ø0.6) reaches past its cell: the full 3x3 halo on
+            // BOTH layers must be free of foreign copper, or the via lands
+            // on top of an already-routed neighbor track (live-verified:
+            // 0.075mm clearance violations between vias and earlier nets'
+            // tracks on the stress board).
             let via_next = Cell {
                 x: node.cell.x,
                 y: node.cell.y,
                 front: !node.cell.front,
             };
-            if is_free(&via_next) {
+            let via_clear = {
+                let mut ok = true;
+                'halo: for dxdy in [(0i32, 0i32), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    for f in [true, false] {
+                        let c = Cell {
+                            x: node.cell.x + dxdy.0,
+                            y: node.cell.y + dxdy.1,
+                            front: f,
+                        };
+                        match occupied.get(&(c.x, c.y, c.front)) {
+                            None => {}
+                            Some(&n) if n == net => {}
+                            Some(_) => {
+                                ok = false;
+                                break 'halo;
+                            }
+                        }
+                    }
+                }
+                ok
+            };
+            if is_free(&via_next) && via_clear {
                 let via_cost = 8.0;
                 let tentative =
                     g_score.get(&node.cell).copied().unwrap_or(f64::INFINITY) + via_cost;
@@ -539,6 +641,6 @@ mod tests {
         assert_eq!(c.clearance, 0.2, "skill 101: active clearance 0.2mm");
         assert_eq!(c.via_size, 0.6, "skill 101: via preset 0.6");
         assert_eq!(c.via_drill, 0.3, "skill 101: via preset 0.3");
-        assert_eq!(c.edge_clearance, 0.25, "skill 101: edge clearance 0.25mm");
+        assert_eq!(c.edge_clearance, 0.5, "kicad-cli enforces the 0.5 default");
     }
 }
