@@ -127,3 +127,23 @@ The design now carries physics end to end, per the harness directive:
 Live-verified with an RF fixture (2.4GHz path + 555): the harness flagged the
 naive board's SWR 2.16 at default width, then the router solved the RF trace
 to 50Ω and KiCad DRC passed clean. The honest-done loop applied to physics.
+
+## Claude Code Plugin — PCB from a vibe
+
+Use someda directly inside Claude Code:
+
+```bash
+claude plugin marketplace add kabidey/someda-claude-plugin
+claude plugin install someda@someda
+```
+
+Then just describe a circuit in conversation:
+
+```
+/pcb-build a 555 timer blinking an LED at 1Hz with proper decoupling
+```
+
+Claude plans the circuit (real pinouts, per-net frequencies, per-component
+power); the compiled someda engine places, routes with physics, audits
+against JLCPCB's real materials, verifies through kicad-cli, and exports
+Gerbers — gated by the honest-done contract.
