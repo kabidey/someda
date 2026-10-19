@@ -342,8 +342,15 @@ impl Placer {
         let mut rest: Vec<usize> = (0..parts.len())
             .filter(|i| !solved.iter().any(|s| s.reference == parts[*i].reference))
             .collect();
+        // Most connected first, then the largest courtyard (an IC whose nets
+        // are all planes still anchors the layout), then by reference.
+        let area = |p: &Part| (p.rel.2 - p.rel.0) * (p.rel.3 - p.rel.1);
         rest.sort_by(|&a, &b| {
-            parts[b].degree.cmp(&parts[a].degree).then_with(|| parts[a].reference.cmp(&parts[b].reference))
+            parts[b]
+                .degree
+                .cmp(&parts[a].degree)
+                .then_with(|| area(&parts[b]).partial_cmp(&area(&parts[a])).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| parts[a].reference.cmp(&parts[b].reference))
         });
         // Place in waves: a part whose neighbours are all unplaced waits for
         // the most-connected part to seed the centre.

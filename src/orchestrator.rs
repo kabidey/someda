@@ -1003,10 +1003,8 @@ pub fn generate_schematic(plan: &CircuitPlan) -> String {
                 }
             }
         }
-        if pin_nums.is_empty() {
-            pin_nums.push("1".into());
-            pin_nums.push("2".into());
-        }
+        // Components no net references (mounting holes, mechanical parts)
+        // get a pin-less symbol: nothing to float, nothing to connect.
         // Pin geometry: 2 pins inline; >2 pins on a DIP rectangle
         // (left column top-to-bottom, right column bottom-to-top)
         let n = pin_nums.len();
@@ -1155,10 +1153,6 @@ fn parse_pin(pin_ref: &str, plan: &CircuitPlan) -> Option<(f64, f64)> {
                 }
             }
         }
-    }
-    if pin_nums.is_empty() {
-        pin_nums.push("1".into());
-        pin_nums.push("2".into());
     }
     let n = pin_nums.len();
     let pi = pin_nums.iter().position(|p| p == pin_num)?;
