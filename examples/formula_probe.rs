@@ -15,6 +15,18 @@ fn main() {
     println!("wavelength_mm 1GHz er_eff3.2 = {:.1}; max_via_stub_mm 1GHz = {:.2}; 10GHz = {:.3}", formulas::wavelength_mm(1e9, 3.2), formulas::max_via_stub_mm(1e9, 3.2), formulas::max_via_stub_mm(10e9, 3.2));
     println!("crosstalk_spacing w0.127 = {:.3} (3W) / {:.3} (5W)", formulas::crosstalk_spacing(0.127, false), formulas::crosstalk_spacing(0.127, true));
     println!("via_pair_loop_nh h1.6 s1.0 d0.3 = {:.3}", formulas::via_pair_loop_nh(1.6, 1.0, 0.3));
+    // Coupled microstrip (Kirschning-Jansen) and the fab pair tables
+    let cm = formulas::coupled_microstrip(4.5, 0.2, 0.2, 0.2, 0.0);
+    println!("coupled_microstrip er4.5 h0.2 w0.2 s0.2 t0: Zeven {:.1} Zodd {:.1} Zdiff {:.1} (PCBWay/IPC approx: Zdiff 111.4)", cm.z_even, cm.z_odd, cm.z_diff());
+    for layers in [2u32, 4, 6] {
+        let st = someda::materials::Stackup::for_layers(layers);
+        for z in [90.0, 100.0] {
+            match st.pair_geometry(z, 0.10, if layers <= 2 { 0.2 } else { 0.127 }) {
+                Some(g) => println!("{}-layer {} Ω pair: w {:.4} gap {:.4} mm — {}", layers, z, g.width_mm, g.gap_mm, g.source),
+                None => println!("{}-layer {} Ω pair: no cross-section", layers, z),
+            }
+        }
+    }
     println!("junction_temp 25C 0.8W 45 = {:.1}; thermal_via_count 32.7mm2 = {}", formulas::junction_temp_c(25.0, 0.8, 45.0), formulas::thermal_via_count(32.7));
     println!("cap_srf 100nF esl 0.5nH = {:.1} MHz; 10uF esl 1nH = {:.2} MHz", formulas::cap_srf_hz(0.5e-9, 100e-9) / 1e6, formulas::cap_srf_hz(1e-9, 10e-6) / 1e6);
     println!("pdn_target 50mV 2A = {:.3} ohm", formulas::pdn_target_ohms(0.05, 2.0));

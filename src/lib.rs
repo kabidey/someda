@@ -28,3 +28,6 @@ pub mod rules;
 pub mod netfreq;
 pub mod si;
 pub mod thermal;
+pub mod values;
+pub mod stability;
+pub mod pdn;

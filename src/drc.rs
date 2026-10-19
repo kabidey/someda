@@ -69,7 +69,9 @@ impl DrcConfig {
         DrcConfig {
             min_clearance_mm: rules.clearance_mm,
             edge_clearance_mm: rules.edge_clearance_mm.min(0.25),
-            min_trace_width_mm: rules.trace_width_mm,
+            // The fab's minimum, not the design default: pair cross-sections
+            // from the fab table may be narrower than the default trace.
+            min_trace_width_mm: crate::materials::FabLimits::default().min_trace_mm.min(rules.trace_width_mm),
         }
     }
 }

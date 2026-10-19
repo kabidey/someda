@@ -14,6 +14,14 @@ as original, working code:
 - **The honest-done repair loop**: done claims are re-verified against the
   board's own state — claiming done with open work is rejected
 
+## 0.7: differential pairs, crosstalk as a rule, oscillation gates (2026-10-19)
+
+- **Differential pairs are routed as pairs.** `pairs: [{"p","n","z_diff","skew_mm"}]` in the plan. The cross-section comes from JLCPCB's own impedance calculator (6-layer JLC06161H-3313 and 4-layer JLC04161H-7628 tables, run 2026-10-19) or, off-table, from the Kirschning–Jansen coupled-microstrip closed form (`formulas::coupled_microstrip`, transcribed from the Qucs/KiCad transline source and checked against an independent calculator). The router routes every pair first as a coupled corridor on one plane-referenced layer (direction-aware A*, handedness carried from the start pads to the far pads, straight terminals), two offset tracks, short single-ended tails, and compensates the intra-pair skew (4·offset per corner, tail differences) with tail detours and 45° bumps on the shorter track. The `pairs` stage fails on an uncoupled trunk or a skew above the budget (Toradex 102492 interface tables by default).
+- **Crosstalk spacing is enforced, not warned.** Every net with a frequency or a clock/highspeed/rf role carries a 3W/5W edge gap (W = design trace width) that the router honours in both directions (aggressor halos; victims' traces dilated into near maps) outside breakout zones (1 mm around pads, fine-pitch escape bands). The SI audit measures same-layer parallel runs on the routed copper against the same zones: `crosstalk-violation` is an error.
+- **Oscillation checks that mean something.** The lumped LC "self-resonance" warning no longer fires on terminated transmission lines (it flagged every 20 mm MIPI lane); instead: `unterminated-line` for electrically long nets without a termination, per-capacitor mounting-loop inductance from the routed stubs and via pair (`decoupling-loop`), regulator output capacitance vs datasheet minimums, crystal load capacitors and trace geometry, buck switch/feedback nodes (`stability.rs`), and a per-rail PDN |Z(f)| sweep against the ΔV/ΔI target (`pdn.rs`).
+- Impedance-controlled single-ended nets are confined to layers over a solid plane; the KiCad project's minimum track width is the fab's (0.10 mm) so fab-table pair widths pass DRC.
+- `cargo run --example formula_probe` prints the pair cross-sections alongside the other formulas.
+
 ## 0.6: real footprints, multilayer, escape vias (2026-10-19)
 
 What changed between 0.5.4 and 0.6.0, each verified against kicad-cli 10.0.6 on real boards:
@@ -24,7 +32,7 @@ What changed between 0.5.4 and 0.6.0, each verified against kicad-cli 10.0.6 on 
 - **Router.** Dense occupancy over every signal layer; pads rasterized as their real rotated rectangles (circles as ellipses); through-hole pads block every layer; hole clearance; footprint keep-outs; plane fanout per pad (sites under the body preferred) with trace fallback; depth-staggered **escape vias** for every fine-pitch signal pin; escape lanes and bands that keep other nets and wide traces out of pin rows; route-to-net with union-find components; whole-net rip-up-and-reroute plus final retries; collinear segment merging; 0.35/0.2mm vias on multilayer rules.
 - **Honest gates.** The kicad-cli DRC stage parses the report file (errors + unconnected fail, warnings are listed) — the stdout classification used to pass boards with unconnected pads. Gerber set per copper count with zones checked, drill map, PNG renders. Engine DRC and ERC judge by the board's rules; the schematic parser matches symbols by full name.
 - **Checkpoints.** The README's 555 example reaches all six gates with DRC 0 errors (it did not before: 2–5 unrouted). A 26-part 6-layer LQFP-48 board and a 132-part Allwinner V3s SBC (192 connections, 220 fanouts, 130 escape vias) both reach all six gates with kicad-cli DRC at 0 errors.
-- **Still not done:** differential-pair routing and length matching (pairs are two single-ended traces), bottom-side placement, electrical simulation.
+- **Still not done (0.6):** differential-pair routing and length matching — done in 0.7; bottom-side placement, electrical simulation.
 
 ## Usage
 

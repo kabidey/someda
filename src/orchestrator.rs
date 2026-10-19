@@ -31,6 +31,24 @@ pub struct CircuitPlan {
     /// the main power net on the layer before the last inner GND.
     #[serde(default)]
     pub planes: Option<Vec<PlaneSpec>>,
+    /// Differential pairs: routed as coupled pairs (same layer, constant
+    /// gap, matched length) to a differential impedance target.
+    #[serde(default)]
+    pub pairs: Option<Vec<PairSpec>>,
+}
+
+/// A differential pair: nets `p` and `n` are routed side by side as one
+/// coupled pair at `z_diff` Ω (default 100), with intra-pair length
+/// mismatch held under `skew_mm` (default: the interface class budget —
+/// see `pair_skew_budget_mm`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairSpec {
+    pub p: String,
+    pub n: String,
+    #[serde(default)]
+    pub z_diff: Option<f64>,
+    #[serde(default)]
+    pub skew_mm: Option<f64>,
 }
 
 /// A fixed board outline request (mm).
@@ -112,6 +130,13 @@ pub struct PlannedNet {
     /// highspeed | analog | digital. Otherwise derived from the name.
     #[serde(default)]
     pub role: Option<String>,
+    /// Optional: how the net is terminated — "series" (resistor at the
+    /// driver), "parallel" (resistor at the receiver), "on-chip" (the
+    /// interface terminates inside the ICs: USB, MIPI, Ethernet PHY),
+    /// "none". Otherwise derived: a ≤100 Ω two-pin resistor on the net
+    /// counts as series termination; pair nets count as on-chip.
+    #[serde(default)]
+    pub termination: Option<String>,
 }
 
 /// The system prompt for circuit planning. The LLM sees the JSON contract
@@ -138,6 +163,8 @@ Rules:
 - Power nets are named "VCC" and "GND" (use these exact names)
 - Declare each net's "freq_hz" when the circuit's intent knows it (clocks, RF, high-speed interfaces); leave it out when unknown
 - Declare "role" (power|ground|clock|rf|highspeed|analog|digital) when the net name alone is ambiguous
+- Declare "termination" (series|parallel|on-chip|none) on fast nets when known; a series resistor on the net is detected automatically
+- Declare differential pairs as "pairs": [{"p": "USB_DP", "n": "USB_DM", "z_diff": 90}] — both nets must connect the same two components; they are routed as one coupled, length-matched pair
 - Declare "power_w" for components that dissipate noticeably (regulators, power LEDs, resistors in power paths)
 - Include decoupling capacitors (100nF) on every IC's power pins
 - Use standard values: E12 series for resistors, standard capacitor values
@@ -437,7 +464,7 @@ pub fn build(
             Some(PlaneRegionSpec::Rect([x0, y0, x1, y1])) => Some((*x0, *y0, *x1, *y1)),
             Some(PlaneRegionSpec::Auto(_)) => {
                 // The island follows the footprint that owns most of the
-                // net's pins (the SoC's rail pins) plus 3.5mm for the
+                // net's pins (the SoC's rail pins) plus 5mm for the
                 // decoupling caps hugging them. Pads elsewhere are routed
                 // to the island as traces.
                 let anchor = board
@@ -453,7 +480,7 @@ pub fn build(
                         }
                     }
                 }
-                if b.0.is_finite() { Some((b.0 - 3.5, b.1 - 3.5, b.2 + 3.5, b.3 + 3.5)) } else { None }
+                if b.0.is_finite() { Some((b.0 - 5.0, b.1 - 5.0, b.2 + 5.0, b.3 + 5.0)) } else { None }
             }
         };
         if let Some(r) = r {
@@ -493,6 +520,12 @@ pub fn build(
     );
     let route_summary;
     let unrouted_count;
+    let route_pairs: Vec<crate::router::PairReport>;
+    let route_exempt: Vec<(f64, f64, f64, f64, String)>;
+    let router_net_gap: std::collections::HashMap<String, f64>;
+    let pair_infos: Vec<crate::si::PairInfo>;
+    let pairs_ok: bool;
+    let pairs_detail: String;
     {
         let nl = crate::netlist::Netlist::from_board(&board);
         // Power nets (routed as wide traces when not planes)
@@ -528,8 +561,77 @@ pub fn build(
                 priority: p.priority.unwrap_or(0),
             })
             .collect();
+        // ─── Differential pairs: cross-section per pair from the stackup ───
+        let fab_limits = crate::materials::FabLimits::default();
+        let mut pair_cfgs: Vec<crate::router::PairConfig> = Vec::new();
+        let mut pair_net_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pair_geometry_failed = 0usize;
+        let mut infos: Vec<crate::si::PairInfo> = Vec::new();
+        if let Some(pairs) = &plan.pairs {
+            for pr in pairs {
+                let z = pr.z_diff.unwrap_or(100.0);
+                match stackup.pair_geometry(z, fab_limits.min_trace_mm, rules.clearance_mm) {
+                    Some(g) => {
+                        let budget = pr.skew_mm.unwrap_or_else(|| pair_skew_budget_mm(&pr.p, &pr.n));
+                        println!(
+                            "  pair {}/{}: {:.0} Ω → w {:.4} mm / gap {:.4} mm, skew budget {:.3} mm ({})",
+                            pr.p, pr.n, z, g.width_mm, g.gap_mm, budget, g.source
+                        );
+                        pair_cfgs.push(crate::router::PairConfig {
+                            p: pr.p.clone(),
+                            n: pr.n.clone(),
+                            width_mm: g.width_mm,
+                            pitch_mm: g.width_mm + g.gap_mm,
+                            z_diff: z,
+                            skew_budget_mm: budget,
+                        });
+                        infos.push(crate::si::PairInfo { p: pr.p.clone(), n: pr.n.clone(), z_diff: z, width_mm: g.width_mm, gap_mm: g.gap_mm, source: g.source.clone(), routed: false });
+                        pair_net_names.insert(pr.p.clone());
+                        pair_net_names.insert(pr.n.clone());
+                    }
+                    None => {
+                        println!("  [error] pair {}/{}: no {:.0} Ω cross-section within the fab scope on {}", pr.p, pr.n, z, stackup.name);
+                        pair_geometry_failed += 1;
+                        infos.push(crate::si::PairInfo { p: pr.p.clone(), n: pr.n.clone(), z_diff: z, width_mm: 0.0, gap_mm: 0.0, source: "none".into(), routed: false });
+                    }
+                }
+            }
+        }
+        cfg.pairs = pair_cfgs;
+        // Clean layers: signal layers next to a single whole-board plane
+        // (a split plane under a trace breaks its return path).
+        cfg.pair_layers = clean_signal_layers(&board, &signal_layers, &plane_specs, &plane_rects);
+        if !cfg.pairs.is_empty() {
+            println!("  pair/impedance layers: {}", cfg.pair_layers.join(", "));
+        }
+        // Crosstalk: every net that carries a frequency gets its 3W/5W gap
+        for net in &plan.nets {
+            let mut member_values: Vec<&str> = Vec::new();
+            for pin in &net.pins {
+                if let Some((refdes, _)) = pin.split_once(':') {
+                    if let Some(c) = plan.components.iter().find(|c| c.reference == refdes) {
+                        member_values.push(&c.value);
+                        member_values.push(&c.lib_id);
+                    }
+                }
+            }
+            let sig = crate::netfreq::net_signal(&net.name, &member_values, net.freq_hz, net.role.as_deref());
+            let fast = sig.freq_hz >= 1.0e6 || matches!(sig.role, crate::netfreq::NetRole::Rf | crate::netfreq::NetRole::HighSpeed | crate::netfreq::NetRole::Clock);
+            if fast && !matches!(sig.role, crate::netfreq::NetRole::Power | crate::netfreq::NetRole::Ground) {
+                // 3W/5W with W = the board's design trace width: one spacing
+                // class per board, so router halo and audit rule agree for
+                // every width that net may take (pair width, neck-down, 50 Ω).
+                let w = rules.trace_width_mm;
+                let gap = sig.crosstalk_spacing_mm(w) - w; // centre spacing 3W/5W → edge gap 2W/4W
+                cfg.net_gap.insert(net.name.clone(), gap);
+            }
+        }
+        router_net_gap = cfg.net_gap.clone();
         let mut router = crate::router::Router::new(cfg).stackup_with(stackup.clone());
         for net in &plan.nets {
+            if pair_net_names.contains(&net.name) {
+                continue; // pair nets take the pair cross-section, not a 50 Ω single-ended width
+            }
             let mut member_values: Vec<&str> = Vec::new();
             for pin in &net.pins {
                 if let Some((refdes, _)) = pin.split_once(':') {
@@ -548,9 +650,41 @@ pub fn build(
                 }
             }
         }
+        router.config.restricted_nets = router.impedance_targets.keys().cloned().collect();
         let route = router.route(&board, &nl);
         route_summary = route.summary_line();
         unrouted_count = route.unrouted.len();
+        // Pair reports → gate facts
+        for pr in &route.pairs {
+            println!(
+                "  pair {}/{}: {}",
+                pr.p, pr.n,
+                if pr.routed {
+                    format!("coupled {:.1} mm on {}, tails ≤ {:.1} mm, len P {:.2} / N {:.2} mm, skew {:+.3} mm (budget {:.3}), {} corner(s), {} bump(s){}{}",
+                        pr.coupled_mm, pr.layer, pr.tail_max_mm, pr.p_len_mm, pr.n_len_mm, pr.skew_mm, pr.skew_budget_mm, pr.corners, pr.bumps,
+                        if pr.crossover { ", P/N order differs at the two ends: far tails cross through a via" } else { "" },
+                        if pr.cause.is_empty() { String::new() } else { format!(" — {}", pr.cause) })
+                } else {
+                    format!("NOT COUPLED — {}", pr.cause)
+                }
+            );
+        }
+        let mut infos = infos;
+        for info in infos.iter_mut() {
+            info.routed = route.pairs.iter().filter(|r| r.p == info.p && r.n == info.n).all(|r| r.routed) && route.pairs.iter().any(|r| r.p == info.p && r.n == info.n);
+        }
+        let declared = plan.pairs.as_ref().map(|p| p.len()).unwrap_or(0);
+        let trunks_ok = route.pairs.iter().filter(|r| r.routed && r.skew_mm.abs() <= r.skew_budget_mm + 1e-6).count();
+        let trunks = route.pairs.len();
+        pairs_ok = pair_geometry_failed == 0 && infos.iter().all(|i| i.routed) && trunks_ok == trunks;
+        pairs_detail = format!(
+            "{} pair(s) declared, {} trunk(s) coupled, {} within skew budget{}",
+            declared, route.pairs.iter().filter(|r| r.routed).count(), trunks_ok,
+            if pair_geometry_failed > 0 { format!(", {} without a fab cross-section", pair_geometry_failed) } else { String::new() }
+        );
+        route_pairs = route.pairs.clone();
+        route_exempt = route.exempt_rects.iter().map(|r| (r.x0, r.y0, r.x1, r.y1, r.layer.clone())).collect();
+        pair_infos = infos;
         for u in &route.unrouted {
             println!("  UNROUTED {} {} → {}: {}", u.net.1, u.from, u.to, u.cause);
         }
@@ -580,6 +714,10 @@ pub fn build(
             detail: route_summary.clone(),
         });
     }
+    if plan.pairs.as_ref().map(|p| !p.is_empty()).unwrap_or(false) {
+        stages.push(StageResult { stage: "pairs".into(), success: pairs_ok, detail: pairs_detail.clone() });
+    }
+    let _ = &route_pairs;
 
     // ─── Stage 2d: physics-aware design audit (freq / SI / thermal) ───
     // Every net's frequency is known (declared or component-spec); every
@@ -655,8 +793,9 @@ pub fn build(
             );
         }
 
-        // SI audit (stray L/C + SWR + stubs + crosstalk)
-        let si = crate::si::audit(&board, &signals, &stackup, &fab);
+        // SI audit (stray L/C + SWR + stubs + crosstalk + pairs + decoupling)
+        let si_ctx = build_si_context(&plan, &board, &pair_infos, &route_exempt, &router_net_gap, rules.clearance_mm, &plane_specs);
+        let si = crate::si::audit(&board, &signals, &stackup, &fab, &si_ctx);
         let si_errors = si.findings.iter().filter(|f| f.severity == "error").count();
         let si_warnings = si.findings.iter().filter(|f| f.severity == "warning").count();
         for f in &si.findings {
@@ -710,6 +849,43 @@ pub fn build(
             success: th_errors == 0,
             detail: format!("{} error(s), {} warning(s)", th_errors, th_warnings),
         });
+
+        // ─── Stability audit: regulators, crystals, switch/feedback nodes ───
+        {
+            let stab = crate::stability::audit(&plan, &board);
+            let errs = stab.iter().filter(|f| f.severity == "error").count();
+            let warns = stab.iter().filter(|f| f.severity == "warning").count();
+            for f in &stab {
+                println!("  [{}] {} {}: {}", f.severity, f.code, f.subject, f.detail);
+            }
+            stages.push(StageResult {
+                stage: "stability-audit".into(),
+                success: errs == 0,
+                detail: format!("{} error(s), {} warning(s): regulator output capacitance, crystal loads and traces, switch/feedback nodes", errs, warns),
+            });
+        }
+
+        // ─── PDN: |Z(f)| per rail from the decouplers as mounted ───
+        {
+            let results = pdn_audit(&plan, &board, &stackup, &si_ctx, &plane_specs, &plane_rects);
+            let mut over = 0usize;
+            for r in &results {
+                let status = if r.peak_ohm > r.z_target_ohm { over += 1; "warning" } else { "info" };
+                println!(
+                    "  [{}] pdn {}: peak |Z| {:.3} Ω at {:.1} MHz vs target {:.3} Ω ({} capacitor(s){})",
+                    status, r.rail, r.peak_ohm, r.peak_hz / 1e6, r.z_target_ohm, r.n_caps,
+                    match (r.over_target_from_hz, r.over_target_to_hz) {
+                        (Some(a), Some(b)) => format!("; above target {:.1}–{:.1} MHz — add low-ESL capacitance or shorten its loops", a / 1e6, b / 1e6),
+                        _ => String::new(),
+                    }
+                );
+            }
+            stages.push(StageResult {
+                stage: "pdn-audit".into(),
+                success: true,
+                detail: format!("{} rail(s) swept 100 kHz–200 MHz, {} above the ΔV/ΔI target (model: MLCC ESR/ESL classes + measured mounting loops; above 200 MHz the package/die decoupling owns the rail)", results.len(), over),
+            });
+        }
 
         // Fab-scope: the design rules the board was routed with must fit JLCPCB
         let fab_checks = rules.fab_violations(&fab, stackup.finished_thickness_mm);
@@ -1063,6 +1239,38 @@ pub fn validate_plan(plan: &CircuitPlan) -> Result<(), OrchestrateError> {
                 return Err(OrchestrateError::PlanInvalid(format!(
                     "net '{}' has malformed pin '{}' (expected REFDES:PIN_NUMBER)",
                     net.name, pin
+                )));
+            }
+        }
+    }
+    if let Some(pairs) = &plan.pairs {
+        let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for pr in pairs {
+            if pr.p == pr.n {
+                return Err(OrchestrateError::PlanInvalid(format!("pair '{}' names the same net twice", pr.p)));
+            }
+            for name in [&pr.p, &pr.n] {
+                if !plan.nets.iter().any(|n| &n.name == name) {
+                    return Err(OrchestrateError::PlanInvalid(format!("pair net '{}' is not a plan net", name)));
+                }
+                if !used.insert(name.as_str()) {
+                    return Err(OrchestrateError::PlanInvalid(format!("net '{}' belongs to more than one pair", name)));
+                }
+            }
+            if let Some(z) = pr.z_diff {
+                if !(20.0..=300.0).contains(&z) {
+                    return Err(OrchestrateError::PlanInvalid(format!("pair {}/{}: z_diff {} Ω is not a PCB pair impedance (20..300)", pr.p, pr.n, z)));
+                }
+            }
+            // The two nets must run between the same two components
+            let refs_of = |name: &str| -> std::collections::HashSet<String> {
+                plan.nets.iter().find(|n| n.name == name).map(|n| n.pins.iter().filter_map(|p| p.split(':').next().map(|s| s.to_string())).collect()).unwrap_or_default()
+            };
+            let shared = refs_of(&pr.p).intersection(&refs_of(&pr.n)).count();
+            if shared < 2 {
+                return Err(OrchestrateError::PlanInvalid(format!(
+                    "pair {}/{}: the two nets share {} component(s); a pair runs between two components both nets connect to",
+                    pr.p, pr.n, shared
                 )));
             }
         }
@@ -1618,6 +1826,220 @@ pub fn generate_board(plan: &CircuitPlan) -> String {
 
     out.push_str(")\n");
     out
+}
+
+
+
+/// Rail voltage from a net name: "+3V3" → 3.3, "+1V8" → 1.8, "VBUS"/"+5V" → 5.
+pub fn rail_volts(name: &str) -> Option<f64> {
+    let u = name.to_ascii_uppercase();
+    if u == "VBUS" || u == "+5V" || u == "5V" || u == "VIN" {
+        return Some(5.0);
+    }
+    let bytes: Vec<char> = u.chars().collect();
+    for i in 0..bytes.len() {
+        if bytes[i] == 'V' && i > 0 && bytes[i - 1].is_ascii_digit() {
+            let int_part: String = bytes[..i].iter().rev().take_while(|c| c.is_ascii_digit()).collect::<String>().chars().rev().collect();
+            let frac: String = bytes[i + 1..].iter().take_while(|c| c.is_ascii_digit()).collect();
+            let v: f64 = format!("{}.{}", int_part, if frac.is_empty() { "0".to_string() } else { frac }).parse().ok()?;
+            if v > 0.0 && v < 60.0 {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Build and sweep a PDN model per power rail that has decouplers.
+fn pdn_audit(
+    plan: &CircuitPlan,
+    board: &crate::board::Board,
+    stackup: &crate::materials::Stackup,
+    ctx: &crate::si::SiContext,
+    plane_specs: &[PlaneSpec],
+    plane_rects: &[Option<(f64, f64, f64, f64)>],
+) -> Vec<crate::pdn::RailResult> {
+    use crate::pdn::*;
+    let ground = |n: &str| ctx.decouplers.iter().any(|d| (d.net_a == n || d.net_b == n) && crate::netfreq::net_signal(n, &[], None, None).role == crate::netfreq::NetRole::Ground);
+    // Consumers: components with declared power, split across their rails by pin count
+    let consumers: Vec<(String, f64, Vec<(String, f64, usize)>)> = plan
+        .components
+        .iter()
+        .filter_map(|c| {
+            let p = c.power_w?;
+            if p <= 0.0 {
+                return None;
+            }
+            let mut rails: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for n in &plan.nets {
+                if let Some(v) = rail_volts(&n.name) {
+                    let _ = v;
+                    let cnt = n.pins.iter().filter(|pin| pin.starts_with(&format!("{}:", c.reference))).count();
+                    if cnt > 0 && crate::netfreq::net_signal(&n.name, &[], n.freq_hz, n.role.as_deref()).role == crate::netfreq::NetRole::Power {
+                        *rails.entry(n.name.clone()).or_insert(0) += cnt;
+                    }
+                }
+            }
+            Some((c.reference.clone(), p, rails.into_iter().map(|(r, cnt)| (r.clone(), rail_volts(&r).unwrap_or(3.3), cnt)).collect()))
+        })
+        .collect();
+    let currents = rail_currents(&consumers);
+    let (bw, bh) = board.outline_bbox().map(|(x0, y0, x1, y1)| (x1 - x0, y1 - y0)).unwrap_or((100.0, 80.0));
+    let mut rails: Vec<String> = ctx.decouplers.iter().filter_map(|d| if ground(&d.net_b) { Some(d.net_a.clone()) } else if ground(&d.net_a) { Some(d.net_b.clone()) } else { None }).collect();
+    rails.sort();
+    rails.dedup();
+    let mut out = Vec::new();
+    for rail in rails {
+        let Some(volts) = rail_volts(&rail) else { continue };
+        let caps: Vec<CapBranch> = ctx
+            .decouplers
+            .iter()
+            .filter(|d| d.net_a == rail || d.net_b == rail)
+            .map(|d| {
+                let loop_nh = crate::si::cap_loop_inductance_nh(board, stackup, ctx, d).map(|(l, _)| l).unwrap_or(2.0);
+                CapBranch { reference: d.reference.clone(), c_f: d.c_farads, esr_ohm: mlcc_esr_ohm(d.c_farads), esl_nh: mlcc_esl_nh(d.c_farads) + loop_nh }
+            })
+            .collect();
+        // Plane capacitance to the nearest GND plane (depth difference)
+        let plane_c_pf = plane_specs
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.net == rail)
+            .map(|(i, p)| {
+                let area = plane_rects.get(i).copied().flatten().map(|(x0, y0, x1, y1)| (x1 - x0) * (y1 - y0)).unwrap_or(bw * bh);
+                let k = p.layer.strip_prefix("In").and_then(|r| r.strip_suffix(".Cu")).and_then(|d| d.parse::<usize>().ok()).unwrap_or(1);
+                let kg = plane_specs.iter().find(|q| crate::netfreq::net_signal(&q.net, &[], None, None).role == crate::netfreq::NetRole::Ground).and_then(|q| q.layer.strip_prefix("In").and_then(|r| r.strip_suffix(".Cu")).and_then(|d| d.parse::<usize>().ok())).unwrap_or(1);
+                let step = (stackup.finished_thickness_mm - 2.0 * (stackup.h_mm + stackup.copper_thickness_mm)).max(0.1) / (board.layer_count as f64 - 3.0).max(1.0);
+                let h = ((k as f64 - kg as f64).abs() * step).max(stackup.h_mm);
+                plane_capacitance_pf(area, h, stackup.er)
+            })
+            .sum();
+        // Regulator branch: the output path from the regulator (or its buck
+        // inductor) to the first via/pad — measured; 20 mΩ source resistance.
+        let (vrm_l_nh, _src) = plan
+            .components
+            .iter()
+            .filter(|c| crate::values::inductance_h(&c.value).is_some() || { let u = format!("{} {}", c.value, c.lib_id).to_ascii_uppercase(); u.contains("REGULATOR") || u.contains("LDO") || u.contains("TPS5") || u.contains("ME62") || u.contains("XC62") })
+            .filter(|c| plan.nets.iter().any(|n| n.name == rail && n.pins.iter().any(|p| p.starts_with(&format!("{}:", c.reference)))))
+            .filter_map(|c| crate::si::component_stub(board, &c.reference, &rail).map(|(len, w, _)| (crate::si::trace_l_per_mm(w, stackup.h_mm, stackup.copper_thickness_mm) * len + 0.5, c.reference.clone())))
+            .next()
+            .unwrap_or((10.0, "assumed 10 nH (no regulator found on this rail)".into()));
+        let model = RailModel { rail: rail.clone(), volts, current_a: currents.get(&rail).copied().unwrap_or(0.1).max(0.05), caps, plane_c_pf, vrm_r_ohm: 0.02, vrm_l_nh };
+        out.push(sweep(&model));
+    }
+    out
+}
+
+/// Intra-pair skew budget by interface class (Toradex Layout Design
+/// Guide 102492, interface tables: USB 2.0 < 7.5 ps ≈ 1.1 mm; Ethernet
+/// < 1.6 ps ≈ 250 µm; MIPI CSI/DSI, USB 3, PCIe, SATA, LVDS < 1 ps ≈
+/// 150 µm). Unknown interfaces get the Ethernet figure.
+pub fn pair_skew_budget_mm(p: &str, n: &str) -> f64 {
+    let u = format!("{} {}", p, n).to_ascii_uppercase();
+    let has = |keys: &[&str]| keys.iter().any(|k| u.contains(k));
+    if has(&["MIPI", "CSI", "DSI", "LVDS", "PCIE", "SATA", "HDMI", "USB3", "SS_", "SSTX", "SSRX", "TMDS"]) {
+        0.15
+    } else if has(&["USB", "DP", "DM", "D+", "D-"]) {
+        1.1
+    } else if has(&["ETH", "MDI", "TXP", "TXN", "RXP", "RXN", "TD", "RD", "TRD"]) {
+        0.25
+    } else {
+        0.25
+    }
+}
+
+/// Signal layers that sit next to one whole-board plane: a trace there has
+/// an unbroken return path. A layer next to a split plane, or to no plane
+/// at all on a multilayer board, is excluded for pairs and
+/// impedance-controlled nets. 2-layer boards: both layers (nothing better).
+pub fn clean_signal_layers(
+    board: &crate::board::Board,
+    signal_layers: &[String],
+    plane_specs: &[PlaneSpec],
+    plane_rects: &[Option<(f64, f64, f64, f64)>],
+) -> Vec<String> {
+    let copper = board.copper_layers();
+    if board.layer_count <= 2 || plane_specs.is_empty() {
+        return signal_layers.to_vec();
+    }
+    let whole_single = |layer: &str| -> bool {
+        let on: Vec<usize> = plane_specs.iter().enumerate().filter(|(_, p)| p.layer == layer).map(|(i, _)| i).collect();
+        on.len() == 1 && plane_rects.get(on[0]).map(|r| r.is_none()).unwrap_or(false)
+    };
+    signal_layers
+        .iter()
+        .filter(|l| {
+            let Some(i) = copper.iter().position(|c| c == *l) else { return false };
+            let neighbours = [i.checked_sub(1), if i + 1 < copper.len() { Some(i + 1) } else { None }];
+            neighbours.iter().flatten().any(|&j| whole_single(&copper[j]))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Everything the SI audit needs beyond the copper, derived from the plan.
+fn build_si_context(
+    plan: &CircuitPlan,
+    board: &crate::board::Board,
+    pair_infos: &[crate::si::PairInfo],
+    exempt: &[(f64, f64, f64, f64, String)],
+    net_gap: &std::collections::HashMap<String, f64>,
+    clearance_mm: f64,
+    plane_specs: &[PlaneSpec],
+) -> crate::si::SiContext {
+    let mut ctx = crate::si::SiContext {
+        pairs: pair_infos.to_vec(),
+        exempt_rects: exempt.to_vec(),
+        gap_of: net_gap.clone(),
+        clearance_mm,
+        layer_count: board.layer_count,
+        ..Default::default()
+    };
+    let comp = |r: &str| plan.components.iter().find(|c| c.reference == r);
+    for net in &plan.nets {
+        let declared = net.termination.as_deref().map(|t| t.to_ascii_lowercase());
+        let terminated = match declared.as_deref() {
+            Some("series") | Some("parallel") | Some("on-chip") | Some("onchip") | Some("ac") => true,
+            Some(_) => false,
+            None => net.pins.iter().any(|pin| {
+                pin.split_once(':').and_then(|(r, _)| comp(r)).map(|c| {
+                    let two_pin = plan.nets.iter().flat_map(|n| n.pins.iter()).filter(|p| p.starts_with(&format!("{}:", c.reference))).count() <= 2;
+                    two_pin && crate::values::resistance_ohm(&c.value).map(|r| r <= 100.0).unwrap_or(false)
+                }).unwrap_or(false)
+            }),
+        };
+        if terminated {
+            ctx.terminated.insert(net.name.clone());
+        }
+    }
+    // Decouplers: two-pin capacitors between a power-role net and a
+    // ground-role net (RC filters, crystal loads and AC couplings are not
+    // decouplers and carry no mounting-loop rule).
+    let role_of = |name: &str| -> crate::netfreq::NetRole {
+        plan.nets.iter().find(|n| n.name == name).map(|n| crate::netfreq::net_signal(&n.name, &[], n.freq_hz, n.role.as_deref()).role).unwrap_or(crate::netfreq::NetRole::Digital)
+    };
+    for c in &plan.components {
+        let Some(cf) = crate::values::capacitance_f(&c.value) else { continue };
+        let pins: Vec<(&str, &str)> = plan.nets.iter().flat_map(|n| n.pins.iter().filter(|p| p.starts_with(&format!("{}:", c.reference))).map(move |p| (n.name.as_str(), p.as_str()))).collect();
+        if pins.len() != 2 || pins[0].0 == pins[1].0 {
+            continue;
+        }
+        let (ra, rb) = (role_of(pins[0].0), role_of(pins[1].0));
+        let is_decoupler = matches!((&ra, &rb), (crate::netfreq::NetRole::Power, crate::netfreq::NetRole::Ground) | (crate::netfreq::NetRole::Ground, crate::netfreq::NetRole::Power));
+        if !is_decoupler {
+            continue;
+        }
+        // Strict (error) only for capacitors placed at an IC; a connector's
+        // or regulator's bulk capacitor is judged as a warning.
+        let strict = c.near.as_deref().map(|a| a.starts_with('U')).unwrap_or(false);
+        ctx.decouplers.push(crate::si::Decoupler { reference: c.reference.clone(), net_a: pins[0].0.to_string(), net_b: pins[1].0.to_string(), c_farads: cf, strict });
+    }
+    for ps in plane_specs {
+        if let Some(k) = ps.layer.strip_prefix("In").and_then(|r| r.strip_suffix(".Cu")).and_then(|d| d.parse::<usize>().ok()) {
+            ctx.plane_layer_of.entry(ps.net.clone()).or_insert(k);
+        }
+    }
+    ctx
 }
 
 #[cfg(test)]

@@ -36,8 +36,16 @@ impl NetRole {
     /// Classify from a net name (the circuit's own vocabulary).
     pub fn from_name(name: &str) -> Option<NetRole> {
         let n = name.to_uppercase();
-        if n == "VCC" || n == "VBUS" || n.starts_with("+3V") || n.starts_with("+5V")
-            || n.starts_with("VDD") || n.starts_with("VIN")
+        // Rail names: VCC/VBUS/VDD*/VIN*, "+3V3"-style voltages ("+1V2",
+        // "+1V8", "+5V", "3V3", "12V"), and *_VCC/*_VDD rails
+        let voltage_like = {
+            let t = n.trim_start_matches('+');
+            t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                && t.contains('V')
+                && t.chars().all(|c| c.is_ascii_digit() || c == 'V' || c == '.')
+        };
+        if n == "VCC" || n == "VBUS" || voltage_like
+            || n.starts_with("VDD") || n.starts_with("VIN") || n.ends_with("_VCC") || n.ends_with("_VDD") || n.starts_with("VCC_") || n.starts_with("VDD_")
         {
             return Some(NetRole::Power);
         }
@@ -326,6 +334,14 @@ mod tests {
         let c = net_signal("X2", &["100MHz"], None, Some("clock"));
         assert_eq!(c.role, NetRole::Clock);
         assert!(c.needs_impedance_control(), "100MHz clock needs Z control");
+    }
+
+    #[test]
+    fn voltage_style_rail_names_are_power() {
+        for n in ["+1V2", "+1V8", "+3V0", "+5V", "3V3", "12V", "ETH_VCC", "VCC_PLL"] {
+            assert_eq!(NetRole::from_name(n), Some(NetRole::Power), "{}", n);
+        }
+        assert_ne!(NetRole::from_name("LCD_PE24"), Some(NetRole::Power));
     }
 
     #[test]

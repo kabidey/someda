@@ -336,9 +336,257 @@ pub fn copper_imbalance_pct(coverage_top: f64, coverage_bottom: f64) -> f64 {
     (coverage_top - coverage_bottom).abs() / avg * 100.0
 }
 
+
+/// Even/odd-mode result of a coupled microstrip pair (Ω, dimensionless).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoupledMicrostrip {
+    pub z_even: f64,
+    pub z_odd: f64,
+    pub er_eff_even: f64,
+    pub er_eff_odd: f64,
+}
+
+impl CoupledMicrostrip {
+    /// Differential impedance Z_diff = 2·Z_odd.
+    pub fn z_diff(&self) -> f64 {
+        2.0 * self.z_odd
+    }
+    /// Common-mode impedance Z_common = Z_even / 2.
+    pub fn z_common(&self) -> f64 {
+        self.z_even / 2.0
+    }
+}
+
+fn hammerstad_ab(u: f64, er: f64) -> (f64, f64) {
+    let a = 1.0
+        + ((u.powi(4) + (u / 52.0).powi(2)) / (u.powi(4) + 0.432)).ln() / 49.0
+        + (1.0 + (u / 18.1).powi(3)).ln() / 18.7;
+    let b = 0.564 * ((er - 0.9) / (er + 3.0)).powf(0.053);
+    (a, b)
+}
+
+fn hammerstad_er(u: f64, er: f64, a: f64, b: f64) -> f64 {
+    (er + 1.0) / 2.0 + (er - 1.0) / 2.0 * (1.0 + 10.0 / u).powf(-a * b)
+}
+
+/// Free-space impedance η₀ (Ω).
+const Z_FREE_SPACE: f64 = 376.730_313_668;
+
+fn hammerstad_zl(u: f64) -> f64 {
+    let fu = 6.0 + (2.0 * std::f64::consts::PI - 6.0) * (-(30.666 / u).powf(0.7528)).exp();
+    Z_FREE_SPACE / (2.0 * std::f64::consts::PI) * (fu / u + (1.0 + (2.0 / u).powi(2)).sqrt()).ln()
+}
+
+/// Edge-coupled microstrip pair, quasi-static even/odd-mode impedance.
+///
+/// Kirschning & Jansen (1984), "Accurate wide-range design equations for
+/// the frequency-dependent characteristics of parallel coupled microstrip
+/// lines", IEEE MTT-32(1), with Jansen's strip-thickness correction, as
+/// implemented (coefficient for coefficient) in Qucs `mscoupled.cpp`
+/// (model "Kirschning") and KiCad's PCB Calculator, which inherits the
+/// Qucs transline code. Validity: 0.1 ≤ w/h ≤ 10, 0.1 ≤ s/h ≤ 10, εr ≤ 18.
+///
+/// w, s, h, t in mm; s is the EDGE gap between the two traces.
+pub fn coupled_microstrip(er: f64, h_mm: f64, w_mm: f64, s_mm: f64, t_mm: f64) -> CoupledMicrostrip {
+    let nan = CoupledMicrostrip { z_even: f64::NAN, z_odd: f64::NAN, er_eff_even: f64::NAN, er_eff_odd: f64::NAN };
+    if w_mm <= 0.0 || s_mm <= 0.0 || h_mm <= 0.0 || er < 1.0 {
+        return nan;
+    }
+    let pi = std::f64::consts::PI;
+    let (w, h, s, t) = (w_mm, h_mm, s_mm, t_mm);
+    let u = w / h;
+    let g = s / h;
+    // Finite strip thickness (Jansen): widens the even-mode strip, and the
+    // odd-mode strip a little more because the gap field sees the strip side.
+    let (mut ue, mut uo) = (u, u);
+    if t > 0.0 && s > 10.0 * (2.0 * t) {
+        let one_over_2pi = 1.0 / (2.0 * pi);
+        let dw = if u >= one_over_2pi && one_over_2pi > 2.0 * t / h {
+            t * (1.0 + (2.0 * h / t).ln()) / pi
+        } else if w > 2.0 * t {
+            t * (1.0 + (4.0 * pi * w / t).ln()) / pi
+        } else {
+            0.0
+        };
+        let dt = 2.0 * t * h / s / er;
+        let we = w + dw * (1.0 - 0.5 * (-0.69 * dw / dt).exp());
+        let wo = we + dt;
+        ue = we / h;
+        uo = wo / h;
+    }
+    // Even-mode effective permittivity
+    let v = ue * (20.0 + g * g) / (10.0 + g * g) + g * (-g).exp();
+    let (ae, be) = hammerstad_ab(v, er);
+    let er_eff_even = hammerstad_er(v, er, ae, be);
+    // Odd-mode effective permittivity
+    let (a, b) = hammerstad_ab(uo, er);
+    let er_eff = hammerstad_er(uo, er, a, b);
+    let d = 0.593 + 0.694 * (-0.562 * uo).exp();
+    let bo = 0.747 * er / (0.15 + er);
+    let co = bo - (bo - 0.207) * (-0.414 * uo).exp();
+    let ao = 0.7287 * (er_eff - (er + 1.0) / 2.0) * (1.0 - (-0.179 * uo).exp());
+    let er_eff_odd = ((er + 1.0) / 2.0 + ao - er_eff) * (-co * g.powf(d)).exp() + er_eff;
+    // Single-line impedance
+    let zl1 = hammerstad_zl(u) / er_eff.sqrt();
+    // Even-mode impedance
+    let q1 = 0.8695 * ue.powf(0.194);
+    let q2 = 1.0 + 0.7519 * g + 0.189 * g.powf(2.31);
+    let q3 = 0.1975
+        + (16.6 + (8.4 / g).powi(6)).powf(-0.387)
+        + (g.powi(10) / (1.0 + (g / 3.4).powi(10))).ln() / 241.0;
+    let q4 = q1 / q2 * 2.0 / ((-g).exp() * ue.powf(q3) + (2.0 - (-g).exp()) * ue.powf(-q3));
+    let z_even = (er_eff / er_eff_even).sqrt() * zl1 / (1.0 - zl1 * er_eff.sqrt() * q4 / Z_FREE_SPACE);
+    // Odd-mode impedance
+    let q5 = 1.794 + 1.14 * (1.0 + 0.638 / (g + 0.517 * g.powf(2.43))).ln();
+    let q6 = 0.2305
+        + (g.powi(10) / (1.0 + (g / 5.8).powi(10))).ln() / 281.3
+        + (1.0 + 0.598 * g.powf(1.154)).ln() / 5.1;
+    let q7 = (10.0 + 190.0 * g * g) / (1.0 + 82.3 * g * g * g);
+    let q8 = (-6.5 - 0.95 * g.ln() - (g / 0.15).powi(5)).exp();
+    let q9 = q7.ln() * (q8 + 1.0 / 16.5);
+    let q10 = (q2 * q4 - q5 * (uo.ln() * q6 * uo.powf(-q9)).exp()) / q2;
+    let z_odd = (er_eff / er_eff_odd).sqrt() * zl1 / (1.0 - zl1 * er_eff.sqrt() * q10 / Z_FREE_SPACE);
+    CoupledMicrostrip { z_even, z_odd, er_eff_even, er_eff_odd }
+}
+
+/// Differential impedance of an edge-coupled microstrip pair (Ω).
+pub fn diff_microstrip_z(er: f64, h_mm: f64, w_mm: f64, s_mm: f64, t_mm: f64) -> f64 {
+    coupled_microstrip(er, h_mm, w_mm, s_mm, t_mm).z_diff()
+}
+
+/// A routable differential-pair cross-section: both traces `width_mm`
+/// wide, centre-to-centre `pitch_cells` × 2 router cells apart (so the
+/// pair sits symmetrically on the routing lattice), edge gap `gap_mm`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairGeometry {
+    pub width_mm: f64,
+    pub gap_mm: f64,
+    /// Half the centre-to-centre pitch in router cells (offset of each
+    /// trace from the pair centreline).
+    pub offset_cells: i32,
+    pub z_diff: f64,
+    pub z_odd: f64,
+    pub z_even: f64,
+}
+
+/// Solve the pair cross-section for a differential target on a microstrip
+/// stackup. The trace centres must lie on the router lattice: offset ±k
+/// cells from the centreline, so pitch = 2k·grid and gap = pitch − w.
+/// Z_diff falls monotonically with w at fixed pitch (wider trace AND
+/// smaller gap both lower Z_odd), so bisection on w is exact. The
+/// smallest k (tightest coupling) that admits a fab-legal solution wins.
+/// `width_scale` calibrates the closed form to the fab's field solver
+/// (e.g. 0.1425/0.175 for JLCPCB's 6-layer 50 Ω width): the solved width
+/// is multiplied by it; None = 1.0.
+pub fn solve_pair_geometry(
+    z_diff_target: f64,
+    er: f64,
+    h_mm: f64,
+    t_mm: f64,
+    grid_mm: f64,
+    min_trace_mm: f64,
+    min_space_mm: f64,
+    width_scale: Option<f64>,
+) -> Option<PairGeometry> {
+    let scale = width_scale.unwrap_or(1.0);
+    for k in 1..=6 {
+        let pitch = 2.0 * k as f64 * grid_mm;
+        // Width bounds on the CLOSED-FORM side (fab width = w × scale)
+        let w_lo = min_trace_mm / scale;
+        let w_hi = (pitch - min_space_mm) / scale;
+        if w_hi <= w_lo {
+            continue;
+        }
+        let z_at = |w: f64| diff_microstrip_z(er, h_mm, w, pitch - w * scale, t_mm);
+        // Need z(w_lo) ≥ target ≥ z(w_hi)
+        if z_at(w_lo) < z_diff_target || z_at(w_hi) > z_diff_target {
+            continue;
+        }
+        let (mut lo, mut hi) = (w_lo, w_hi);
+        for _ in 0..100 {
+            let mid = 0.5 * (lo + hi);
+            if z_at(mid) > z_diff_target {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let w_closed = 0.5 * (lo + hi);
+        let width = w_closed * scale;
+        let gap = pitch - width;
+        if width < min_trace_mm - 1e-9 || gap < min_space_mm - 1e-9 {
+            continue;
+        }
+        let cm = coupled_microstrip(er, h_mm, w_closed, gap, t_mm);
+        return Some(PairGeometry {
+            width_mm: (width * 1e4).round() / 1e4,
+            gap_mm: (gap * 1e4).round() / 1e4,
+            offset_cells: k,
+            z_diff: cm.z_diff(),
+            z_odd: cm.z_odd,
+            z_even: cm.z_even,
+        });
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coupled_microstrip_decouples_to_single_line_at_wide_gap() {
+        // s/h → large: odd and even modes both converge on the single-line
+        // impedance (coupling vanishes).
+        let (er, h, w, t) = (4.1, 0.0994, 0.1425, 0.0);
+        let z_single = microstrip_z0(er, h, w, t);
+        let cm = coupled_microstrip(er, h, w, 10.0 * h, t);
+        assert!((cm.z_odd - z_single).abs() / z_single < 0.03, "odd {} vs single {}", cm.z_odd, z_single);
+        assert!((cm.z_even - z_single).abs() / z_single < 0.03, "even {} vs single {}", cm.z_even, z_single);
+    }
+
+    #[test]
+    fn coupled_microstrip_coupling_splits_modes_monotonically() {
+        let (er, h, w, t) = (4.1, 0.0994, 0.127, 0.035);
+        let tight = coupled_microstrip(er, h, w, 0.127, t);
+        let loose = coupled_microstrip(er, h, w, 0.4, t);
+        assert!(tight.z_odd < loose.z_odd, "closer pair → lower Z_odd");
+        assert!(tight.z_even > loose.z_even, "closer pair → higher Z_even");
+        assert!(tight.z_odd < tight.z_even);
+        assert!(tight.z_diff() < 2.0 * microstrip_z0(er, h, w, t));
+    }
+
+    #[test]
+    fn coupled_microstrip_matches_independent_calculator() {
+        // Independent reference (PCBWay edge-coupled microstrip calculator,
+        // run 2026-10-19, which uses the IPC-2141 coupled approximation
+        // Z_diff = 2·Z0·(1 − 0.48·e^(−0.96·s/h))): εr 4.5, h 0.2 mm,
+        // w = s = 0.2 mm, 0.5 oz → Z0 68.2 Ω, Z_diff 111.4 Ω. The IPC
+        // approximation is itself only good to ~10 %; Kirschning–Jansen
+        // (zero thickness) must land within that band of it.
+        let cm = coupled_microstrip(4.5, 0.2, 0.2, 0.2, 0.0);
+        let z_single = microstrip_z0(4.5, 0.2, 0.2, 0.0);
+        assert!((z_single - 68.2).abs() / 68.2 < 0.05, "Z0 single {}", z_single);
+        assert!((cm.z_diff() - 111.4).abs() / 111.4 < 0.10, "Z_diff {}", cm.z_diff());
+        // Classic 1.6 mm two-layer: w = s = 1.0 mm, εr 4.5 → IPC/PCBWay
+        // Z_diff 127.4 Ω (1 oz); zero-thickness KJ within 10 %.
+        let cm2 = coupled_microstrip(4.5, 1.53, 1.0, 1.0, 0.0);
+        assert!((cm2.z_diff() - 127.4).abs() / 127.4 < 0.10, "Z_diff 2-layer {}", cm2.z_diff());
+    }
+
+    #[test]
+    fn pair_solver_hits_target_on_lattice() {
+        // JLC06161H-3313 outer layer, 0.127 mm lattice: 90 Ω and 100 Ω pairs
+        for target in [90.0, 100.0] {
+            let g = solve_pair_geometry(target, 4.1, 0.0994, 0.035, 0.127, 0.127, 0.127, None)
+                .unwrap_or_else(|| panic!("no {} Ω pair geometry", target));
+            assert!((g.z_diff - target).abs() < 0.5, "{} Ω: got {}", target, g.z_diff);
+            assert!(g.width_mm >= 0.127 - 1e-9 && g.gap_mm >= 0.127 - 1e-9);
+            let pitch = g.width_mm + g.gap_mm;
+            assert!((pitch - 2.0 * g.offset_cells as f64 * 0.127).abs() < 1e-3, "pitch on lattice");
+        }
+    }
+
 
     /// Skill 077/101 worked example: width=10 mils, thickness=1.37 mils
     /// (1 oz), ΔT=10°C. The skill text says "= 0.97 A" but the formula
