@@ -468,13 +468,13 @@ impl Router {
                         return false;
                     }
                     let x = grid.xt[i];
-                    if x != FREE && x != tp && x != tn {
+                    if x != FREE && !grid.tags.friendly(tp, x) {
                         return false;
                     }
                     if !grid.exempt[i] {
                         if let Some(m) = near {
                             let v = if m == 0 { grid.near3[i] } else { grid.near5[i] };
-                            if v != FREE && v != tp && v != tn {
+                            if v != FREE && !grid.tags.friendly(tp, v) {
                                 return false;
                             }
                         }
@@ -769,7 +769,9 @@ impl Router {
                         grid.claim_halo(c.x + dx, c.y + dy, layer, tag);
                     }
                     if let Some(ix) = grid.idx(c.x + dx, c.y + dy, layer) {
-                        grid.corridor[ix] = true;
+                        if grid.corridor[ix] == 0 {
+                            grid.corridor[ix] = tp;
+                        }
                     }
                 }
             }
@@ -784,7 +786,9 @@ impl Router {
                 for j in -(halo + 1)..=(halo + 1) {
                     let q = (c.x + s * step * dx + j * p.0, c.y + s * step * dy + j * p.1);
                     if let Some(ix) = grid.idx(q.0, q.1, layer) {
-                        grid.corridor[ix] = false;
+                        if grid.corridor[ix] == tp {
+                            grid.corridor[ix] = 0;
+                        }
                     }
                 }
             }
@@ -813,7 +817,7 @@ impl Router {
                 for dx in -xr..=xr {
                     if let Some(i) = grid.idx(c.x + dx, c.y + dy, layer) {
                         if !grid.exempt[i] {
-                            Grid::claim_mate(&mut grid.xt, i, tp, tn);
+                            Grid::claim_fam(&mut grid.xt, i, tp, &grid.tags.family);
                         }
                     }
                 }
@@ -876,7 +880,7 @@ impl Router {
                             continue;
                         }
                         let o = grid.owner_at(q);
-                        if o != FREE && o != tag && o != mate {
+                        if o != FREE && o != tag && o != mate && !grid.tags.friendly(tag, o) {
                             ok = false;
                             break 'chk;
                         }
@@ -925,7 +929,7 @@ impl Router {
                     let o = grid.owner[i];
                     let lane = grid.lane[c.y as usize * grid.w + c.x as usize];
                     let x = grid.xt[i];
-                    (o == FREE || o == tag) && (lane == 0 || lane == tag) && (x == FREE || x == tag || x == mate) && !grid.corridor[i]
+                    (o == FREE || o == tag) && (lane == 0 || lane == tag) && (x == FREE || x == tag || x == mate || grid.tags.friendly(tag, x)) && (grid.corridor[i] == 0 || grid.tags.friendly(tag, grid.corridor[i]))
                 }
                 None => false,
             }

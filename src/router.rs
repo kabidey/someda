@@ -368,9 +368,10 @@ struct Grid {
     /// Per cell/layer: breakout zone (pad proximity, escape band or lane)
     /// where the crosstalk rule is relaxed.
     exempt: Vec<bool>,
-    /// Per cell/layer: inside a pair corridor's halo — pair tails stay out
-    /// (they join only through the terminal approach cells).
-    corridor: Vec<bool>,
+    /// Per cell/layer: inside a pair corridor's halo (the pair's P tag) —
+    /// tails of other families stay out (they join only through their own
+    /// terminal approach cells).
+    corridor: Vec<u32>,
     /// Per-net-tag facts the stamping/search code needs.
     tags: TagMaps,
 }
@@ -384,11 +385,24 @@ struct TagMaps {
     gap_of: Vec<f64>,
     restricted: Vec<bool>,
     layer_allowed: Vec<bool>,
+    /// Crosstalk family per tag (0 = none): a pair's two nets, and pairs
+    /// chained through a shared component (SoC → ESD → connector carry the
+    /// same signal), may sit inside each other's halos.
+    family: Vec<u32>,
 }
 impl TagMaps {
     #[inline]
     fn mate(&self, tag: u32) -> u32 {
         self.mate_of.get(tag as usize).copied().unwrap_or(0)
+    }
+    /// Same net, or the same crosstalk family.
+    #[inline]
+    fn friendly(&self, a: u32, b: u32) -> bool {
+        if a == b {
+            return true;
+        }
+        let fa = self.family.get(a as usize).copied().unwrap_or(0);
+        fa != 0 && fa == self.family.get(b as usize).copied().unwrap_or(0)
     }
     #[inline]
     fn gap(&self, tag: u32, default: f64) -> f64 {
@@ -422,18 +436,22 @@ impl Grid {
             near3: vec![FREE; n],
             near5: vec![FREE; n],
             exempt: vec![false; n],
-            corridor: vec![false; n],
+            corridor: vec![0; n],
             tags: TagMaps::default(),
         }
     }
-    /// Claim into a side map with a pair mate treated as self.
+    /// Claim into a side map with the tag's crosstalk family treated as self.
     #[inline]
-    fn claim_mate(map: &mut [u32], i: usize, tag: u32, mate: u32) {
+    fn claim_fam(map: &mut [u32], i: usize, tag: u32, family: &[u32]) {
         let cur = map[i];
         if cur == FREE {
             map[i] = tag;
-        } else if cur != tag && cur != mate {
-            map[i] = BLOCK;
+        } else if cur != tag {
+            let fa = family.get(tag as usize).copied().unwrap_or(0);
+            let fb = family.get(cur as usize).copied().unwrap_or(0);
+            if fa == 0 || fa != fb {
+                map[i] = BLOCK;
+            }
         }
     }
     #[inline]
@@ -684,7 +702,37 @@ impl Router {
             gap_of: vec![self.config.clearance; max_tag],
             restricted: vec![false; max_tag],
             layer_allowed: self.config.signal_layers.iter().map(|l| self.config.pair_layers.is_empty() || self.config.pair_layers.contains(l)).collect(),
+            family: vec![0; max_tag],
         };
+        // Crosstalk families: each pair, merged with pairs that share a
+        // component with it (chained through an ESD array or series parts)
+        {
+            let refs_of = |n: usize| -> Vec<String> {
+                let mut v: Vec<String> = pads.iter().filter(|p| p.net == Some(n)).map(|p| p.reference.clone()).collect();
+                v.sort();
+                v.dedup();
+                v
+            };
+            let pair_nets: Vec<Option<(usize, usize)>> = self.config.pairs.iter().map(|pc| match (net_id(&pc.p), net_id(&pc.n)) { (Some(a), Some(b)) => Some((a, b)), _ => None }).collect();
+            let pair_refs: Vec<Vec<String>> = pair_nets.iter().map(|pn| pn.map(|(a, b)| { let mut r = refs_of(a); r.extend(refs_of(b)); r.sort(); r.dedup(); r }).unwrap_or_default()).collect();
+            let mut fam: Vec<usize> = (0..pair_nets.len()).collect();
+            fn root(f: &mut Vec<usize>, i: usize) -> usize { let mut i = i; while f[i] != i { f[i] = f[f[i]]; i = f[i]; } i }
+            for i in 0..pair_nets.len() {
+                for j in (i + 1)..pair_nets.len() {
+                    if pair_refs[i].iter().any(|r| pair_refs[j].contains(r)) {
+                        let (ri, rj) = (root(&mut fam, i), root(&mut fam, j));
+                        if ri != rj { fam[rj] = ri; }
+                    }
+                }
+            }
+            for (i, pn) in pair_nets.iter().enumerate() {
+                if let Some((a, b)) = pn {
+                    let fid = root(&mut fam, i) as u32 + 1;
+                    tags.family[a + 1] = fid;
+                    tags.family[b + 1] = fid;
+                }
+            }
+        }
         let mut pair_net_ids: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for pc in &self.config.pairs {
             if let (Some(a), Some(b)) = (net_id(&pc.p), net_id(&pc.n)) {
@@ -1445,7 +1493,7 @@ impl Router {
             for x in (at.x - r)..=(at.x + r) {
                 let c = Cell { x, y, layer: at.layer };
                 let o = grid.owner_at(c);
-                let (cp, cor) = grid.idx(x, y, at.layer).map(|i| (grid.copper_pad[i], grid.corridor[i])).unwrap_or((0, false));
+                let (cp, cor) = grid.idx(x, y, at.layer).map(|i| (grid.copper_pad[i], grid.corridor[i] != 0)).unwrap_or((0, false));
                 let lane = if x >= 0 && y >= 0 && (x as usize) < grid.w && (y as usize) < grid.h { grid.lane[y as usize * grid.w + x as usize] } else { 0 };
                 line.push(if x == at.x && y == at.y { '@' } else if o == BLOCK { '#' } else if cp != 0 && o == tag { 'O' } else if cp != 0 { 'X' } else if cor && o != tag { 'c' } else if o == FREE { if lane != 0 && lane != tag { 'l' } else { '.' } } else if o == tag { 'o' } else { 'x' });
             }
@@ -1542,7 +1590,7 @@ impl Router {
 
     /// Dilate trace copper into the near maps: the 3W and 5W radii an
     /// aggressor of default width must keep from a victim of width `w`.
-    fn stamp_near(&self, grid: &mut Grid, cells: &[Cell], w: f64, tag: u32, mate: u32) {
+    fn stamp_near(&self, grid: &mut Grid, cells: &[Cell], w: f64, tag: u32, _mate: u32) {
         let tw = self.config.trace_width;
         let r3 = (((w / 2.0 + 2.0 * tw + tw / 2.0) / self.config.grid).ceil() as i32 - 1).max(0);
         let r5 = (((w / 2.0 + 4.0 * tw + tw / 2.0) / self.config.grid).ceil() as i32 - 1).max(0);
@@ -1551,9 +1599,9 @@ impl Router {
                 for dx in -r5..=r5 {
                     if let Some(i) = grid.idx(c.x + dx, c.y + dy, c.layer) {
                         if dx.abs() <= r3 && dy.abs() <= r3 {
-                            Grid::claim_mate(&mut grid.near3, i, tag, mate);
+                            Grid::claim_fam(&mut grid.near3, i, tag, &grid.tags.family);
                         }
-                        Grid::claim_mate(&mut grid.near5, i, tag, mate);
+                        Grid::claim_fam(&mut grid.near5, i, tag, &grid.tags.family);
                     }
                 }
             }
@@ -1606,7 +1654,7 @@ impl Router {
                     for dx in -xr..=xr {
                         if let Some(i) = grid.idx(c.x + dx, c.y + dy, c.layer) {
                             if !grid.exempt[i] {
-                                Grid::claim_mate(&mut grid.xt, i, tag, mate);
+                                Grid::claim_fam(&mut grid.xt, i, tag, &grid.tags.family);
                             }
                         }
                     }
@@ -1967,7 +2015,7 @@ impl Router {
         tail: bool,
     ) -> Option<Vec<Cell>> {
         let tag = net as u32 + 1;
-        let mate = grid.tags.mate(tag);
+        let _mate = grid.tags.mate(tag);
         let gap = grid.tags.gap(tag, self.config.clearance);
         let (near_idx, _) = self.xt_radius(gap, width);
         let restricted = grid.tags.is_restricted(tag);
@@ -2034,13 +2082,13 @@ impl Router {
             match grid.idx(q.x, q.y, q.layer) {
                 Some(i) => {
                     let x = grid.xt[i];
-                    if x != FREE && x != tag && x != mate {
+                    if x != FREE && !grid.tags.friendly(tag, x) {
                         return false;
                     }
                     if !grid.exempt[i] {
                         if let Some(m) = near_idx {
                             let v = if m == 0 { grid.near3[i] } else { grid.near5[i] };
-                            if v != FREE && v != tag && v != mate {
+                            if v != FREE && !grid.tags.friendly(tag, v) {
                                 return false;
                             }
                         }
@@ -2057,7 +2105,8 @@ impl Router {
             }
             if tail {
                 if let Some(i) = grid.idx(c.x, c.y, c.layer) {
-                    if grid.corridor[i] {
+                    let cp = grid.corridor[i];
+                    if cp != 0 && !grid.tags.friendly(tag, cp) {
                         return false;
                     }
                 }
