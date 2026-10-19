@@ -204,7 +204,39 @@ pub fn build(
             .map(|(x0, y0, x1, y1)| (x1 - x0, y1 - y0))
             .unwrap_or((100.0, 80.0));
         let placer = crate::placer::Placer::new(w, h);
-        let intent = crate::placer::PlacementIntent::default();
+        // PHYSICS-DRIVEN PLACEMENT INTENT: design parameters place the
+        // components — thermal dissipation demands separation between hot
+        // parts (apart ≥15mm for every pair ≥0.5W), and per the directive
+        // the board grows for impedance corridors (handled in the area
+        // budget). The LLM still never emits coordinates.
+        let mut intent = crate::placer::PlacementIntent::default();
+        {
+            let hot: Vec<&crate::orchestrator::PlannedComponent> = plan
+                .components
+                .iter()
+                .filter(|c| {
+                    let p = c
+                        .power_w
+                        .unwrap_or_else(|| crate::thermal::power_from_value(&c.value));
+                    p >= 0.5
+                })
+                .collect();
+            for i in 0..hot.len() {
+                for j in (i + 1)..hot.len() {
+                    intent.apart.push(crate::placer::ApartIntent {
+                        a: hot[i].reference.clone(),
+                        b: hot[j].reference.clone(),
+                        min_mm: 15.0,
+                    });
+                }
+            }
+            if !intent.apart.is_empty() {
+                println!(
+                    "  thermal placement: {} hot pair(s) ≥15mm apart",
+                    intent.apart.len()
+                );
+            }
+        }
         let solved = placer.arrange(&board, &nl, &intent);
         for s in &solved {
             if let Some(fp) = board.footprints.iter_mut().find(|f| f.reference == s.reference) {

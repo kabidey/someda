@@ -1,0 +1,27 @@
+ERC report (2026-10-19T12:29:37, Encoding UTF8)
+Report includes: Errors, Warnings
+
+***** Sheet /
+[pin_not_connected]: Pin not connected
+    ; error
+    @(94.92 mm, 100.00 mm): Symbol U9 Pin 3 [C, Passive, Line]
+[pin_not_connected]: Pin not connected
+    ; error
+    @(100.00 mm, 94.92 mm): Symbol U9 Pin 2 [B, Passive, Line]
+[pin_not_connected]: Pin not connected
+    ; error
+    @(100.00 mm, 105.08 mm): Symbol U9 Pin 1 [A, Passive, Line]
+[endpoint_off_grid]: Symbol pin or wire end off connection grid
+    ; warning
+    @(100.00 mm, 94.92 mm): Symbol U9 Pin 2 [B, Passive, Line]
+[lib_symbol_issues]: The current configuration does not include the symbol library 'Probe'
+    ; warning
+    @(100.00 mm, 100.00 mm): Symbol U9 [SYM]
+
+ ** ERC messages: 5  Errors 3  Warnings 2
+
+ ** Ignored checks:
+    - Global label only appears once in the schematic
+    - Four connection points are joined together
+    - SPICE model issue
+    - Assigned footprint doesn't match footprint filters

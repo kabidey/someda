@@ -128,11 +128,12 @@ impl Schematic {
 
     /// Absolute position of a pin on a placed instance.
     pub fn pin_absolute(&self, inst: &Instance, pin: &LibPin) -> (f64, f64) {
-        // KiCad renders lib-symbol pins with an inverted Y: a pin stored at
-        // (px, py) in the sub-symbol appears at instance origin + (px, −py)
-        // (live-verified: wires targeting the rendered position connected in
-        // KiCad while our unmirrored ERC saw every pin floating).
-        let r = inst.rot_deg.to_radians();
+        // AUTHORITATIVE (KiCad 10.0.6 live probes at instance rot 0 and 90,
+        // pins at all four directions): a lib pin stored at (px, py) renders
+        // at origin + R(−rot)·(px, −py) — mirror the lib Y, then rotate by
+        // MINUS the instance rotation (KiCad's schematic rotation is CW).
+        // The pin's own angle is its drawn direction, never a position term.
+        let r = (-inst.rot_deg).to_radians();
         let mx = pin.x;
         let my = -pin.y;
         let ox = mx * r.cos() - my * r.sin();
@@ -337,9 +338,10 @@ mod tests {
         )"#;
         let s = Schematic::from_kicad_sch(input).unwrap();
         let pins = s.instance_pins(&s.instances[0]);
-        // pin at rel (5.08, 0) rotated 90° → (0, 5.08) → abs (100, 55.08)
+        // Live-probed (KiCad 10.0.6): pin (5.08,0) under instance rot 90
+        // renders at origin + R(-90)·(5.08, 0) = (0, -5.08) → (100, 44.92)
         assert!((pins[0].2 - 100.0).abs() < 1e-9);
-        assert!((pins[0].3 - 55.08).abs() < 1e-9);
+        assert!((pins[0].3 - 44.92).abs() < 1e-9);
     }
 
     #[test]
@@ -419,6 +421,22 @@ fn points_match(a: (f64, f64), b: (f64, f64)) -> bool {
     (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01
 }
 
+/// True if point (px,py) lies on the segment (x1,y1)-(x2,y2) within
+/// the connection tolerance.
+fn point_on_segment(px: f64, py: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> bool {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len2 = dx * dx + dy * dy;
+    if len2 < 1e-12 {
+        return points_match((px, py), (x1, y1));
+    }
+    // Parameter of the closest point, clamped to the segment
+    let t = (((px - x1) * dx + (py - y1) * dy) / len2).clamp(0.0, 1.0);
+    let cx = x1 + t * dx;
+    let cy = y1 + t * dy;
+    points_match((px, py), (cx, cy))
+}
+
 /// Re-derive connectivity from geometry: pins, wires, labels, power symbols, no-connects.
 pub fn derive_nets(sch: &Schematic) -> Vec<Net> {
     // Collect all points: pin positions, wire endpoints, label positions, no-connect positions
@@ -473,9 +491,30 @@ pub fn derive_nets(sch: &Schematic) -> Vec<Net> {
             }
         }
     }
-    // Wire endpoint to wire endpoint coincidence (also handles T-junctions at same coords)
-    // Note: midpoint-on-wire connections require full geometry; v0 uses endpoint coincidence
-    // (matches the common case: pins connect at wire endpoints).
+    // POINT-ON-SEGMENT connections: a pin, label, or no-connect touching a
+    // wire ANYWHERE along its length joins that wire's net (live-verified:
+    // labels placed at wire midpoints produced unnamed nets — the v0
+    // endpoint-only coincidence silently dropped them).
+    {
+        // KiCad file semantics (live-verified against kicad-cli's netlist
+        // on our generated files): a pin connects to a wire only at the
+        // wire's ENDPOINTS; a wire passing through a pin position does
+        // NOT connect. LABELS attach anywhere along a wire. Restrict the
+        // segment test to labels (and no-connect markers) accordingly.
+        for idx in 0..n {
+            if points[idx].label.is_none() && !points[idx].no_connect {
+                continue; // pins and wire ends join only by coincidence
+            }
+            let (px, py) = points[idx].pos;
+            for (i1, _i2) in &wire_point_indices {
+                let (x1, y1) = points[*i1].pos;
+                let (x2, y2) = points[*_i2].pos;
+                if point_on_segment(px, py, x1, y1, x2, y2) {
+                    ds.union(idx, *i1);
+                }
+            }
+        }
+    }
 
     // Collect nets by root
     let mut net_map: HashMap<usize, Net> = HashMap::new();
@@ -555,7 +594,70 @@ pub fn run_erc(sch: &Schematic) -> ErcReport {
         }
     }
 
-    // 3. Missing power flag: power symbols present but a net named like power has no driver.
+    // 3. DECOUPLING BEST PRACTICE (skill 102: "decoupling within 2mm of each
+    //    power pin"): every IC (multi-pin part) power pin's net should carry
+    //    at least one capacitor. The schematic-level check: the net contains
+    //    a member whose lib_id/value says capacitor.
+    for net in &nets {
+        let is_power_net = net
+            .name
+            .as_ref()
+            .map(|n| {
+                let u = n.to_uppercase();
+                u == "VCC" || u == "GND" || u.starts_with("+3V") || u.starts_with("+5V")
+                    || u.starts_with("VDD") || u.starts_with("VSS")
+            })
+            .unwrap_or(false);
+        if !is_power_net {
+            continue;
+        }
+        // Does this net have an IC member (multi-pin: heuristic — the same
+        // reference appears with different pin numbers across nets)?
+        let mut ref_pin_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for n2 in &nets {
+            for (r, _, _) in &n2.pins {
+                *ref_pin_counts.entry(r.as_str()).or_insert(0) += 1;
+            }
+        }
+        let has_ic = net
+            .pins
+            .iter()
+            .any(|(r, _, _)| *ref_pin_counts.get(r.as_str()).unwrap_or(&0) >= 3);
+        if !has_ic {
+            continue;
+        }
+        let has_cap = net.pins.iter().any(|(r, _, _)| {
+            sch.instances.iter().any(|inst| {
+                if inst.reference != *r {
+                    return false;
+                }
+                // The lib suffix after ':' names the part type:
+                // "Device:C", "Device:C_Polarized", "Device:CP" are caps;
+                // "Device:R" is not ("Device" itself contains a 'C' —
+                // the substring heuristic was a false-positive source).
+                let suffix = inst
+                    .lib_id
+                    .rsplit(':')
+                    .next()
+                    .unwrap_or("")
+                    .to_uppercase();
+                let base = suffix.split('_').next().unwrap_or("").to_string();
+                base == "C" || base == "CP" || base == "C_POLARIZED" || base.contains("CAP")
+            })
+        });
+        if !has_cap {
+            findings.push(ErcFinding {
+                code: "missing-decoupling".into(),
+                message: format!(
+                    "Power net '{}' carries an IC pin but no decoupling capacitor — add 100nF within 2mm of each IC power pin (skill 102).",
+                    net.name.as_deref().unwrap_or("<unnamed>")
+                ),
+            });
+        }
+    }
+
+    // 3b. Missing power flag: power symbols present but a net named like power has no driver.
     //    v0: check that any net containing a power_in/power_out pin has a power symbol connection.
     for net in &nets {
         let name = net.name.as_deref().unwrap_or("");
@@ -589,6 +691,50 @@ mod erc_tests {
     use super::*;
 
     #[test]
+    fn erc_flags_missing_decoupling() {
+        // A power net with an IC but no capacitor must flag (skill 102).
+        // IC with three rot-0/180 pins only (the validated mirror case).
+        let sch = Schematic::from_kicad_sch(r##"(kicad_sch
+          (lib_symbols
+            (symbol "Timer:IC3"
+              (symbol "IC3_0_1"
+                (pin passive line (at -5.08 0 0) (length 3.81) (name "~") (number "1"))
+                (pin passive line (at 5.08 0 180) (length 3.81) (name "~") (number "2"))
+                (pin passive line (at -10.16 0 0) (length 3.81) (name "~") (number "3"))
+              )
+            )
+            (symbol "Device:R"
+              (symbol "R_0_1"
+                (pin passive line (at -5.08 0 0) (length 3.81) (name "~") (number "1"))
+                (pin passive line (at 5.08 0 180) (length 3.81) (name "~") (number "2"))
+              )
+            )
+          )
+          (symbol (lib_id "Timer:IC3") (at 50 50 0)
+            (property "Reference" "U1" (at 0 0 0))
+          )
+          (symbol (lib_id "Device:R") (at 90 50 0)
+            (property "Reference" "R1" (at 0 0 0))
+          )
+          (wire (pts (xy 44.92 50) (xy 44.92 40)))
+          (wire (pts (xy 84.92 50) (xy 84.92 40)))
+          (wire (pts (xy 44.92 40) (xy 84.92 40)))
+          (wire (pts (xy 55.08 50) (xy 55.08 70)))
+          (wire (pts (xy 95.08 50) (xy 95.08 70)))
+          (wire (pts (xy 55.08 70) (xy 95.08 70)))
+          (wire (pts (xy 39.84 50) (xy 39.84 30)))
+          (label "VCC" (at 60 40 0))
+          (label "GND" (at 75 70 0))
+          (label "OUT" (at 39.84 32 0))
+        )"##).unwrap();
+        let report = run_erc(&sch);
+        assert!(
+            report.findings.iter().any(|f| f.code == "missing-decoupling"),
+            "VCC carries U1 but no cap - must flag. got: {:?}",
+            report.findings.iter().map(|f| f.code.clone()).collect::<Vec<_>>()
+        );
+    }
+
     fn floating_pin_detected() {
         // R1 with pin 1 wired but pin 2 floating
         let sch = Schematic::from_kicad_sch(r##"(kicad_sch
