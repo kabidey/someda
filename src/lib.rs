@@ -6,6 +6,7 @@
 
 pub mod sexp;
 pub mod board;
+pub mod footprint_lib;
 pub mod drc;
 pub mod netclass;
 pub mod geometry;
@@ -23,6 +24,7 @@ pub mod boardplan;
 pub mod bringup;
 pub mod formulas;
 pub mod materials;
+pub mod rules;
 pub mod netfreq;
 pub mod si;
 pub mod thermal;

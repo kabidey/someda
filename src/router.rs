@@ -246,7 +246,7 @@ impl Router {
                     let gx = (pad.x / self.config.grid).round() as i32;
                     let gy = (pad.y / self.config.grid).round() as i32;
                     pad_cells.insert((gx, gy, true), net_id);
-                    let half = pad.width.max(pad.height) / 2.0;
+                    let half = pad.radius();
                     pads.push((pad.x, pad.y, half, net_id));
                 }
             }
@@ -259,7 +259,7 @@ impl Router {
                     let gy = (pad.y / self.config.grid).round() as i32;
                     // Halo = pad radius + clearance, FRONT layer only
                     // (SMD pads are F.Cu; B.Cu routing passes beneath)
-                    let r = ((pad.width.max(pad.height) / 2.0 + self.config.clearance)
+                    let r = ((pad.radius() + self.config.clearance)
                         / self.config.grid)
                         .ceil() as i32;
                     for dx in -r..=r {

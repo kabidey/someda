@@ -177,6 +177,8 @@ impl FabLimits {
 /// finished thickness minus copper and mask.
 #[derive(Debug, Clone)]
 pub struct Stackup {
+    /// JLCPCB stackup name this preset models.
+    pub name: &'static str,
     pub layers: u32,
     pub finished_thickness_mm: f64,
     /// Dielectric height under F.Cu microstrip (mm).
@@ -187,9 +189,46 @@ pub struct Stackup {
     pub mask_thickness_mm: f64,
 }
 
+impl Stackup {
+    /// The JLCPCB preset for a copper layer count: 2 (1.6mm FR-4),
+    /// 4 (JLC04161H-7628) or 6 (JLC06161H-3313). Other counts fall back to
+    /// the 6-layer outer-prepreg physics.
+    ///
+    /// Outer-layer microstrip height is the prepreg between F.Cu and the
+    /// first inner plane: 7628 ≈ 0.21mm (Er 4.4) on the 4-layer stackup,
+    /// 3313 ≈ 0.10mm (Er 4.1) on the 6-layer stackup — JLCPCB's published
+    /// impedance-calculator defaults (fetched 2026-10-19).
+    pub fn for_layers(layers: u32) -> Stackup {
+        match layers {
+            0..=2 => Stackup::default(),
+            3 | 4 => Stackup {
+                name: "JLC04161H-7628",
+                layers: 4,
+                finished_thickness_mm: 1.6,
+                h_mm: 0.2104,
+                er: ER_PREPREG_7628,
+                copper_thickness_mm: 0.035,
+                mask_er: ER_SOLDERMASK,
+                mask_thickness_mm: 0.0254,
+            },
+            _ => Stackup {
+                name: "JLC06161H-3313",
+                layers,
+                finished_thickness_mm: 1.6,
+                h_mm: 0.0994,
+                er: ER_PREPREG_3313,
+                copper_thickness_mm: 0.035,
+                mask_er: ER_SOLDERMASK,
+                mask_thickness_mm: 0.0254,
+            },
+        }
+    }
+}
+
 impl Default for Stackup {
     fn default() -> Self {
         Stackup {
+            name: "JLCPCB 2-layer 1.6mm FR-4",
             layers: 2,
             finished_thickness_mm: 1.6,
             // 2-layer microstrip physics: the F.Cu trace's field
@@ -262,6 +301,20 @@ mod tests {
         assert!(!f.check_via(0.15, 0.20, 1.6).is_empty(), "0.025 ring must fail");
         // and their recommended pad (hole + 0.15) passes:
         assert!(f.check_via(0.15, 0.30, 1.6).is_empty(), "recommended pad passes");
+    }
+
+    #[test]
+    fn stackup_presets_per_layer_count() {
+        assert_eq!(Stackup::for_layers(2).layers, 2);
+        let s4 = Stackup::for_layers(4);
+        assert_eq!(s4.name, "JLC04161H-7628");
+        assert!((s4.h_mm - 0.2104).abs() < 1e-9 && (s4.er - 4.4).abs() < 1e-9);
+        let s6 = Stackup::for_layers(6);
+        assert_eq!(s6.name, "JLC06161H-3313");
+        assert!((s6.h_mm - 0.0994).abs() < 1e-9 && (s6.er - 4.1).abs() < 1e-9);
+        // 50Ω on the 6-layer outer prepreg solves to a routable ~0.15mm trace
+        let w = crate::formulas::microstrip_width_for_z0(50.0, s6.er, s6.h_mm, s6.copper_thickness_mm);
+        assert!(w > 0.10 && w < 0.25, "6-layer 50Ω width {:.3}mm", w);
     }
 
     #[test]

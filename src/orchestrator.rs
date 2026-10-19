@@ -18,6 +18,32 @@ pub struct CircuitPlan {
     pub description: String,
     pub components: Vec<PlannedComponent>,
     pub nets: Vec<PlannedNet>,
+    /// Copper layer count: 2 (default), 4 or 6. Even, 2..=12.
+    #[serde(default)]
+    pub layers: Option<u32>,
+    /// Optional fixed board size (mm). Absent: the engine budgets area
+    /// from the real footprint courtyards.
+    #[serde(default)]
+    pub board: Option<BoardSpec>,
+    /// Copper planes on inner layers: which net fills which layer.
+    /// Absent on a 4/6-layer board: GND on In1.Cu (and In4.Cu on 6 layers),
+    /// the main power net on the layer before the last inner GND.
+    #[serde(default)]
+    pub planes: Option<Vec<PlaneSpec>>,
+}
+
+/// A fixed board outline request (mm).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardSpec {
+    pub width_mm: f64,
+    pub height_mm: f64,
+}
+
+/// A copper plane: `net` fills copper layer `layer` (e.g. "In1.Cu").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaneSpec {
+    pub net: String,
+    pub layer: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +63,17 @@ pub struct PlannedComponent {
     /// Power dissipation (W). Optional: parsed from value if absent.
     #[serde(default)]
     pub power_w: Option<f64>,
+    /// Semantic placement hint (never a coordinate): top_left, top,
+    /// top_right, left, center, right, bottom_left, bottom, bottom_right,
+    /// or an edge: left_edge, right_edge, top_edge, bottom_edge.
+    #[serde(default)]
+    pub position: Option<String>,
+    /// Rotation in degrees (0/90/180/270), e.g. to face a connector outward.
+    #[serde(default)]
+    pub rotation: Option<f64>,
+    /// Keep this part next to another reference (decoupling caps hug their IC).
+    #[serde(default)]
+    pub near: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,7 +207,32 @@ pub fn build(
         .map_err(|e| OrchestrateError::Io(e.to_string()))?;
 
     let sch_content = generate_schematic(&plan);
-    let mut board = generate_board_model(&plan);
+    let (mut board, fp_report) = generate_board_model_with_report(&plan);
+    {
+        let real = fp_report.iter().filter(|r| r.real).count();
+        let synthetic: Vec<String> = fp_report
+            .iter()
+            .filter(|r| !r.real)
+            .map(|r| format!("{} ({})", r.reference, r.lib_id))
+            .collect();
+        for r in &fp_report {
+            println!("  footprint {:>5} {:<55} {}", r.reference, r.lib_id, if r.real { r.note.clone() } else { format!("SYNTHETIC — {}", r.note) });
+        }
+        stages.push(StageResult {
+            stage: "footprints".into(),
+            success: synthetic.is_empty(),
+            detail: if synthetic.is_empty() {
+                format!("{} real KiCad library footprints, {} copper layers", real, board.layer_count)
+            } else {
+                format!(
+                    "{} real, {} SYNTHETIC (not orderable geometry): {}",
+                    real,
+                    synthetic.len(),
+                    synthetic.join(", ")
+                )
+            },
+        });
+    }
 
     let sch_path = project_dir.join("circuit.kicad_sch");
     let pcb_path = project_dir.join("circuit.kicad_pcb");
@@ -468,6 +530,19 @@ pub fn build(
     let pcb_content = board.to_kicad_pcb();
     fs::write(&pcb_path, &pcb_content)
         .map_err(|e| OrchestrateError::Io(e.to_string()))?;
+    // The KiCad project file carries the design rules kicad-cli judges by
+    // (its 0.2mm defaults would fail every fine-pitch net otherwise).
+    {
+        let rules = crate::rules::DesignRules::for_layers(board.layer_count);
+        let classes: Vec<(String, f64, f64)> = vec![(
+            "power".into(),
+            rules.power_trace_width_mm,
+            rules.clearance_mm,
+        )];
+        let pro_path = project_dir.join("circuit.kicad_pro");
+        fs::write(&pro_path, rules.kicad_project_json("circuit.kicad_pro", &classes))
+            .map_err(|e| OrchestrateError::Io(e.to_string()))?;
+    }
 
     stages.push(StageResult {
         stage: "generate".into(),
@@ -485,23 +560,40 @@ pub fn build(
             detail: format!("{}", erc),
         });
 
-        println!("─── Stage 4: kicad-cli DRC ───");
+        println!("─── Stage 4: kicad-cli DRC (zones refilled, report parsed) ───");
         let drc = cli.pcb_drc("circuit.kicad_pcb");
+        println!("  {}", drc.stdout.trim());
         stages.push(StageResult {
             stage: "kicad-drc".into(),
             success: drc.success,
-            detail: format!("{}", drc),
+            detail: if drc.stdout.trim().is_empty() { format!("{}", drc) } else { drc.stdout.trim().to_string() },
         });
 
         println!("─── Stage 5: kicad-cli exports ───");
         let out_dir = project_dir.join("fab");
         let _ = fs::create_dir_all(&out_dir);
 
-        let gerbers = cli.export_gerbers("circuit.kicad_pcb", "fab");
+        let gerbers = cli.export_gerbers("circuit.kicad_pcb", "fab", board.layer_count);
+        let gerber_files = fs::read_dir(&out_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| {
+                        let n = e.file_name().to_string_lossy().to_lowercase();
+                        n.ends_with(".gtl") || n.ends_with(".gbl") || n.starts_with("circuit-in")
+                            || n.ends_with(".gts") || n.ends_with(".gbs") || n.ends_with(".gtp")
+                            || n.ends_with(".gbp") || n.ends_with(".gto") || n.ends_with(".gbo")
+                            || n.ends_with(".gm1")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
         stages.push(StageResult {
             stage: "export-gerbers".into(),
-            success: gerbers.success,
-            detail: format!("{}", gerbers),
+            success: gerbers.success && gerber_files >= (board.layer_count as usize + 7),
+            detail: format!(
+                "{} ({} Gerber layers written: {} copper + mask/paste/silk/outline)",
+                gerbers, gerber_files, board.layer_count
+            ),
         });
 
         let drill = cli.export_drill("circuit.kicad_pcb", "fab");
@@ -523,6 +615,16 @@ pub fn build(
             stage: "export-bom".into(),
             success: bom.success,
             detail: format!("{}", bom),
+        });
+
+        // Renders for humans: top and bottom 3D views
+        let _ = fs::create_dir_all(project_dir.join("render"));
+        let top = cli.render_png("circuit.kicad_pcb", "render/board-top.png", "top");
+        let bottom = cli.render_png("circuit.kicad_pcb", "render/board-bottom.png", "bottom");
+        stages.push(StageResult {
+            stage: "render".into(),
+            success: top.success && bottom.success,
+            detail: format!("render/board-top.png render/board-bottom.png {}", top),
         });
     } else {
         stages.push(StageResult {
@@ -599,13 +701,27 @@ pub fn build(
     // ─── Stage 7: the 6-gate export preflight (skill 103) ───
     // DRC ✓ + shorts ✓ + unrouted ✓ + pours + Gerbers + drill — the honest
     // done-gate: only all-six-pass means orderable.
-    let pours_filled = true; // no zones yet: nothing unfilled (M3 pours land in M4)
-    let gerber_ok = cli.is_available(); // exports ran above when kicad-cli exists
-    let drill_ok = cli.is_available();
+    // KiCad's DRC is the stricter authority when it ran: its error count
+    // (clearance, shorts, hole spacing, mask bridges...) and its unconnected
+    // count both feed the gate. someda's own DRC covers the no-kicad case.
+    let kicad_drc = if cli.is_available() { cli.last_drc_summary("circuit.kicad_pcb") } else { None };
+    let drc_errors_total = drc_report.errors()
+        .saturating_sub(drc_report.findings.iter().filter(|f| f.code == "segment-check-truncated").count())
+        + kicad_drc.as_ref().map(|k| k.errors.saturating_sub(k.unconnected)).unwrap_or(0);
+    let shorts = kicad_drc
+        .as_ref()
+        .map(|k| k.by_code.iter().filter(|(c, _)| c == "shorting_items").map(|(_, n)| *n).sum())
+        .unwrap_or(0);
+    let unconnected_total = unrouted_count + kicad_drc.as_ref().map(|k| k.unconnected).unwrap_or(0);
+    // Pours: every declared zone must exist in the written board; KiCad's
+    // unconnected count already covers plane pads a fanout missed.
+    let pours_filled = board.zones.is_empty() || kicad_drc.as_ref().map(|k| k.unconnected == 0).unwrap_or(true);
+    let gerber_ok = stages.iter().any(|s| s.stage == "export-gerbers" && s.success);
+    let drill_ok = stages.iter().any(|s| s.stage == "export-drill" && s.success);
     let preflight_gates = crate::formulas::export_preflight(
-        drc_report.errors(),
-        0, // shorts surface as DRC errors in the current engine
-        unrouted_count,
+        drc_errors_total,
+        shorts,
+        unconnected_total,
         gerber_ok,
         pours_filled,
         drill_ok,
@@ -932,51 +1048,126 @@ fn parse_pin(pin_ref: &str, plan: &CircuitPlan) -> Option<(f64, f64)> {
     }
 }
 
-/// Generate a .kicad_pcb from the plan (deterministic).
+/// How one component's footprint was obtained.
+#[derive(Debug, Clone)]
+pub struct FootprintResolution {
+    pub reference: String,
+    pub lib_id: String,
+    /// true = stock KiCad library geometry; false = synthetic fallback
+    pub real: bool,
+    pub note: String,
+}
+
 /// Generate a Board MODEL from the plan (the routing substrate).
 /// Copper is added later by the router; this creates outline, nets,
 /// footprints with pads, and assigns pad nets from the plan.
 pub fn generate_board_model(plan: &CircuitPlan) -> crate::board::Board {
-    let mut board = crate::board::Board::default();
+    generate_board_model_with_report(plan).0
+}
 
-    // Board outline from the area budget (skill 102) + PHYSICS HEADROOM:
-    // impedance-controlled nets route at solved widths (50Ω on 1.6mm FR-4
-    // is ~1.44mm wide) — each RF/clock corridor claims its width × span so
-    // the board is big enough for wide traces to coexist (live-verified:
-    // two RF nets at 1.44mm + 3.3-cell halos could not fit the 35%-density
-    // board; the router honestly reported 5 unrouted).
-    let courtyard_mm2: f64 = plan.components.len() as f64 * 60.0; // ~60mm²/part
-    let mut area = (courtyard_mm2 / 0.35).max(4000.0); // hobby density 35%
-    // RF/headroom: for every net that needs impedance control, add a
-    // corridor of (solved width + clearance) × estimated span
-    {
-        let stackup = crate::materials::Stackup::default();
-        for net in &plan.nets {
-            let mut member_values: Vec<&str> = Vec::new();
-            for pin in &net.pins {
-                if let Some((refdes, _)) = pin.split_once(':') {
-                    if let Some(c) = plan.components.iter().find(|c| c.reference == refdes) {
-                        member_values.push(&c.value);
-                        member_values.push(&c.lib_id);
-                    }
-                }
+/// Like [`generate_board_model`], also reporting per-component whether the
+/// footprint came from a real KiCad library or the synthetic fallback.
+pub fn generate_board_model_with_report(
+    plan: &CircuitPlan,
+) -> (crate::board::Board, Vec<FootprintResolution>) {
+    let mut board = crate::board::Board::default();
+    board.layer_count = plan.layers.unwrap_or(2).max(2);
+    let mut report = Vec::new();
+
+    // Nets
+    for (i, net) in plan.nets.iter().enumerate() {
+        board.nets.push((i + 1, net.name.clone()));
+    }
+    let net_for = |reference: &str, pin: &str| -> Option<(usize, String)> {
+        let key = format!("{}:{}", reference, pin);
+        plan.nets
+            .iter()
+            .enumerate()
+            .find(|(_, net)| net.pins.iter().any(|p| p == &key))
+            .map(|(i, net)| (i + 1, net.name.clone()))
+    };
+
+    // Footprints: real library geometry when the plan names a resolvable
+    // "Lib:Name"; otherwise the synthetic fallback (reported honestly).
+    let mut courtyard_area = 0.0;
+    for comp in &plan.components {
+        let rotation = comp.rotation.unwrap_or(0.0);
+        let lib_id = comp.footprint.clone().unwrap_or_else(|| "someda:DEFAULT".into());
+        let loaded = if comp.footprint.is_some() {
+            crate::footprint_lib::load(&lib_id)
+        } else {
+            Err("no footprint given".into())
+        };
+        match loaded {
+            Ok(lib) => {
+                let fp = lib.instantiate(
+                    &comp.reference,
+                    &comp.value,
+                    &lib_id,
+                    0.0,
+                    0.0,
+                    rotation,
+                    &|pin: &str| net_for(&comp.reference, pin),
+                );
+                let (w, h) = lib.size();
+                courtyard_area += w * h;
+                report.push(FootprintResolution {
+                    reference: comp.reference.clone(),
+                    lib_id: lib_id.clone(),
+                    real: true,
+                    note: format!("{} pads, courtyard {:.1}x{:.1}mm", lib.pads.len(), w, h),
+                });
+                board.footprints.push(fp);
             }
-            let sig = crate::netfreq::net_signal(
-                &net.name, &member_values, net.freq_hz, net.role.as_deref(),
-            );
-            if let Some(z0) = sig.z_target {
-                if sig.needs_impedance_control() {
-                    let w = crate::formulas::microstrip_width_for_z0(
-                        z0, stackup.er, stackup.h_mm, stackup.copper_thickness_mm,
-                    );
-                    // corridor: width+clearance both sides, 60mm typical span
-                    area += (w + 0.4) * 60.0;
-                }
+            Err(why) => {
+                let fp = synthetic_footprint(plan, comp, &lib_id, rotation, &net_for);
+                courtyard_area += 60.0;
+                report.push(FootprintResolution {
+                    reference: comp.reference.clone(),
+                    lib_id: lib_id.clone(),
+                    real: false,
+                    note: format!("synthetic pads ({})", why),
+                });
+                board.footprints.push(fp);
             }
         }
     }
-    let w = (area / 0.8).sqrt(); // aspect 0.8
-    let h = area / w;
+
+    // Board outline: fixed size from the plan, or an area budget from the
+    // real courtyards (skill 102) plus physics headroom for impedance
+    // corridors (wide controlled-Z traces need room to coexist).
+    let (w, h) = match &plan.board {
+        Some(b) => (b.width_mm, b.height_mm),
+        None => {
+            let density = if board.layer_count >= 4 { 0.45 } else { 0.35 };
+            let mut area = (courtyard_area / density).max(1500.0);
+            let stackup = crate::materials::Stackup::for_layers(board.layer_count);
+            for net in &plan.nets {
+                let mut member_values: Vec<&str> = Vec::new();
+                for pin in &net.pins {
+                    if let Some((refdes, _)) = pin.split_once(':') {
+                        if let Some(c) = plan.components.iter().find(|c| c.reference == refdes) {
+                            member_values.push(&c.value);
+                            member_values.push(&c.lib_id);
+                        }
+                    }
+                }
+                let sig = crate::netfreq::net_signal(
+                    &net.name, &member_values, net.freq_hz, net.role.as_deref(),
+                );
+                if let Some(z0) = sig.z_target {
+                    if sig.needs_impedance_control() {
+                        let wz = crate::formulas::microstrip_width_for_z0(
+                            z0, stackup.er, stackup.h_mm, stackup.copper_thickness_mm,
+                        );
+                        area += (wz + 0.4) * 60.0;
+                    }
+                }
+            }
+            let w = (area / 0.8).sqrt();
+            (w, area / w)
+        }
+    };
     let (min_x, min_y, max_x, max_y) = (0.0, 0.0, w, h);
     board.outline = vec![
         ((min_x, min_y), (max_x, min_y)),
@@ -985,95 +1176,68 @@ pub fn generate_board_model(plan: &CircuitPlan) -> crate::board::Board {
         ((min_x, max_y), (min_x, min_y)),
     ];
 
-    // Nets
-    for (i, net) in plan.nets.iter().enumerate() {
-        board.nets.push((i + 1, net.name.clone()));
-    }
+    (board, report)
+}
 
-    // Footprints with 2-pin pads; pad nets from the plan
-    for comp in &plan.components {
-        let mut fp = crate::board::Footprint {
-            reference: comp.reference.clone(),
-            lib_name: comp.footprint.clone().unwrap_or_else(|| "someda:DEFAULT".into()),
-            x: 0.0,
-            y: 0.0,
-            rotation: 0.0,
-            pads: Vec::new(),
-        };
-        // ONE PAD PER PLAN-REFERENCED PIN — never a fixed 2-pad model.
-        // (Live-validated: the v0 board dropped U1:3/U1:8 silently because
-        // only pads "1"/"2" existed. Every plan pin must land on copper.)
-        // Collect every pin this component needs, in plan order, deduped:
-        let mut pin_nums: Vec<String> = Vec::new();
-        for (net_index, net) in plan.nets.iter().enumerate() {
-            for pin in &net.pins {
-                if let Some((refdes, num)) = pin.split_once(':') {
-                    if refdes == comp.reference && !pin_nums.iter().any(|p| p == num) {
-                        pin_nums.push(num.to_string());
-                    }
+/// The synthetic fallback footprint: 2 pins → 2.5mm inline; more pins →
+/// a two-column 1.27mm grid. Used only when no library footprint resolves,
+/// and always reported as synthetic.
+fn synthetic_footprint(
+    plan: &CircuitPlan,
+    comp: &PlannedComponent,
+    lib_id: &str,
+    rotation: f64,
+    net_for: &dyn Fn(&str, &str) -> Option<(usize, String)>,
+) -> crate::board::Footprint {
+    let mut fp = crate::board::Footprint {
+        reference: comp.reference.clone(),
+        lib_name: lib_id.to_string(),
+        value: comp.value.clone(),
+        x: 0.0,
+        y: 0.0,
+        rotation,
+        pads: Vec::new(),
+        courtyard: None,
+        source: None,
+    };
+    // ONE PAD PER PLAN-REFERENCED PIN — never a fixed 2-pad model.
+    let mut pin_nums: Vec<String> = Vec::new();
+    for net in &plan.nets {
+        for pin in &net.pins {
+            if let Some((refdes, num)) = pin.split_once(':') {
+                if refdes == comp.reference && !pin_nums.iter().any(|p| p == num) {
+                    pin_nums.push(num.to_string());
                 }
             }
         }
-        // Components referenced by no net still get pins 1+2 (power parts
-        // referenced by value later; honest default).
-        if pin_nums.is_empty() {
-            pin_nums.push("1".into());
-            pin_nums.push("2".into());
-        }
-        // Pad geometry: 2 pins → 2.5mm pitch inline; >2 pins → DIP grid
-        // (two columns, 1.27mm pitch — DIP-8 class), deterministic order.
-        let n = pin_nums.len();
-        for (i, pin_num) in pin_nums.iter().enumerate() {
-            let (dx, dy) = if n <= 2 {
-                let step = 1.25;
-                if n == 1 { (0.0, 0.0) }
-                else if i == 0 { (-step, 0.0) } else { (step, 0.0) }
-            } else {
-                // DIP: left column top-to-bottom, then right column bottom-to-top
-                let half = (n + 1) / 2;
-                let pitch = 1.27;
-                let col_gap = 7.62 / 2.0; // DIP column spacing
-                if i < half {
-                    (-col_gap, (i as f64 - (half as f64 - 1.0) / 2.0) * pitch)
-                } else {
-                    let k = n - 1 - i; // mirror for right column
-                    (col_gap, (k as f64 - (half as f64 - 1.0) / 2.0) * pitch)
-                }
-            };
-            let pad_net = plan
-                .nets
-                .iter()
-                .enumerate()
-                .find(|(_, net)| {
-                    net.pins
-                        .iter()
-                        .any(|p| p == &format!("{}:{}", comp.reference, pin_num))
-                })
-                .map(|(i, net)| (i + 1, net.name.clone()));
-        // Pad size by pitch: DIP pitch 1.27mm → pads 1.0mm (a 1.5mm pad
-        // overlaps its neighbor — live-verified by KiCad DRC as a short).
-        // Inline 2-pin parts keep the 1.5mm SMD pad.
-        let (pad_w, pad_h) = if n > 2 { (1.0, 1.0) } else { (1.5, 1.5) };
-            fp.pads.push(crate::board::Pad {
-                number: pin_num.clone(),
-                net: pad_net,
-                x: dx, // relative until the placer sets fp.x/y
-                y: dy,
-                width: pad_w,
-                height: pad_h,
-            });
-        }
-        // Absolute pad positions start centered at origin; the placer moves the fp
-        fp.x = 0.0;
-        fp.y = 0.0;
-        for pad in &mut fp.pads {
-            pad.x += fp.x;
-            pad.y += fp.y;
-        }
-        board.footprints.push(fp);
     }
-
-    board
+    if pin_nums.is_empty() {
+        pin_nums.push("1".into());
+        pin_nums.push("2".into());
+    }
+    let n = pin_nums.len();
+    for (i, pin_num) in pin_nums.iter().enumerate() {
+        let (dx, dy) = if n <= 2 {
+            let step = 1.25;
+            if n == 1 { (0.0, 0.0) } else if i == 0 { (-step, 0.0) } else { (step, 0.0) }
+        } else {
+            let half = (n + 1) / 2;
+            let pitch = 1.27;
+            let col_gap = 7.62 / 2.0;
+            if i < half {
+                (-col_gap, (i as f64 - (half as f64 - 1.0) / 2.0) * pitch)
+            } else {
+                let k = n - 1 - i;
+                (col_gap, (k as f64 - (half as f64 - 1.0) / 2.0) * pitch)
+            }
+        };
+        let (ox, oy) = crate::board::rotate_offset(dx, dy, rotation);
+        let (pad_w, pad_h) = if n > 2 { (1.0, 1.0) } else { (1.5, 1.5) };
+        let mut pad = crate::board::Pad::smd(pin_num, net_for(&comp.reference, pin_num), ox, oy, pad_w, pad_h);
+        pad.rotation = rotation;
+        fp.pads.push(pad);
+    }
+    fp
 }
 
 pub fn generate_board(plan: &CircuitPlan) -> String {

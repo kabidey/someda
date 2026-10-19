@@ -239,7 +239,7 @@ fn check_segment_clearance(board: &Board, config: &DrcConfig, findings: &mut Vec
                 _ => false,
             };
             if same_net { continue; }
-            let rect = RotRect::new(pad.x, pad.y, pad.width.max(0.01), pad.height.max(0.01), 0.0);
+            let rect = RotRect::new(pad.x, pad.y, pad.width.max(0.01), pad.height.max(0.01), pad.rotation);
             let d = roirect_segment_clearance(
                 &rect, seg.start.0, seg.start.1, seg.end.0, seg.end.1,
             ) - seg.width / 2.0;
@@ -248,7 +248,7 @@ fn check_segment_clearance(board: &Board, config: &DrcConfig, findings: &mut Vec
                 // Distance ~0 with an endpoint inside the pad = possible intentional
                 // connection (jumpers, old-format files) — warn, don't hard-fail.
                 let touching = d < 0.02 && (
-                    crate::geometry::point_segment_distance(pad.x, pad.y, seg.start.0, seg.start.1, seg.end.0, seg.end.1) < pad.width.max(pad.height) / 2.0
+                    crate::geometry::point_segment_distance(pad.x, pad.y, seg.start.0, seg.start.1, seg.end.0, seg.end.1) < pad.radius()
                 );
                 findings.push(Finding {
                     severity: if touching { Severity::Warning } else { Severity::Error },
