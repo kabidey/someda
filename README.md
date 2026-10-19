@@ -21,6 +21,7 @@ as original, working code:
 - **Oscillation checks that mean something.** The lumped LC "self-resonance" warning no longer fires on terminated transmission lines (it flagged every 20 mm MIPI lane); instead: `unterminated-line` for electrically long nets without a termination, per-capacitor mounting-loop inductance from the routed stubs and via pair (`decoupling-loop`), regulator output capacitance vs datasheet minimums, crystal load capacitors and trace geometry, buck switch/feedback nodes (`stability.rs`), and a per-rail PDN |Z(f)| sweep against the ΔV/ΔI target (`pdn.rs`).
 - Impedance-controlled single-ended nets are confined to layers over a solid plane; the KiCad project's minimum track width is the fab's (0.10 mm) so fab-table pair widths pass DRC.
 - `cargo run --example formula_probe` prints the pair cross-sections alongside the other formulas.
+- **Checkpoints (0.7.0, kicad-cli 10.0.6):** the 555 fixture with a decoupling capacitor (2-layer, 10 connections) and a 26-part 6-layer LQFP-48 board (31 connections, 46 fanouts) reach all six gates with DRC 0 errors; the 132-part V3s SBC routes 194 of 194 connections with its seven USB/Ethernet/MIPI pairs coupled within budget, 0 crosstalk violations, DRC 0 errors and all six gates (evidence in the plugin repository). Remaining warnings on the SBC are real: crystal traces of 10–29 mm with vias and five +1V8 capacitors placed 6–16 mm from the SoC (board density 147 %).
 
 ## 0.6: real footprints, multilayer, escape vias (2026-10-19)
 
