@@ -261,6 +261,39 @@ pub fn length_match_budget_mm(interface: &str) -> Option<f64> {
     })
 }
 
+/// Skill 101 (Class 2 fab table): via aspect ratio — AR = thickness / drill.
+/// Fab quote rejection above 10:1. Returns (ar, ok).
+pub fn via_aspect_ratio(board_thickness_mm: f64, drill_mm: f64) -> (f64, bool) {
+    let ar = board_thickness_mm / drill_mm;
+    (ar, ar <= 10.0)
+}
+
+/// Skill 101 (BGA fanout drill plan): via drill = lead diagonal + 0.2 mm.
+pub fn via_in_pad_drill_mm(lead_diagonal_mm: f64) -> f64 {
+    lead_diagonal_mm + 0.2
+}
+
+/// Skill 031/034/078 (fab DFM): annular ring check — via pad must leave
+/// (size - drill)/2 ≥ 0.1 mm of copper around the hole (minAnnular 0.1 floor).
+pub fn annular_ring_mm(via_size_mm: f64, drill_mm: f64) -> f64 {
+    (via_size_mm - drill_mm) / 2.0
+}
+
+/// Skill 031/034/078: thermal-relief spokes — the canonical spoke count and
+/// width for pad-to-pour connections (tombstone/thermal-mass prevention).
+pub const THERMAL_SPOKE_WIDTH_MM: f64 = 0.15;
+pub const THERMAL_SPOKE_COUNT: usize = 4;
+
+/// Skill 101 (Class 2): copper balance — |coverage_top − coverage_bottom| /
+/// avg < 15%, or the fab warns about warp.
+pub fn copper_imbalance_pct(coverage_top: f64, coverage_bottom: f64) -> f64 {
+    let avg = (coverage_top + coverage_bottom) / 2.0;
+    if avg <= 0.0 {
+        return 0.0;
+    }
+    (coverage_top - coverage_bottom).abs() / avg * 100.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +458,55 @@ mod tests {
         let f2 = cap_srf_hz(0.5e-9, 100e-9);
         assert!(f1 > 10e6, "100nF with 1nH ESL ≈ 16 MHz, got {:.1e}", f1);
         assert!(f2 > f1, "less ESL → higher SRF");
+    }
+
+    /// Skill 101 fab table: aspect ratio AR = thickness/drill < 10.
+    #[test]
+    fn via_aspect_ratio_matches_skill() {
+        // 1.6mm board, 0.3mm drill → AR 5.33, OK
+        let (ar, ok) = via_aspect_ratio(1.6, 0.3);
+        assert!((ar - 5.333).abs() < 0.01, "AR 5.33, got {:.2}", ar);
+        assert!(ok);
+        // 1.6mm board, 0.15mm drill → AR 10.67, REJECT (fab quote)
+        let (ar, ok) = via_aspect_ratio(1.6, 0.15);
+        assert!(!ok, "AR {:.2} > 10 must fail", ar);
+    }
+
+    /// Skill 101 BGA drill plan: drill = lead diagonal + 0.2mm.
+    #[test]
+    fn via_in_pad_drill_matches_skill() {
+        // 0.3mm lead (BGA ball diagonal class) → 0.5mm drill
+        let d = via_in_pad_drill_mm(0.3);
+        assert!((d - 0.5).abs() < 1e-9);
+    }
+
+    /// Skill 101: minAnnular 0.1 floor — (size − drill)/2 ≥ 0.1.
+    #[test]
+    fn annular_ring_matches_skill_floor() {
+        // The skill's 0.6/0.3 preset: (0.6-0.3)/2 = 0.15 ≥ 0.1 ✓
+        assert!((annular_ring_mm(0.6, 0.3) - 0.15).abs() < 1e-9);
+        assert!(annular_ring_mm(0.6, 0.3) >= 0.1);
+        // A 0.45/0.20 preset: (0.45-0.2)/2 = 0.125 ≥ 0.1 ✓ (the floor)
+        assert!(annular_ring_mm(0.45, 0.20) >= 0.1);
+        // A too-small 0.35/0.25 → 0.05 < 0.1 ✗
+        assert!(annular_ring_mm(0.35, 0.25) < 0.1);
+    }
+
+    /// Skill 101 Class 2: copper balance — |top − bottom| / avg < 15%.
+    #[test]
+    fn copper_imbalance_matches_skill() {
+        assert!(copper_imbalance_pct(0.50, 0.50) < 15.0);
+        // 4-point split: |0.52−0.48| / 0.50 = 8% — fine
+        assert!(copper_imbalance_pct(0.52, 0.48) < 15.0, "8% split is fine");
+        // 10-point split: |0.55−0.45| / 0.50 = 20% — over the 15% fab limit
+        assert!(copper_imbalance_pct(0.55, 0.45) > 15.0, "20% split warns");
+        assert!(copper_imbalance_pct(0.90, 0.30) > 15.0, "lopsided pour warns");
+    }
+
+    /// Skills 031/034/078: thermal relief spokes.
+    #[test]
+    fn thermal_relief_constants_match_skills() {
+        assert_eq!(THERMAL_SPOKE_WIDTH_MM, 0.15);
+        assert_eq!(THERMAL_SPOKE_COUNT, 4);
     }
 }

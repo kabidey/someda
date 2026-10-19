@@ -149,6 +149,22 @@ pub fn build(
     fs::write(&sch_path, &sch_content)
         .map_err(|e| OrchestrateError::Io(e.to_string()))?;
 
+    // ─── Stage 2a: pin coverage (honest-done) ───
+    // Every plan pin must exist as a pad BEFORE we place/route — the v0
+    // generator's fixed 2-pad model silently dropped IC pins; this gate
+    // makes that impossible to ship again.
+    verify_pin_coverage(&plan, &board)
+        .map_err(|e| OrchestrateError::Verification(format!("pin coverage: {}", e)))?;
+    stages.push(StageResult {
+        stage: "pin-coverage".into(),
+        success: true,
+        detail: format!(
+            "every plan pin has a pad ({} pins across {} footprints)",
+            plan.nets.iter().map(|n| n.pins.len()).sum::<usize>(),
+            board.footprints.len()
+        ),
+    });
+
     // ─── Stage 2b: Deterministic placement (skill 102) ───
     // The LLM never outputs coordinates; the solver owns geometry.
     println!("─── Stage 2b: Deterministic placement ───");
@@ -371,6 +387,56 @@ pub fn validate_plan(plan: &CircuitPlan) -> Result<(), OrchestrateError> {
                     net.name, pin, ref_des
                 )));
             }
+            if pin.split(':').count() != 2 || pin.split(':').nth(1).unwrap_or("").is_empty() {
+                return Err(OrchestrateError::PlanInvalid(format!(
+                    "net '{}' has malformed pin '{}' (expected REFDES:PIN_NUMBER)",
+                    net.name, pin
+                )));
+            }
+        }
+    }
+    // Duplicate references would make net-to-pad joins ambiguous
+    let mut seen = std::collections::HashSet::new();
+    for c in &plan.components {
+        if !seen.insert(c.reference.as_str()) {
+            return Err(OrchestrateError::PlanInvalid(format!(
+                "duplicate component reference '{}'",
+                c.reference
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Honest-done: every pin the plan names must exist as a pad on the board.
+/// Catches generator drift (the v0 2-pad model dropped IC pins silently).
+pub fn verify_pin_coverage(
+    plan: &CircuitPlan,
+    board: &crate::board::Board,
+) -> Result<(), OrchestrateError> {
+    for net in &plan.nets {
+        for pin in &net.pins {
+            let (refdes, num) = match pin.split_once(':') {
+                Some(x) => x,
+                None => {
+                    return Err(OrchestrateError::Verification(format!(
+                        "malformed pin '{}' in net '{}'",
+                        pin, net.name
+                    )))
+                }
+            };
+            let ok = board
+                .footprints
+                .iter()
+                .find(|f| f.reference == refdes)
+                .map(|f| f.pads.iter().any(|p| p.number == num))
+                .unwrap_or(false);
+            if !ok {
+                return Err(OrchestrateError::Verification(format!(
+                    "pin '{}' (net '{}') has no pad on the board — the plan and copper disagree",
+                    pin, net.name
+                )));
+            }
         }
     }
     Ok(())
@@ -506,21 +572,67 @@ pub fn generate_board_model(plan: &CircuitPlan) -> crate::board::Board {
             rotation: 0.0,
             pads: Vec::new(),
         };
-        // Default footprint-relative pad geometry (2-pin SMD, 2.5mm pitch)
-        for (pin_num, dx) in [("1", -1.25), ("2", 1.25)] {
+        // ONE PAD PER PLAN-REFERENCED PIN — never a fixed 2-pad model.
+        // (Live-validated: the v0 board dropped U1:3/U1:8 silently because
+        // only pads "1"/"2" existed. Every plan pin must land on copper.)
+        // Collect every pin this component needs, in plan order, deduped:
+        let mut pin_nums: Vec<String> = Vec::new();
+        for net in &plan.nets {
+            for pin in &net.pins {
+                if let Some((refdes, num)) = pin.split_once(':') {
+                    if refdes == comp.reference && !pin_nums.iter().any(|p| p == num) {
+                        pin_nums.push(num.to_string());
+                    }
+                }
+            }
+        }
+        // Components referenced by no net still get pins 1+2 (power parts
+        // referenced by value later; honest default).
+        if pin_nums.is_empty() {
+            pin_nums.push("1".into());
+            pin_nums.push("2".into());
+        }
+        // Pad geometry: 2 pins → 2.5mm pitch inline; >2 pins → DIP grid
+        // (two columns, 1.27mm pitch — DIP-8 class), deterministic order.
+        let n = pin_nums.len();
+        for (i, pin_num) in pin_nums.iter().enumerate() {
+            let (dx, dy) = if n <= 2 {
+                let step = 1.25;
+                if n == 1 { (0.0, 0.0) }
+                else if i == 0 { (-step, 0.0) } else { (step, 0.0) }
+            } else {
+                // DIP: left column top-to-bottom, then right column bottom-to-top
+                let half = (n + 1) / 2;
+                let pitch = 1.27;
+                let col_gap = 7.62 / 2.0; // DIP column spacing
+                if i < half {
+                    (-col_gap, (i as f64 - (half as f64 - 1.0) / 2.0) * pitch)
+                } else {
+                    let k = n - 1 - i; // mirror for right column
+                    (col_gap, (k as f64 - (half as f64 - 1.0) / 2.0) * pitch)
+                }
+            };
             let pad_net = plan
                 .nets
                 .iter()
                 .enumerate()
-                .find(|(_, n)| n.pins.iter().any(|p| p == &format!("{}:{}", comp.reference, pin_num)))
-                .map(|(i, n)| (i + 1, n.name.clone()));
+                .find(|(_, net)| {
+                    net.pins
+                        .iter()
+                        .any(|p| p == &format!("{}:{}", comp.reference, pin_num))
+                })
+                .map(|(i, net)| (i + 1, net.name.clone()));
+        // Pad size by pitch: DIP pitch 1.27mm → pads 1.0mm (a 1.5mm pad
+        // overlaps its neighbor — live-verified by KiCad DRC as a short).
+        // Inline 2-pin parts keep the 1.5mm SMD pad.
+        let (pad_w, pad_h) = if n > 2 { (1.0, 1.0) } else { (1.5, 1.5) };
             fp.pads.push(crate::board::Pad {
-                number: pin_num.into(),
+                number: pin_num.clone(),
                 net: pad_net,
-                x: dx, // relative until the placer sets fp.x/y; writer recomputes
-                y: 0.0,
-                width: 1.5,
-                height: 1.5,
+                x: dx, // relative until the placer sets fp.x/y
+                y: dy,
+                width: pad_w,
+                height: pad_h,
             });
         }
         // Absolute pad positions start centered at origin; the placer moves the fp
@@ -664,6 +776,87 @@ mod tests {
         // Parse it back with our own parser
         let parsed = crate::board::Board::from_kicad_pcb(&pcb);
         assert!(parsed.is_ok(), "{:?}", parsed);
+    }
+
+    #[test]
+    fn multi_pin_components_get_their_pins() {
+        // Live-validated regression: the v0 board dropped U1:3/U1:8 silently
+        let plan: CircuitPlan = serde_json::from_str(r#"{
+            "name": "ic test",
+            "description": "an IC with pins beyond 1 and 2",
+            "components": [
+                {"reference": "U1", "value": "NE555", "lib_id": "Timer:NE555", "footprint": "Package_DIP:DIP-8"}
+            ],
+            "nets": [
+                {"name": "VCC", "pins": ["U1:1"]},
+                {"name": "OUT", "pins": ["U1:3"]},
+                {"name": "GND", "pins": ["U1:8"]}
+            ]
+        }"#).unwrap();
+        validate_plan(&plan).unwrap();
+        let board = generate_board_model(&plan);
+        // Every plan pin must exist as a pad:
+        verify_pin_coverage(&plan, &board).unwrap();
+        let u1 = board.footprints.iter().find(|f| f.reference == "U1").unwrap();
+        let numbers: Vec<&str> = u1.pads.iter().map(|p| p.number.as_str()).collect();
+        assert!(numbers.contains(&"3"), "U1 pin 3 must exist, got {:?}", numbers);
+        assert!(numbers.contains(&"8"), "U1 pin 8 must exist, got {:?}", numbers);
+        // DIP grid: pins 1..8 → 3 pads here, in plan order, with nets attached
+        assert_eq!(u1.pads.len(), 3);
+        let p3 = u1.pads.iter().find(|p| p.number == "3").unwrap();
+        assert_eq!(p3.net.as_ref().map(|(_, n)| n.as_str()), Some("OUT"));
+    }
+
+    #[test]
+    fn pin_coverage_rejects_missing_pad() {
+        // A board model that lacks a plan pin must FAIL the gate
+        let plan: CircuitPlan = serde_json::from_str(r#"{
+            "name": "gap test",
+            "description": "pin missing from board",
+            "components": [
+                {"reference": "R1", "value": "10k", "lib_id": "Device:R"}
+            ],
+            "nets": [
+                {"name": "A", "pins": ["R1:1", "R1:2"]}
+            ]
+        }"#).unwrap();
+        let mut board = generate_board_model(&plan);
+        // Sabotage: remove pad 2
+        board.footprints[0].pads.truncate(1);
+        let err = verify_pin_coverage(&plan, &board);
+        assert!(err.is_err(), "missing pad must fail the gate");
+        assert!(format!("{:?}", err).contains("R1:2"));
+    }
+
+    #[test]
+    fn duplicate_reference_rejected() {
+        let plan: CircuitPlan = serde_json::from_str(r#"{
+            "name": "dup",
+            "description": "duplicate refs",
+            "components": [
+                {"reference": "R1", "value": "10k", "lib_id": "Device:R"},
+                {"reference": "R1", "value": "10k", "lib_id": "Device:R"}
+            ],
+            "nets": [
+                {"name": "A", "pins": ["R1:1", "R1:2"]}
+            ]
+        }"#).unwrap();
+        assert!(validate_plan(&plan).is_err(), "duplicate reference must fail");
+    }
+
+    #[test]
+    fn malformed_pin_rejected() {
+        let plan: CircuitPlan = serde_json::from_str(r#"{
+            "name": "malformed",
+            "description": "no pin number",
+            "components": [
+                {"reference": "R1", "value": "10k", "lib_id": "Device:R"}
+            ],
+            "nets": [
+                {"name": "A", "pins": ["R1:"]}
+            ]
+        }"#).unwrap();
+        assert!(validate_plan(&plan).is_err(), "empty pin number must fail");
     }
 
     #[test]

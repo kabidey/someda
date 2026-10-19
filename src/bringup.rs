@@ -386,6 +386,92 @@ mod tests {
     }
 
     #[test]
+    fn bringup_round_repair_loop_honest_done() {
+        // Skill 103 contract, integration: a done claim is re-verified against
+        // the LIVE board — claiming done with open work is REJECTED.
+        use crate::bringup::get_board_status;
+        use crate::drc::{DrcConfig, RepairLoop, RoundOutcome};
+
+        // A board with a footprint stranded OUTSIDE the outline
+        let mut board = Board::from_kicad_pcb(
+            r#"(kicad_pcb (version 20221018)
+              (gr_line (start 0 0) (end 100 0) (layer "Edge.Cuts") (width 0.1))
+              (gr_line (start 100 0) (end 100 80) (layer "Edge.Cuts") (width 0.1))
+              (gr_line (start 100 80) (end 0 80) (layer "Edge.Cuts") (width 0.1))
+              (gr_line (start 0 80) (end 0 0) (layer "Edge.Cuts") (width 0.1))
+              (net 1 "VCC")
+              (footprint "R" (layer "F.Cu") (at 200 200 0)
+                (fp_text reference "R1" (at 0 -2))
+                (pad "1" smd rect (at -1.25 0) (size 1.5 1.5) (layers "F.Cu") (net 1 "VCC"))))"#,
+        )
+        .unwrap();
+
+        // Live status BEFORE: the airwire/DRC truth the repair agent reads
+        let status = get_board_status(&board);
+        assert_eq!(status.footprints, 1);
+        assert!(status.drc_errors > 0, "stranded footprint must be an error");
+
+        // Round 1: claim done while broken → REJECTED (wastes a round)
+        {
+            let mut rl = RepairLoop::new(&mut board, DrcConfig::default());
+            let result = rl.round(RoundOutcome::Done { summary: "all fixed".into() });
+            assert!(result.is_err(), "done with open work must be rejected");
+            assert!(format!("{:?}", result).contains("REJECTED"));
+        }
+
+        // Round 2 (fresh loop): nudge the offender inside, THEN done → accepted
+        {
+            let mut rl = RepairLoop::new(&mut board, DrcConfig::default());
+            rl.round(RoundOutcome::Actions {
+                actions: vec![crate::drc::RepairAction::NudgeIntoOutline { reference: "R1".into() }],
+                note: "nudge R1 into outline".into(),
+            })
+            .unwrap();
+            let done = rl.round(RoundOutcome::Done { summary: "R1 nudged; DRC clean".into() });
+            assert!(done.is_ok(), "done after real fix must be accepted: {:?}", done);
+            assert_eq!(rl.rounds_used(), 2);
+
+            // The live status AGREES now (get_board_status re-verifies)
+            let status = get_board_status(&board);
+            assert_eq!(status.drc_errors, 0, "live board agrees: clean");
+        }
+    }
+
+    #[test]
+    fn repair_loop_budget_bounds_rounds() {
+        // Bounded rounds: thrash ends in Stop, never an infinite loop
+        use crate::drc::{DrcConfig, RepairLoop, RoundOutcome};
+        let mut board = Board::from_kicad_pcb(
+            r#"(kicad_pcb (version 20221018)
+              (gr_line (start 0 0) (end 100 0) (layer "Edge.Cuts") (width 0.1))
+              (gr_line (start 100 0) (end 100 80) (layer "Edge.Cuts") (width 0.1))
+              (gr_line (start 100 80) (end 0 80) (layer "Edge.Cuts") (width 0.1))
+              (gr_line (start 0 80) (end 0 0) (layer "Edge.Cuts") (width 0.1))
+              (net 1 "VCC")
+              (footprint "R" (layer "F.Cu") (at 200 200 0)
+                (fp_text reference "R1" (at 0 -2))
+                (pad "1" smd rect (at -1.25 0) (size 1.5 1.5) (layers "F.Cu") (net 1 "VCC"))))"#,
+        )
+        .unwrap();
+        let mut rl = RepairLoop::new(&mut board, DrcConfig::default());
+        let mut outcome = Ok(RoundOutcome::Actions { actions: vec![], note: String::new() });
+        for _ in 0..12 {
+            outcome = rl.round(RoundOutcome::Actions {
+                actions: vec![], // deliberately useless: no convergence
+                note: "noop".into(),
+            });
+            if let Ok(RoundOutcome::Stop { .. }) = outcome {
+                break;
+            }
+        }
+        assert!(
+            matches!(outcome, Ok(RoundOutcome::Stop { .. })),
+            "thrash must end in Stop (bounded rounds), got {:?}",
+            outcome
+        );
+    }
+
+    #[test]
     fn get_board_status_reports_airwires() {
         let b = board_2comp();
         let st = get_board_status(&b);
