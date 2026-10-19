@@ -63,11 +63,17 @@ impl Default for DrcConfig {
 }
 
 pub fn run_drc(board: &Board, config: &DrcConfig) -> DrcReport {
+    run_drc_with_classes(board, config, None)
+}
+
+pub fn run_drc_with_classes(board: &Board, config: &DrcConfig, classes: Option<&crate::netclass::NetClassTable>) -> DrcReport {
     let mut findings = Vec::new();
 
     check_pad_outside_outline(board, &mut findings);
     check_pad_clearance(board, config, &mut findings);
     check_outline_closed(board, &mut findings);
+    check_trace_width(board, config, classes, &mut findings);
+    check_segment_clearance(board, config, &mut findings);
 
     DrcReport { findings }
 }
@@ -147,6 +153,130 @@ fn check_outline_closed(board: &Board, findings: &mut Vec<Finding>) {
             ),
         });
     }
+}
+
+fn check_trace_width(board: &Board, config: &DrcConfig, classes: Option<&crate::netclass::NetClassTable>, findings: &mut Vec<Finding>) {
+    for seg in &board.segments {
+        let min_width = match (&classes, &seg.net) {
+            (Some(t), Some((_, net_name))) => t.trace_width_for(net_name),
+            _ => config.min_trace_width_mm,
+        };
+        if seg.width < min_width && seg.width > 0.0 {
+            let net_desc = seg.net.as_ref()
+                .map(|(_, n)| n.as_str())
+                .unwrap_or("unnamed");
+            findings.push(Finding {
+                severity: Severity::Error,
+                code: "trace-width".into(),
+                message: format!(
+                    "Trace on net '{}' (layer {}) is {:.3} mm wide (min {:.3} mm).{}",
+                    net_desc, seg.layer, seg.width, min_width,
+                    if let Some(cls) = classes.and_then(|c| c.class_of(net_desc)) {
+                        format!(" Net class '{}'.", cls)
+                    } else { String::new() }
+                ),
+            });
+        }
+    }
+}
+
+fn check_segment_clearance(board: &Board, config: &DrcConfig, findings: &mut Vec<Finding>) {
+    use crate::geometry::{RotRect, roirect_segment_clearance};
+
+    // Segment-to-segment clearance (same layer, different nets)
+    let seg_count = board.segments.len();
+    if seg_count > 200 {
+        // O(n^2) pairwise: cap at 200 segments for now to avoid pathological runtime
+        // on dense boards. Full spatial-indexing is an M2 item.
+        findings.push(Finding {
+            severity: Severity::Warning,
+            code: "segment-check-truncated".into(),
+            message: format!("Board has {} segments; pairwise clearance checked on the first 200 only (spatial index lands in M2).", seg_count),
+        });
+    }
+    let check_n = seg_count.min(200);
+    for i in 0..check_n {
+        let a = &board.segments[i];
+        for j in (i + 1)..check_n {
+            let b = &board.segments[j];
+            if a.layer != b.layer { continue; }
+            let same_net = match (&a.net, &b.net) {
+                (Some((_, x)), Some((_, y))) if !x.is_empty() && !y.is_empty() && x == y => true,
+                (Some((ia, _)), Some((ib, _))) if ia == ib && *ia > 0 => true,
+                _ => false,
+            };
+            if same_net { continue; }
+            let clearance = segment_segment_distance(
+                a.start, a.end, b.start, b.end,
+            ).min(segment_segment_distance(b.start, b.end, a.start, a.end));
+            // Subtract half-widths for edge-to-edge clearance
+            let edge_gap = clearance - (a.width + b.width) / 2.0;
+            if edge_gap < config.min_clearance_mm && edge_gap >= 0.0 {
+                let na = a.net.as_ref().map(|(_, n)| n.as_str()).unwrap_or("?");
+                let nb = b.net.as_ref().map(|(_, n)| n.as_str()).unwrap_or("?");
+                findings.push(Finding {
+                    severity: Severity::Error,
+                    code: "segment-clearance".into(),
+                    message: format!(
+                        "Traces on nets '{}' and '{}' (layer {}) are {:.3} mm apart (min {:.3} mm).",
+                        na, nb, a.layer, edge_gap, config.min_clearance_mm
+                    ),
+                });
+            }
+        }
+    }
+
+    // Segment-to-pad clearance: use the existing RotRect geometry
+    let pad_list: Vec<(&crate::board::Footprint, &crate::board::Pad)> = board.footprints.iter()
+        .flat_map(|fp| fp.pads.iter().map(move |p| (fp, p)))
+        .collect();
+    for seg in board.segments.iter().take(200) {
+        for (fp, pad) in &pad_list {
+            let same_net = match (&seg.net, &pad.net) {
+                (Some((ia, a)), Some((ib, b))) if !a.is_empty() && !b.is_empty() && a == b => true,
+                // Old-format files: net names may be empty; fall back to net index
+                (Some((ia, _)), Some((ib, _))) if *ia == *ib && *ia > 0 => true,
+                _ => false,
+            };
+            if same_net { continue; }
+            let rect = RotRect::new(pad.x, pad.y, pad.width.max(0.01), pad.height.max(0.01), 0.0);
+            let d = roirect_segment_clearance(
+                &rect, seg.start.0, seg.start.1, seg.end.0, seg.end.1,
+            ) - seg.width / 2.0;
+            if d < config.min_clearance_mm && d >= 0.0 {
+                let sn = seg.net.as_ref().map(|(_, n)| n.as_str()).unwrap_or("?");
+                // Distance ~0 with an endpoint inside the pad = possible intentional
+                // connection (jumpers, old-format files) — warn, don't hard-fail.
+                let touching = d < 0.02 && (
+                    crate::geometry::point_segment_distance(pad.x, pad.y, seg.start.0, seg.start.1, seg.end.0, seg.end.1) < pad.width.max(pad.height) / 2.0
+                );
+                findings.push(Finding {
+                    severity: if touching { Severity::Warning } else { Severity::Error },
+                    code: "segment-pad-clearance".into(),
+                    message: format!(
+                        "Trace on net '{}' is {:.3} mm from pad {}:{} (min {:.3} mm).{}",
+                        sn, d, fp.reference, pad.number, config.min_clearance_mm,
+                        if touching { " Trace endpoint inside pad — check for intended connection (jumper) or short." } else { "" }
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// Minimum distance between two segments (center-line to center-line).
+fn segment_segment_distance(
+    a1: (f64, f64), a2: (f64, f64),
+    b1: (f64, f64), b2: (f64, f64),
+) -> f64 {
+    use crate::geometry::point_segment_distance;
+    let mut d = f64::INFINITY;
+    // endpoint-to-segment
+    d = d.min(point_segment_distance(a1.0, a1.1, b1.0, b1.1, b2.0, b2.1));
+    d = d.min(point_segment_distance(a2.0, a2.1, b1.0, b1.1, b2.0, b2.1));
+    d = d.min(point_segment_distance(b1.0, b1.1, a1.0, a1.1, a2.0, a2.1));
+    d = d.min(point_segment_distance(b2.0, b2.1, a1.0, a1.1, a2.0, a2.1));
+    d
 }
 
 // ---------------------------------------------------------------------------

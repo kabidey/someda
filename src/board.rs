@@ -25,6 +25,28 @@ pub struct Footprint {
     pub pads: Vec<Pad>,
 }
 
+/// A routed trace segment on a copper layer.
+#[derive(Debug, Clone)]
+pub struct Segment {
+    /// (x1, y1) → (x2, y2) in board mm
+    pub start: (f64, f64),
+    pub end: (f64, f64),
+    pub width: f64,
+    pub layer: String,
+    pub net: Option<(usize, String)>,
+}
+
+/// A via connecting two copper layers.
+#[derive(Debug, Clone)]
+pub struct Via {
+    pub x: f64,
+    pub y: f64,
+    pub size: f64,
+    pub drill: f64,
+    pub layers: Vec<String>,
+    pub net: Option<(usize, String)>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Board {
     pub version: Option<String>,
@@ -34,6 +56,10 @@ pub struct Board {
     pub outline: Vec<((f64, f64), (f64, f64))>,
     /// Net classes: (name, trace_width_mm, nets)
     pub net_classes: Vec<(String, f64, Vec<String>)>,
+    /// Routed trace segments
+    pub segments: Vec<Segment>,
+    /// Vias
+    pub vias: Vec<Via>,
 }
 
 impl Board {
@@ -66,6 +92,16 @@ impl Board {
             if item.as_tagged("footprint").is_some() {
                 if let Some(fp) = parse_footprint(item) {
                     board.footprints.push(fp);
+                }
+            }
+            if item.as_tagged("segment").is_some() {
+                if let Some(seg) = parse_segment(item) {
+                    board.segments.push(seg);
+                }
+            }
+            if item.as_tagged("via").is_some() {
+                if let Some(v) = parse_via(item) {
+                    board.vias.push(v);
                 }
             }
         }
@@ -205,6 +241,77 @@ fn parse_pad(child: &Sexp, fp_at: Option<(f64, f64, f64)>) -> Option<Pad> {
         width: w,
         height: h,
     })
+}
+
+fn parse_segment(item: &Sexp) -> Option<Segment> {
+    let items = match item { Sexp::List(v) => v, _ => return None };
+    let mut start = None;
+    let mut end = None;
+    let mut width = 0.0;
+    let mut layer = String::new();
+    let mut net = None;
+    for child in items {
+        if let Some(s) = child.as_tagged("start") {
+            start = s.first().zip(s.get(1)).and_then(|(a, b)| Some((a.f64_value()?, b.f64_value()?)));
+        }
+        if let Some(e) = child.as_tagged("end") {
+            end = e.first().zip(e.get(1)).and_then(|(a, b)| Some((a.f64_value()?, b.f64_value()?)));
+        }
+        if let Some(w) = child.as_tagged("width") {
+            width = w.first().and_then(|s| s.f64_value()).unwrap_or(0.0);
+        }
+        if let Some(l) = child.as_tagged("layer") {
+            layer = l.first().and_then(|s| s.str_value()).unwrap_or("").trim_matches('"').to_string();
+        }
+        if let Some(n) = child.as_tagged("net") {
+            if n.len() >= 2 {
+                net = n.first().and_then(|i| i.str_value()).and_then(|i| i.parse().ok())
+                    .zip(n.get(1).and_then(|s| s.str_value()).map(String::from));
+            } else if n.len() == 1 {
+                net = n.first().and_then(|i| i.str_value()).and_then(|i| i.parse().ok()).map(|i| (i, String::new()));
+            }
+        }
+    }
+    let (sx, sy) = start?;
+    let (ex, ey) = end?;
+    Some(Segment { start: (sx, sy), end: (ex, ey), width, layer, net })
+}
+
+fn parse_via(item: &Sexp) -> Option<Via> {
+    let items = match item { Sexp::List(v) => v, _ => return None };
+    let mut at = None;
+    let mut size = 0.0;
+    let mut drill = 0.0;
+    let mut layers = Vec::new();
+    let mut net = None;
+    for child in items {
+        if let Some(a) = child.as_tagged("at") {
+            at = a.first().zip(a.get(1)).and_then(|(x, y)| Some((x.f64_value()?, y.f64_value()?)));
+        }
+        if let Some(s) = child.as_tagged("size") {
+            size = s.first().and_then(|v| v.f64_value()).unwrap_or(0.0);
+        }
+        if let Some(d) = child.as_tagged("drill") {
+            drill = d.first().and_then(|v| v.f64_value()).unwrap_or(0.0);
+        }
+        if let Some(l) = child.as_tagged("layers") {
+            for arg in l {
+                if let Some(name) = arg.str_value() {
+                    layers.push(name.trim_matches('"').to_string());
+                }
+            }
+        }
+        if let Some(n) = child.as_tagged("net") {
+            if n.len() >= 2 {
+                net = n.first().and_then(|i| i.str_value()).and_then(|i| i.parse().ok())
+                    .zip(n.get(1).and_then(|s| s.str_value()).map(String::from));
+            } else if n.len() == 1 {
+                net = n.first().and_then(|i| i.str_value()).and_then(|i| i.parse().ok()).map(|i| (i, String::new()));
+            }
+        }
+    }
+    let (x, y) = at?;
+    Some(Via { x, y, size, drill, layers, net })
 }
 
 #[cfg(test)]

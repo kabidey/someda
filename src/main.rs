@@ -71,6 +71,11 @@ fn cmd_info(b: &board::Board) {
     for fp in &b.footprints {
         println!("  {} ({}) at ({:.3}, {:.3}) rot {:.0} — {} pads",
             fp.reference, fp.lib_name, fp.x, fp.y, fp.rotation, fp.pads.len());
+        if fp.reference == "JP1" {
+            for p in &fp.pads {
+                println!("    pad {}: net={:?}", p.number, p.net);
+            }
+        }
     }
     if let Some((x0, y0, x1, y1)) = b.outline_bbox() {
         let w = x1 - x0;

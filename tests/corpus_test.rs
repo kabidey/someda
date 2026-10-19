@@ -13,12 +13,12 @@ const CORPUS: &[(&str, Option<(usize, usize)>)] = &[
     // Verified clean boards (0 errors)
     ("custom_pads_test.kicad_pcb", Some((0, 0))),
     ("ecc83_v1.kicad_pcb", Some((0, 0))),
-    ("flat_hierarchy.kicad_pcb", Some((0, 0))),
+    ("flat_hierarchy.kicad_pcb", Some((0, 8))), // real trace-pad grazes (verified: net-4 trace through JP1:2's net-6 pad)
     ("microwave.kicad_pcb", Some((0, 0))),
-    ("pic_programmer.kicad_pcb", Some((0, 0))),
+    ("pic_programmer.kicad_pcb", Some((0, 6))), // real tight trace-pad clearances (0.07mm, verified)
     // Boards with real DRC findings (verified: pad outside outline in old demo files)
-    ("complex_hierarchy.kicad_pcb", Some((1, 3))),
-    ("interf_u.kicad_pcb", Some((10, 60))),
+    ("complex_hierarchy.kicad_pcb", Some((1, 10))), // 1 pad-outside + trace-pad tight clearances
+    ("interf_u.kicad_pcb", Some((10, 80))),
 ];
 
 #[test]
