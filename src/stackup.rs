@@ -82,7 +82,7 @@ pub fn stripline_z0_simple(w: f64, b: f64, t: f64, er: f64) -> f64 {
 
 /// Differential impedance for a coupled pair (edge-coupled microstrip approximation).
 /// Z0 = single-ended impedance, s = gap between traces mm, h = height above plane.
-pub fn diff_z0(z0: f64, s: f64, h: f64, er: f64) -> f64 {
+pub fn diff_z0(z0: f64, s: f64, h: f64, _er: f64) -> f64 {
     if s <= 0.0 || h <= 0.0 {
         return f64::NAN;
     }

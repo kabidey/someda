@@ -17,3 +17,8 @@ pub mod stackup;
 pub mod gateway;
 pub mod kicad_cli;
 pub mod orchestrator;
+pub mod placer;
+pub mod router;
+pub mod boardplan;
+pub mod bringup;
+pub mod formulas;

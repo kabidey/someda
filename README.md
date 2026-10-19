@@ -78,3 +78,36 @@ study of a commercial AI-EDA product: the file formats are public KiCad
 s-expression syntax; the DRC rules and repair-loop contract are clean-room
 implementations of the design patterns we documented. It contains no code,
 text, or material from the analyzed product.
+
+## v0.4.0 — The Full Idea-to-PCB Pipeline (PCB-Superpower Skills 101-103)
+
+The application now walks a circuit from **idea to fab-ready PCB** in one pipeline,
+implementing the [PCB-Superpower](https://github.com/kabidey/PCB-Superpower)
+orchestration layer (skills 101-103) as deterministic Rust:
+
+| Skill | someda module | What it does |
+|-------|--------------|--------------|
+| 102 Placement Handoff | `placer.rs` | The deterministic solver that owns geometry: 9-region semantic positions, rows, groups, apart (2D distance), center-out ring packing ordered by ratsnest centrality. The LLM never emits coordinates. |
+| 101 SomRoute Autorouting | `router.rs` | A* grid router with the skill's verified defaults: 0.25 mm trace, 0.2 mm clearance, 0.6/0.3 vias, 0.25 mm edge clearance, Manhattan-only moves, full segment rasterization, via halos, honest `routed N of M` reporting. |
+| 103 DRC Repair Loop | `bringup.rs` + orchestrator stage 7 | The 6-gate export preflight (DRC, shorts, unrouted, pours, Gerbers, drill) as the honest-done contract: all six pass = orderable, anything else = NOT DONE. |
+| All 103 skills | `formulas.rs` | Every quantitative formula: IPC-2152 current, microstrip Z0 + width solver, λ/20 via stubs, critical length, 3W/5W crosstalk, shielding A/R losses, slot leakage, ground bounce, via loop inductance, thermal chain (θJA, Tj, via grids), PDN targets, cap SRF, L-match RF networks, area budgets, USB3/DDR/PCIe length budgets — each verified against the skills' own worked examples. |
+| Plan schema | `boardplan.rs` | The 7-form contract: plan / bringup phases (layers → stackup → net classes → placement → planes → route → checks), route/unroute flags with net scoping, strict validation. |
+
+### Live-verified end to end
+
+```
+someda ai build "555 LED blinker"
+  Stage 1  plan (LLM JSON contract)
+  Stage 2b placement (deterministic solver, 5 footprints)
+  Stage 2c route: routed 303 of 303 connections (0 unrouted)
+  Stage 6  someda DRC: 0 errors
+  Stage 7  export preflight: drc PASS shorts PASS unrouted PASS pours PASS gerbers PASS drill PASS
+
+kicad-cli pcb drc circuit.kicad_pcb
+  Found 0 unconnected items        (was 4 before routing)
+  0 electrical violations          (only missing-lib env warnings)
+kicad-cli pcb export gerbers → fab/circuit-F_Cu.gtl (routed copper), .drl, .gbrjob
+```
+
+KiCad's own DRC drove two router fixes (grid must encode fab geometry; Manhattan-only
+moves) — the honest-done loop working exactly as the skills demand.

@@ -59,7 +59,7 @@ pub fn extract(sch: &Schematic, board: &Board) -> Netlist {
         if pad_positions.len() >= 2 {
             let mut remaining: Vec<((String, String), f64, f64)> = pad_positions.clone();
             let mut current = remaining.remove(0);
-            let mut chain = vec![current.clone()];
+            let _chain = vec![current.clone()];
             while !remaining.is_empty() {
                 // nearest by Manhattan
                 let mut best_i = 0;
@@ -96,6 +96,83 @@ pub fn extract(sch: &Schematic, board: &Board) -> Netlist {
     }
 
     Netlist { nets, edges, total_manhattan_mm: total }
+}
+
+impl Netlist {
+    /// Board-native ratsnest: pads already carry nets + absolute positions.
+    /// Used by the placer/router when no schematic is present (PCB-first flow).
+    pub fn from_board(board: &Board) -> Netlist {
+        let mut nets: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        let mut edges = Vec::new();
+        let mut total = 0.0;
+
+        // Collect pads per net name
+        let mut by_net: std::collections::BTreeMap<String, Vec<(&crate::board::Pad, String, String)>> =
+            std::collections::BTreeMap::new();
+        for fp in &board.footprints {
+            for pad in &fp.pads {
+                if let Some((_, net_name)) = &pad.net {
+                    by_net
+                        .entry(net_name.clone())
+                        .or_default()
+                        .push((pad, fp.reference.clone(), pad.number.clone()));
+                }
+            }
+        }
+
+        for (net_name, pads) in by_net {
+            nets.push((
+                net_name.clone(),
+                pads.iter()
+                    .map(|(_, r, p)| (r.clone(), p.clone()))
+                    .collect(),
+            ));
+
+            // Chain pads in greedy nearest-neighbor order (same as the schematic flow)
+            if pads.len() >= 2 {
+                let mut remaining: Vec<&crate::board::Pad> = pads.iter().map(|(p, _, _)| *p).collect();
+                let mut current = remaining.remove(0);
+                while !remaining.is_empty() {
+                    let mut best_i = 0;
+                    let mut best_d = f64::INFINITY;
+                    for (i, r) in remaining.iter().enumerate() {
+                        let d = (current.x - r.x).abs() + (current.y - r.y).abs();
+                        if d < best_d {
+                            best_d = d;
+                            best_i = i;
+                        }
+                    }
+                    let next = remaining.remove(best_i);
+                    let from = pads
+                        .iter()
+                        .find(|(p, _, _)| std::ptr::eq(*p, current))
+                        .map(|(_, r, pin)| (r.clone(), pin.clone()))
+                        .unwrap_or_default();
+                    let to = pads
+                        .iter()
+                        .find(|(p, _, _)| std::ptr::eq(*p, next))
+                        .map(|(_, r, pin)| (r.clone(), pin.clone()))
+                        .unwrap_or_default();
+                    edges.push(RatsnestEdge {
+                        net: net_name.clone(),
+                        from_ref: from.0,
+                        from_pin: from.1,
+                        from_x: current.x,
+                        from_y: current.y,
+                        to_ref: to.0,
+                        to_pin: to.1,
+                        to_x: next.x,
+                        to_y: next.y,
+                        manhattan_mm: best_d,
+                    });
+                    total += best_d;
+                    current = next;
+                }
+            }
+        }
+
+        Netlist { nets, edges, total_manhattan_mm: total }
+    }
 }
 
 #[cfg(test)]

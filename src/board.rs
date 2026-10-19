@@ -124,6 +124,94 @@ impl Board {
               xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
               ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max)))
     }
+
+    /// Serialize the board back to KiCad `.kicad_pcb` format.
+    /// This is the writer half of the round-trip: the router's copper
+    /// (segments + vias) lands in the file kicad-cli verifies and exports.
+    pub fn to_kicad_pcb(&self) -> String {
+        let mut out = String::new();
+        out.push_str("(kicad_pcb (version 20221018) (generator someda)\n");
+        out.push_str("  (general (thickness 1.6))\n");
+        out.push_str("  (paper \"A4\")\n");
+        out.push_str("  (layers\n");
+        out.push_str("    (0 \"F.Cu\" signal)\n    (31 \"B.Cu\" signal)\n");
+        out.push_str("    (44 \"Edge.Cuts\" user)\n  )\n");
+
+        for ((x1, y1), (x2, y2)) in &self.outline {
+            out.push_str(&format!(
+                "  (gr_line (start {:.4} {:.4}) (end {:.4} {:.4}) (layer \"Edge.Cuts\") (width 0.1))\n",
+                x1, y1, x2, y2
+            ));
+        }
+
+        for (idx, name) in &self.nets {
+            out.push_str(&format!("  (net {} \"{}\")\n", idx, name));
+        }
+
+        for (name, width, nets) in &self.net_classes {
+            let net_refs: Vec<String> =
+                nets.iter().map(|n| format!("\"{}\"", n)).collect();
+            out.push_str(&format!(
+                "  (net_class \"{}\" \"someda\" (trace_width {}) (clearance 0.2) (nets {}))\n",
+                name, width, net_refs.join(" ")
+            ));
+        }
+
+        for fp in &self.footprints {
+            out.push_str(&format!(
+                "  (footprint \"{}\" (layer \"F.Cu\") (at {:.4} {:.4} {})\n",
+                fp.lib_name, fp.x, fp.y, fp.rotation
+            ));
+            out.push_str(&format!(
+                "    (fp_text reference \"{}\" (at 0 -2 0) (layer \"F.SilkS\"))\n",
+                fp.reference
+            ));
+            for pad in &fp.pads {
+                // Reconstruct the RELATIVE pad offset by inverse rotation
+                let r = (-fp.rotation).to_radians();
+                let dx = pad.x - fp.x;
+                let dy = pad.y - fp.y;
+                let rx = dx * r.cos() - dy * r.sin();
+                let ry = dx * r.sin() + dy * r.cos();
+                let net_part = match &pad.net {
+                    Some((idx, name)) => format!(" (net {} \"{}\")", idx, name),
+                    None => String::new(),
+                };
+                out.push_str(&format!(
+                    "    (pad \"{}\" smd rect (at {:.4} {:.4}) (size {:.4} {:.4}) (layers \"F.Cu\" \"F.Mask\"){})\n",
+                    pad.number, rx, ry, pad.width, pad.height, net_part
+                ));
+            }
+            out.push_str("  )\n");
+        }
+
+        for seg in &self.segments {
+            // KiCad tracks take (net N) — the name form is pad-only
+            let net_part = match &seg.net {
+                Some((idx, _)) => format!(" (net {})", idx),
+                None => String::new(),
+            };
+            out.push_str(&format!(
+                "  (segment (start {:.4} {:.4}) (end {:.4} {:.4}) (width {:.4}) (layer \"{}\"){})\n",
+                seg.start.0, seg.start.1, seg.end.0, seg.end.1, seg.width, seg.layer, net_part
+            ));
+        }
+
+        for via in &self.vias {
+            // KiCad vias take (net N) — the name form is pad-only
+            let net_part = match &via.net {
+                Some((idx, _)) => format!(" (net {})", idx),
+                None => String::new(),
+            };
+            out.push_str(&format!(
+                "  (via (at {:.4} {:.4}) (size {:.4}) (drill {:.4}) (layers \"F.Cu\" \"B.Cu\"){})\n",
+                via.x, via.y, via.size, via.drill, net_part
+            ));
+        }
+
+        out.push_str(")\n");
+        out
+    }
 }
 
 fn parse_at(args: &[Sexp]) -> Option<(f64, f64, f64)> {
@@ -377,6 +465,50 @@ mod tests {
         // pad 9 at rel (0, 20.32) rotated 90° → absolute (150 - 20.32, 124)
         assert!((p9.x - 129.68).abs() < 1e-9, "p9.x = {}", p9.x);
         assert!((p9.y - 124.0).abs() < 1e-9, "p9.y = {}", p9.y);
+    }
+
+    #[test]
+    fn to_kicad_pcb_roundtrip_preserves_model() {
+        let input = r#"(kicad_pcb (version 20221018)
+          (gr_line (start 0 0) (end 100 0) (layer "Edge.Cuts") (width 0.1))
+          (gr_line (start 100 0) (end 100 80) (layer "Edge.Cuts") (width 0.1))
+          (gr_line (start 100 80) (end 0 80) (layer "Edge.Cuts") (width 0.1))
+          (gr_line (start 0 80) (end 0 0) (layer "Edge.Cuts") (width 0.1))
+          (net 1 "VCC")
+          (net 2 "GND")
+          (footprint "R" (layer "F.Cu") (at 10 10 0)
+            (fp_text reference "R1" (at 0 -2))
+            (pad "1" smd rect (at -1.25 0) (size 1.5 1.5) (layers "F.Cu") (net 1 "VCC"))
+            (pad "2" smd rect (at 1.25 0) (size 1.5 1.5) (layers "F.Cu") (net 2 "GND")))
+          (segment (start 8.75 10) (end 8.75 20) (width 0.25) (layer "F.Cu") (net 1 "VCC"))
+          (via (at 8.75 20) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net 1 "VCC")))"#;
+        let b1 = Board::from_kicad_pcb(input).unwrap();
+        let written = b1.to_kicad_pcb();
+        let b2 = Board::from_kicad_pcb(&written).unwrap();
+
+        assert_eq!(b1.footprints.len(), b2.footprints.len());
+        assert_eq!(b1.nets, b2.nets);
+        assert_eq!(b1.segments.len(), b2.segments.len());
+        assert_eq!(b1.vias.len(), b2.vias.len());
+        assert_eq!(b1.outline.len(), b2.outline.len());
+        // Footprint positions survive the round-trip
+        let f1 = &b1.footprints[0];
+        let f2 = &b2.footprints[0];
+        assert_eq!(f1.reference, f2.reference);
+        assert!((f1.x - f2.x).abs() < 1e-6 && (f1.y - f2.y).abs() < 1e-6);
+        // Pads survive (absolute positions recomputed identical)
+        assert_eq!(f1.pads.len(), f2.pads.len());
+        for (p1, p2) in f1.pads.iter().zip(&f2.pads) {
+            assert_eq!(p1.number, p2.number);
+            assert!((p1.x - p2.x).abs() < 1e-6, "pad {} x: {} vs {}", p1.number, p1.x, p2.x);
+            assert!((p1.y - p2.y).abs() < 1e-6);
+        }
+        // Copper survives (KiCad tracks carry (net N); the name lives in the net table)
+        let s1 = &b1.segments[0];
+        let s2 = &b2.segments[0];
+        assert!((s1.start.0 - s2.start.0).abs() < 1e-6);
+        assert_eq!(s1.layer, s2.layer);
+        assert_eq!(s1.net.as_ref().map(|n| n.0), s2.net.as_ref().map(|n| n.0));
     }
 
     #[test]

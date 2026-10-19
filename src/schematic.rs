@@ -511,7 +511,7 @@ pub fn run_erc(sch: &Schematic) -> ErcReport {
 
     // 1. Floating pins: any pin not in any derived net, and not covered by a no-connect
     let mut connected_pins: HashSet<(String, String)> = HashSet::new();
-    let mut nc_positions: Vec<(f64, f64)> = sch.no_connects.iter().map(|nc| (nc.x, nc.y)).collect();
+    let nc_positions: Vec<(f64, f64)> = sch.no_connects.iter().map(|nc| (nc.x, nc.y)).collect();
     for net in &nets {
         for (ref_, num, _) in &net.pins {
             connected_pins.insert((ref_.clone(), num.clone()));
