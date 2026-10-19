@@ -1,0 +1,13 @@
+[package]
+name = "someda"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room KiCad-compatible EDA core: s-expression board model, DRC engine, net classes, and the verify-before-done repair loop"
+license = "MIT"
+repository = "https://github.com/kabidey/someda"
+
+[dependencies]
+
+[profile.release]
+lto = true
+strip = true
