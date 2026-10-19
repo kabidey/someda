@@ -47,6 +47,7 @@ pub enum Busy {
     Installing,
     Thinking,
     Building,
+    Fetching,
 }
 
 /// Things that happen; the window produces them, `apply` consumes them.
@@ -72,8 +73,9 @@ pub enum Event {
     Select { question: usize, option: Option<usize>, other: String },
     SubmitAnswers,
     ModelReplied(Result<String, String>),
-    /// Review → build.
+    /// Review → (fetch what the libraries lack) → build.
     StartBuild,
+    LibrariesFetched(super::libfetch::FetchReport),
     BuildOutput(BuildEvent),
     /// Results → edit; the edit prompt; confirm the proposed plan.
     EditRequested,
@@ -102,6 +104,8 @@ pub enum Effect {
     AskModel(ModelCall),
     /// Start the engine; lines come back as `BuildOutput`.
     SpawnBuild(BuildRequest),
+    /// Fetch these footprints (and their 3D models) from KiCad's repositories.
+    FetchLibraries { footprints: Vec<String>, system_model_dir: Option<PathBuf> },
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +179,7 @@ impl AppState {
             ("SOMEDA_API_KEY".into(), self.config.api_key.clone()),
             ("SOMEDA_BASE_URL".into(), self.config.base_url.clone()),
             ("SOMEDA_MODEL".into(), self.config.model.clone()),
+            ("SOMEDA_FETCHED_DIR".into(), super::libfetch::model_dir().display().to_string()),
         ]
     }
 
@@ -233,6 +238,7 @@ impl AppState {
         };
         self.version = project.version;
         let project_dir = project.build_dir(project.version);
+        let log_file = project_dir.join("build.log");
         let deps = self.deps.clone().unwrap_or_default();
         let Some(someda_cli) = deps.someda_cli() else {
             self.status = "The someda engine was not found (Dependencies screen).".into();
@@ -245,10 +251,10 @@ impl AppState {
             project_dir,
             description: plan.description.clone(),
             kicad_cli: deps.kicad_cli(),
-            footprint_dirs: vec![],
+            footprint_dirs: vec![super::libfetch::footprint_dir()],
             model_dir: deps.get("3D models").and_then(|c| c.path.clone()),
             env: self.model_env(),
-            log_file: Some(project_dir.join("build.log")),
+            log_file: Some(log_file),
         };
         self.project = Some(project);
         self.log.clear();
@@ -458,6 +464,19 @@ impl AppState {
                 if self.interview.phase != Phase::Review {
                     return Effect::None;
                 }
+                // Models the renders need and footprints the plan names are
+                // fetched from KiCad's own repositories before the engine runs.
+                let footprints: Vec<String> = plan.components.iter().filter_map(|c| c.footprint.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+                self.busy = Busy::Fetching;
+                self.status = "Checking footprints and 3D models against KiCad's libraries…".into();
+                Effect::FetchLibraries { footprints, system_model_dir: self.deps.as_ref().and_then(|d| d.get("3D models")).and_then(|c| c.path.clone()) }
+            }
+            Event::LibrariesFetched(report) => {
+                self.busy = Busy::None;
+                if report.fetched() > 0 || !report.missing().is_empty() {
+                    self.interview.turns.push(super::interview::Turn::Engine(report.summary()));
+                }
+                let Some(plan) = self.interview.plan.clone() else { return Effect::None };
                 self.start_build(&plan)
             }
             Event::BuildOutput(ev) => {
@@ -613,8 +632,12 @@ mod tests {
           "nets":[{"name":"A","pins":["R1:1","R2:1"]},{"name":"GND","pins":["R1:2","R2:2"]}]}}"#;
         assert_eq!(s.apply(Event::ModelReplied(Ok(plan.into()))), Effect::None);
         assert_eq!(s.interview.phase, Phase::Review, "{:?}", s.interview.error);
-        // build: the plan is saved as v1 and the engine is spawned
+        // build: libraries are checked first, then the plan is saved as v1 and the engine is spawned
         match s.apply(Event::StartBuild) {
+            Effect::FetchLibraries { footprints, .. } => assert_eq!(footprints.len(), 1, "{:?}", footprints),
+            e => panic!("{:?}", e),
+        }
+        match s.apply(Event::LibrariesFetched(Default::default())) {
             Effect::SpawnBuild(req) => {
                 assert!(req.plan_file.ends_with("plan.v1.json"));
                 assert!(req.project_dir.ends_with("build-v1"));

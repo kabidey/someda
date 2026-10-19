@@ -79,6 +79,12 @@ impl App {
                     let _ = tx.send(Event::ModelReplied(r));
                 });
             }
+            Effect::FetchLibraries { footprints, system_model_dir } => {
+                std::thread::spawn(move || {
+                    let r = someda::app::libfetch::fetch_for(&footprints, system_model_dir.as_deref());
+                    let _ = tx.send(Event::LibrariesFetched(r));
+                });
+            }
             Effect::SpawnBuild(req) => {
                 let rx = someda::app::runner::spawn(req);
                 std::thread::spawn(move || {
@@ -312,6 +318,7 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result {
+    someda::app::libfetch::register_env();
     let mut state = AppState::with_config(AppConfig::load());
     // SOMEDA_APP_SCREEN=provider|dependencies: start on that screen (screenshots, tests)
     match std::env::var("SOMEDA_APP_SCREEN").as_deref() {
@@ -322,6 +329,19 @@ fn main() -> eframe::Result {
             state.go(Screen::Dependencies);
         }
         Ok("interview") => {
+            state.go(Screen::Interview);
+        }
+        Ok("review") => {
+            // SOMEDA_APP_PROJECT=<dir>: load its latest plan into the review step
+            if let Some(dir) = std::env::var_os("SOMEDA_APP_PROJECT") {
+                let dir = std::path::PathBuf::from(dir);
+                let v = someda::app::project::Project::latest_version(&dir).unwrap_or(1);
+                let p = someda::app::project::Project { dir, version: v };
+                if let Ok(plan) = p.load_plan(v) {
+                    state.interview.turns.push(someda::app::interview::Turn::User(plan.description.clone()));
+                    let _ = state.interview.accept_plan(plan);
+                }
+            }
             state.go(Screen::Interview);
         }
         Ok("results") => {

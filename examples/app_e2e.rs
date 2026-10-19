@@ -29,6 +29,11 @@ fn run(state: &mut AppState, ev: Event) {
                 let gw = someda::gateway::Gateway::new(state.protocol(), &state.config.base_url, &state.config.api_key, &state.config.model);
                 effect = state.apply(Event::ModelReplied(gw.chat_with_temperature(&call.system, &call.user, Some(0.1)).map_err(|e| e.to_string())));
             }
+            Effect::FetchLibraries { footprints, system_model_dir } => {
+                let r = someda::app::libfetch::fetch_for(&footprints, system_model_dir.as_deref());
+                println!("   libraries: {}", r.summary());
+                effect = state.apply(Event::LibrariesFetched(r));
+            }
             Effect::SpawnBuild(req) => {
                 let rx = someda::app::runner::spawn(req);
                 effect = Effect::None;
@@ -49,6 +54,7 @@ fn run(state: &mut AppState, ev: Event) {
 }
 
 fn main() {
+    someda::app::libfetch::register_env();
     let args: Vec<String> = std::env::args().collect();
     let base_url = args.get(1).cloned().unwrap_or_else(|| "http://127.0.0.1:8765/v1".into());
     let model = args.get(2).cloned().unwrap_or_else(|| "mock-planner".into());

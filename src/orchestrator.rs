@@ -2287,8 +2287,15 @@ pub fn count_missing_models(pcb_text: &str, model_dir: Option<&str>) -> (usize, 
 /// someda-fetched directory has at that absolute file, so kicad-cli renders
 /// it (one KICAD*_3DMODEL_DIR cannot name two directories).
 pub fn resolve_fetched_models(pcb_text: &str, model_dir: Option<&str>) -> String {
-    let Ok(home) = std::env::var("HOME") else { return pcb_text.to_string() };
-    let fetched = format!("{}/.local/share/someda/3dmodels", home);
+    // SOMEDA_FETCHED_DIR: where fetched models live (the desktop app sets it);
+    // default ~/.local/share/someda/3dmodels (the plugin's fetch-libs convention)
+    let fetched = match std::env::var("SOMEDA_FETCHED_DIR") {
+        Ok(d) => d,
+        Err(_) => {
+            let Ok(home) = std::env::var("HOME") else { return pcb_text.to_string() };
+            format!("{}/.local/share/someda/3dmodels", home)
+        }
+    };
     if !std::path::Path::new(&fetched).is_dir() {
         return pcb_text.to_string();
     }

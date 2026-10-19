@@ -111,8 +111,14 @@ fn sibling_binary(name: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     let bin = if cfg!(windows) { format!("{}.exe", name) } else { name.to_string() };
-    // next to the app, or one level up (cargo's target/release/examples/)
-    [dir.join(&bin), dir.parent().map(|d| d.join(&bin)).unwrap_or_default()].into_iter().find(|p| p.is_file())
+    // next to the app; one level up only for cargo's target/<profile>/examples/ layout
+    let mut candidates = vec![dir.join(&bin)];
+    if dir.file_name().and_then(|n| n.to_str()) == Some("examples") {
+        if let Some(p) = dir.parent() {
+            candidates.push(p.join(&bin));
+        }
+    }
+    candidates.into_iter().find(|p| p.is_file())
 }
 
 /// `which`, without a dependency.

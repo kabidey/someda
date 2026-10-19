@@ -6,6 +6,7 @@
 pub mod config;
 pub mod deps;
 pub mod interview;
+pub mod libfetch;
 pub mod project;
 pub mod providers;
 pub mod runner;

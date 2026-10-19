@@ -33,13 +33,46 @@ plan ─▶ schematic ─▶ footprints ─▶ placement ─▶ routing ─▶ a
 - **Six gates** — DRC, shorts, unrouted, pours, Gerbers, drill. All six pass = `HONEST-DONE`; anything else = `NOT DONE`, with the failing gate named.
 - **Repair rounds** — up to `SOMEDA_REPAIR_ROUNDS` (default 3): footprint substitution, a 100 nF capacitor where ERC finds an IC rail without one, regulator output capacitance, board growth when parts overlap or connections stay unrouted (only when the plan fixes no size). Every change is a `repair:` line, every edit only the author can make a `suggest:` line with the exact plan edit, and the plan as built is written to `plan.built.json`.
 
+## The desktop app
+
+`someda-app` is the same engine behind a window, for people who do not want a terminal.
+Double-click it and it walks you through:
+
+1. **Language model** — pick a provider (Anthropic, OpenAI, DeepSeek, Kimi, Mistral, Z.ai,
+   Ollama Cloud, OpenRouter, NVIDIA NIM, a local Ollama, or any OpenAI-compatible endpoint),
+   paste a key, list its models, send one test message. The key is stored in your user config
+   directory (owner-only) and reaches the engine only through its environment.
+2. **KiCad and libraries** — the app finds `kicad-cli` and the footprint, symbol and 3D model
+   libraries, or installs KiCad for you (Linux apt, the official Windows installer silently,
+   the macOS disk image).
+3. **What to build** — you describe the board; the model asks only what changes the design,
+   as multiple-choice questions with a recommended answer; then it proposes a plan. The
+   engine checks every part against the installed KiCad libraries: symbol, footprint, every
+   pin number against the symbol's pin table (shown to you: `U1: 1 GND · 2 TR · 3 Q …`).
+   Misspellings are corrected by the engine, a real choice becomes a question with the real
+   options, a wrong pin goes back to the model with the pin table. Nothing is built until
+   the engine is satisfied.
+4. **Build** — footprints and 3D models the libraries lack are fetched from KiCad's own
+   repositories, then the engine runs exactly as on the command line; you watch its log.
+5. **Result** — the six gates, the 3D render, repairs, suggestions and warnings; buttons
+   open the project folder, the board in KiCad and the JLCPCB package.
+6. **Change the design** — describe the change; the model proposes a revised plan; you see
+   the difference and confirm; the engine builds the next version (every version's plan and
+   outputs are kept).
+
+Verified on Linux under a virtual display with the 555 quick start (all six gates, then an
+edit and all six gates again). The Windows and macOS binaries are built by the same release
+workflow but their KiCad install flows have not been executed on those systems yet.
+
 ## Install
 
 Prebuilt binaries for Linux x86_64, macOS (Apple silicon and Intel) and Windows x86_64 are on the
-[releases page](https://github.com/kabidey/someda/releases). Or build from source with stable Rust (three direct dependencies: `ureq`, `serde`, `serde_json`):
+[releases page](https://github.com/kabidey/someda/releases): each archive holds `someda` (the
+command line) and `someda-app` (the window). Or build from source with stable Rust:
 
 ```bash
-cargo build --release          # target/release/someda
+cargo build --release                               # target/release/someda (three direct dependencies)
+cargo build --release --features app --bin someda-app   # the window (eframe/egui)
 ```
 
 For the verification and export stages you need [KiCad](https://www.kicad.org/) with `kicad-cli`
@@ -181,7 +214,9 @@ src/formulas.rs materials.rs netfreq.rs    physics, JLCPCB stackups, per-net fre
 src/footprint_lib.rs board.rs sexp.rs      KiCad footprints, board model, s-expressions
 src/schematic.rs drc.rs rules.rs           schematic generation + ERC, engine DRC, fab rules
 src/kicad_cli.rs bom.rs jlcpcb.rs          kicad-cli stages, BOM, JLCPCB package
-examples/             plan_555.json, formula_probe (prints every formula), pipeline examples
+src/app/              the desktop app's logic (providers, config, dependencies, symbols, interview, project, runner)
+src/bin/someda-app/   the window (egui), feature "app"
+examples/             plan_555.json, formula_probe (prints every formula), app_e2e (the app's flow headless), pipeline examples
 tests/                corpus of real boards and fixtures
 ```
 
