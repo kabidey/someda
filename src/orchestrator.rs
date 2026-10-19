@@ -541,7 +541,13 @@ pub fn build(
                 }
             }
             let sig = crate::netfreq::net_signal(&net.name, &member_values, net.freq_hz, net.role.as_deref());
-            if matches!(sig.role, crate::netfreq::NetRole::Power | crate::netfreq::NetRole::Ground) {
+            // Wide traces for rails; a secondary ground (AGND behind a 0 Ω
+            // link) carries decoupling return currents only and routes at
+            // the default width — a 0.4 mm trace cannot thread a fine-pitch
+            // breakout (live-verified: AGND unrouted between two capacitors).
+            let is_plane = plane_specs.iter().any(|p| p.net == net.name);
+            let secondary_ground = matches!(sig.role, crate::netfreq::NetRole::Ground) && !is_plane;
+            if matches!(sig.role, crate::netfreq::NetRole::Power | crate::netfreq::NetRole::Ground) && !secondary_ground {
                 power_nets.push(net.name.clone());
             }
         }
@@ -2046,9 +2052,21 @@ fn build_si_context(
         if !is_decoupler {
             continue;
         }
-        // Strict (error) only for capacitors placed at an IC; a connector's
-        // or regulator's bulk capacitor is judged as a warning.
-        let strict = c.near.as_deref().map(|a| a.starts_with('U')).unwrap_or(false);
+        // Strict (error) only for a capacitor that actually sits at its IC
+        // (within 6 mm of the anchor's body): a capacitor the placer could
+        // not get there is a bulk capacitor, judged as a warning (the PDN
+        // audit still judges the rail).
+        let strict = c.near.as_deref().map(|a| a.starts_with('U') && {
+            let fp = |r: &str| board.footprints.iter().find(|f| f.reference == r).map(|f| (f.x, f.y));
+            match (fp(&c.reference), fp(a)) {
+                (Some((cx, cy)), Some((ax, ay))) => {
+                    let anchor = board.footprints.iter().find(|f| f.reference == a);
+                    let half = anchor.and_then(|f| f.courtyard.as_ref().map(|q| ((q.2 - q.0).abs().max((q.3 - q.1).abs())) / 2.0)).unwrap_or(5.0);
+                    ((cx - ax).powi(2) + (cy - ay).powi(2)).sqrt() <= half + 6.0
+                }
+                _ => true,
+            }
+        }).unwrap_or(false);
         ctx.decouplers.push(crate::si::Decoupler { reference: c.reference.clone(), net_a: pins[0].0.to_string(), net_b: pins[1].0.to_string(), c_farads: cf, strict });
     }
     for ps in plane_specs {

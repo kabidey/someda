@@ -1147,6 +1147,25 @@ impl Router {
             }
         }
 
+        // Debug: SOMEDA_ROUTE_DEBUG_NET=<name> prints every routed cell of
+        // that net with the crosstalk map it sat on (xt owner, exempt flag).
+        if let Ok(dbg_net) = std::env::var("SOMEDA_ROUTE_DEBUG_NET") {
+            for r in &state.routed {
+                if net_name(r.net) != dbg_net {
+                    continue;
+                }
+                let Some(ed) = edges.iter().find(|x| x.0 == r.edge_index) else { continue };
+                eprintln!("route-debug: NET {} edge {}:{} → {}:{} ({} cells)", dbg_net, ed.1.from_ref, ed.1.from_pin, ed.1.to_ref, ed.1.to_pin, r.cells.len());
+                for c in &r.cells {
+                    if let Some(i) = grid.idx(c.x, c.y, c.layer) {
+                        let xt = grid.xt[i];
+                        let xt_name = if xt == FREE { "-".to_string() } else if xt == BLOCK { "BLOCK".to_string() } else { net_name(xt as usize - 1) };
+                        eprintln!("route-debug:   ({:.3},{:.3},{}) xt={} exempt={} corridor={}", c.x as f64 * pitch + bx0, c.y as f64 * pitch + by0, self.config.signal_layers[c.layer as usize], xt_name, grid.exempt[i], grid.corridor[i]);
+                    }
+                }
+            }
+        }
+
         // Escape vias that routing did not use stay in place: a via with
         // copper on one layer is electrically harmless (KiCad notes it as
         // via_dangling, a warning). Removing them after the fact broke
