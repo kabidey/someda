@@ -100,6 +100,16 @@ impl RouteResult {
     }
 }
 
+/// A plane's extent on one layer (board-relative mm) with its priority.
+#[derive(Debug, Clone)]
+pub struct PlaneRegion {
+    pub net: String,
+    pub layer: String,
+    /// None = the whole board
+    pub region: Option<(f64, f64, f64, f64)>,
+    pub priority: i32,
+}
+
 /// Router configuration — derived from the design rules.
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
@@ -126,6 +136,8 @@ pub struct RouterConfig {
     pub signal_layers: Vec<String>,
     /// Nets served by copper planes: fanned out to vias, never routed.
     pub plane_nets: Vec<String>,
+    /// Where each plane net's copper actually is (split planes).
+    pub plane_regions: Vec<PlaneRegion>,
     /// Nets routed at `power_trace_width`.
     pub power_nets: Vec<String>,
     /// Longest fanout stub from a plane-net pad to its via (mm).
@@ -136,6 +148,8 @@ pub struct RouterConfig {
     pub via_cost_mm: f64,
     /// Escape lane reserved outward from every fine-pitch pad (mm).
     pub escape_mm: f64,
+    /// Soft-cost band beyond the fine-pitch pad tips (mm).
+    pub escape_band_mm: f64,
 }
 
 impl Default for RouterConfig {
@@ -156,11 +170,13 @@ impl Default for RouterConfig {
             max_expansions: 300_000,
             signal_layers: vec!["F.Cu".into(), "B.Cu".into()],
             plane_nets: Vec::new(),
+            plane_regions: Vec::new(),
             power_nets: Vec::new(),
             fanout_max_mm: 3.0,
             rip_up_passes: 2,
             via_cost_mm: 2.0,
-            escape_mm: 1.2,
+            escape_mm: 1.5,
+            escape_band_mm: 3.5,
         }
     }
 }
@@ -174,7 +190,7 @@ impl RouterConfig {
         plane_nets: Vec<String>,
         power_nets: Vec<String>,
     ) -> RouterConfig {
-        let cells_per_layer_estimate = 1_000_000usize;
+        let cells_per_layer_estimate = 4_000_000usize;
         RouterConfig {
             grid: rules.grid_mm,
             trace_width: rules.trace_width_mm,
@@ -188,11 +204,13 @@ impl RouterConfig {
             max_expansions: cells_per_layer_estimate * signal_layers.len().max(1),
             signal_layers,
             plane_nets,
+            plane_regions: Vec::new(),
             power_nets,
             fanout_max_mm: 3.0,
-            rip_up_passes: 2,
+            rip_up_passes: 3,
             via_cost_mm: 2.0,
-            escape_mm: 1.2,
+            escape_mm: 1.5,
+            escape_band_mm: 3.5,
         }
     }
 }
@@ -268,6 +286,9 @@ struct Grid {
     copper_pad: Vec<u32>,
     /// 2D: a via center may not land here (hole-to-hole / edge)
     via_forbidden: Vec<u8>,
+    /// Per cell/layer extra step cost (×0.25 grid units): the escape bands
+    /// around fine-pitch parts are expensive to run along, cheap to cross.
+    cost: Vec<u8>,
 }
 
 impl Grid {
@@ -281,6 +302,7 @@ impl Grid {
             owner: vec![FREE; n],
             copper_pad: vec![0; n],
             via_forbidden: vec![0; w * h],
+            cost: vec![0; n],
         }
     }
     #[inline]
@@ -514,6 +536,7 @@ impl Router {
         };
 
         // Ratsnest edges to route: everything not on a plane net
+        let mut fallback_edges: Vec<RatsnestEdge> = Vec::new();
         let mut edges: Vec<(usize, &RatsnestEdge, u32, u32, usize)> = Vec::new();
         for (i, e) in netlist.edges.iter().enumerate() {
             let nid = match net_id(&e.net) {
@@ -568,7 +591,46 @@ impl Router {
         let mut grid = Grid::new(w, h, nlayers, pitch);
         let mut dsu = Dsu::new(pads.len());
         self.stamp_static(&mut grid, &pads, bx1 - bx0, by1 - by0);
-        self.fanout_planes(&mut grid, &pads, &plane_ids, &mut state);
+        self.stamp_keepouts(&mut grid, board, bx0, by0);
+        self.fanout_planes(&mut grid, &pads, &plane_ids, &mut state, &net_name);
+        // Plane pads that found no via site are routed as ordinary
+        // connections to the nearest member of their net that did.
+        for &pid in &state.fanout_failed.clone() {
+            let p = &pads[pid as usize];
+            let Some(net) = p.net else { continue };
+            let target = pads
+                .iter()
+                .filter(|q| q.net == Some(net) && q.id != pid && state.fanouts.iter().any(|f| f.pad == q.id))
+                .min_by(|a, b| {
+                    let da = (a.x - p.x).powi(2) + (a.y - p.y).powi(2);
+                    let db = (b.x - p.x).powi(2) + (b.y - p.y).powi(2);
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            if let Some(q) = target {
+                fallback_edges.push(RatsnestEdge {
+                    net: net_name(net),
+                    from_ref: p.reference.clone(),
+                    from_pin: p.number.clone(),
+                    from_x: p.x + bx0,
+                    from_y: p.y + by0,
+                    to_ref: q.reference.clone(),
+                    to_pin: q.number.clone(),
+                    to_x: q.x + bx0,
+                    to_y: q.y + by0,
+                    manhattan_mm: (p.x - q.x).abs() + (p.y - q.y).abs(),
+                });
+                state.fanout_failed.retain(|&f| f != pid);
+            }
+        }
+        let fallback_start = edges.len();
+        for (i, e) in fallback_edges.iter().enumerate() {
+            let a = pad_lookup(&e.from_ref, &e.from_pin, e.from_x, e.from_y);
+            let b = pad_lookup(&e.to_ref, &e.to_pin, e.to_x, e.to_y);
+            if let (Some(a), Some(b), Some(nid)) = (a, b, net_id(&e.net)) {
+                edges.push((netlist.edges.len() + i, e, a, b, nid));
+            }
+        }
+        let order: Vec<usize> = { let mut o = order; o.extend(fallback_start..edges.len()); o };
         let edge_width = |e: &RatsnestEdge, a: u32, b: u32| -> f64 {
             // NECK-DOWN: a wide (power / impedance) trace cannot land on a
             // fine-pitch pad without grazing its neighbour — route that
@@ -642,6 +704,7 @@ impl Router {
                 let mut g2 = Grid::new(w, h, nlayers, pitch);
                 let mut dsu2 = Dsu::new(pads.len());
                 self.stamp_static(&mut g2, &pads, bx1 - bx0, by1 - by0);
+                self.stamp_keepouts(&mut g2, board, bx0, by0);
                 self.replay_fanouts(&mut g2, &pads, &state.fanouts);
                 for r in &trial_routed {
                     self.stamp_path(&mut g2, &r.cells, r.net, r.width, r.from_pad);
@@ -797,6 +860,46 @@ impl Router {
         result
     }
 
+    /// Footprint keep-out areas: tracks blocked on their layers, vias
+    /// forbidden where vias are not allowed.
+    fn stamp_keepouts(&self, grid: &mut Grid, board: &Board, bx0: f64, by0: f64) {
+        let pitch = self.config.grid;
+        let tw2 = self.config.trace_width / 2.0;
+        for fp in &board.footprints {
+            for k in &fp.keepouts {
+                let (x0, y0, x1, y1) = k.bbox();
+                let (gx0, gx1) = (((x0 - bx0 - tw2) / pitch).floor() as i32, ((x1 - bx0 + tw2) / pitch).ceil() as i32);
+                let (gy0, gy1) = (((y0 - by0 - tw2) / pitch).floor() as i32, ((y1 - by0 + tw2) / pitch).ceil() as i32);
+                let layers: Vec<u8> = (0..grid.layers as u8)
+                    .filter(|&l| k.on_layer(&self.config.signal_layers[l as usize]))
+                    .collect();
+                for y in gy0..=gy1 {
+                    for x in gx0..=gx1 {
+                        let (cx, cy) = (x as f64 * pitch + bx0, y as f64 * pitch + by0);
+                        // a track centred here with its half width must stay out
+                        let hit = k.contains(cx, cy)
+                            || k.contains(cx - tw2, cy) || k.contains(cx + tw2, cy)
+                            || k.contains(cx, cy - tw2) || k.contains(cx, cy + tw2);
+                        if !hit {
+                            continue;
+                        }
+                        if k.tracks {
+                            for &l in &layers {
+                                grid.force(x, y, l, BLOCK, 0);
+                                if let Some(i) = grid.idx(x, y, l) {
+                                    grid.copper_pad[i] = 0;
+                                }
+                            }
+                        }
+                        if k.vias && x >= 0 && y >= 0 && (x as usize) < grid.w && (y as usize) < grid.h {
+                            grid.via_forbidden[y as usize * grid.w + x as usize] = 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Cells blocked for everyone: board edge, unnetted pads, NPTH holes;
     /// pad copper and pad halos claimed for their nets.
     fn stamp_static(&self, grid: &mut Grid, pads: &[RPad], bw: f64, bh: f64) {
@@ -896,6 +999,42 @@ impl Router {
                 let (gx, gy) = ((p.x / pitch).round() as i32, (p.y / pitch).round() as i32);
                 for &l in &p.layers {
                     grid.force(gx, gy, l, tag, p.id);
+                }
+            }
+        }
+        // ESCAPE BAND: the region from the fine-pitch pad tips outward to
+        // `escape_band_mm` is expensive to traverse on the pads' layer, so
+        // other nets' traces do not run along a pin row and wall the lane
+        // ends (live-verified: parallel traces at the lane ends trapped
+        // every remaining pin of a side).
+        {
+            let band = self.config.escape_band_mm;
+            let band_cost = 12u8; // 3 grid units per cell
+            for p in pads {
+                if !p.fine_pitch || p.npth || p.through {
+                    continue;
+                }
+                let along_x = p.hx >= p.hy;
+                let dir = if along_x { (p.x - p.fp_cx).signum() } else { (p.y - p.fp_cy).signum() };
+                if dir == 0.0 {
+                    continue;
+                }
+                let half = if along_x { p.hy } else { p.hx };
+                let start = if along_x { p.hx } else { p.hy };
+                for &l in &p.layers {
+                    let steps = (band / pitch).ceil() as i32;
+                    for k in 0..=steps {
+                        let d = start + k as f64 * pitch;
+                        let (cx, cy) = if along_x { (p.x + dir * d, p.y) } else { (p.x, p.y + dir * d) };
+                        let (gx, gy) = ((cx / pitch).round() as i32, (cy / pitch).round() as i32);
+                        let span = ((half + 0.2) / pitch).ceil() as i32;
+                        for t in -span..=span {
+                            let (x, y) = if along_x { (gx, gy + t) } else { (gx + t, gy) };
+                            if let Some(i) = grid.idx(x, y, l) {
+                                grid.cost[i] = grid.cost[i].max(band_cost);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1103,7 +1242,27 @@ impl Router {
 
     /// Plane nets: every SMD pad gets a stub + via; through-hole pads reach
     /// the plane by their barrel.
-    fn fanout_planes(&self, grid: &mut Grid, pads: &[RPad], plane_ids: &[usize], state: &mut RouteState) {
+    /// Does `net`'s plane copper exist under (x, y) on at least one layer
+    /// (inside its region and not under a higher-priority plane there)?
+    fn plane_reaches(&self, net: &str, x: i32, y: i32) -> bool {
+        let (px, py) = (x as f64 * self.config.grid, y as f64 * self.config.grid);
+        let inside = |r: &Option<(f64, f64, f64, f64)>| match r {
+            None => true,
+            Some((x0, y0, x1, y1)) => px >= *x0 && px <= *x1 && py >= *y0 && py <= *y1,
+        };
+        let mine: Vec<&PlaneRegion> = self.config.plane_regions.iter().filter(|p| p.net == net).collect();
+        if mine.is_empty() {
+            return true; // no region knowledge: whole-board planes
+        }
+        mine.iter().any(|p| {
+            inside(&p.region)
+                && !self.config.plane_regions.iter().any(|q| {
+                    q.layer == p.layer && q.net != p.net && q.priority > p.priority && inside(&q.region)
+                })
+        })
+    }
+
+    fn fanout_planes(&self, grid: &mut Grid, pads: &[RPad], plane_ids: &[usize], state: &mut RouteState, net_name_of: &dyn Fn(usize) -> String) {
         let max_cells = (self.config.fanout_max_mm / self.config.grid).ceil() as i32;
         for p in pads {
             let Some(net) = p.net else { continue };
@@ -1135,7 +1294,7 @@ impl Router {
                         found = Some((c, false));
                         break;
                     }
-                    if self.via_ok(grid, c.x, c.y, tag) {
+                    if self.via_ok(grid, c.x, c.y, tag) && self.plane_reaches(&net_name_of(net), c.x, c.y) {
                         found = Some((c, true));
                         break;
                     }
@@ -1275,9 +1434,13 @@ impl Router {
             open.push(Node { cell: *s, f_score: h(s) });
         }
         let mut expansions = 0usize;
+        let debug = std::env::var("SOMEDA_ROUTE_DEBUG").is_ok();
         while let Some(node) = open.pop() {
             expansions += 1;
             if expansions > self.config.max_expansions {
+                if debug {
+                    eprintln!("route-debug: BUDGET {}:{} → {}:{} after {} expansions", pa.reference, pa.number, pb.reference, pb.number, expansions);
+                }
                 return None;
             }
             let g_here = *g_score.get(&node.cell).unwrap_or(&f64::INFINITY);
@@ -1306,7 +1469,8 @@ impl Router {
                 } else {
                     0.0
                 };
-                let tentative = g_here + 1.0 + against;
+                let extra = grid.idx(next.x, next.y, next.layer).map(|i| grid.cost[i] as f64 * 0.25).unwrap_or(0.0);
+                let tentative = g_here + 1.0 + against + extra;
                 if tentative < *g_score.get(&next).unwrap_or(&f64::INFINITY) {
                     came_from.insert(next, node.cell);
                     g_score.insert(next, tentative);
@@ -1331,6 +1495,9 @@ impl Router {
                     }
                 }
             }
+        }
+        if debug {
+            eprintln!("route-debug: NOPATH {}:{} → {}:{} (search exhausted after {} expansions)", pa.reference, pa.number, pb.reference, pb.number, expansions);
         }
         None
     }

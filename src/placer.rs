@@ -82,6 +82,8 @@ pub struct PlaceIntent {
     pub rot: Option<i32>,
     /// Flip to the bottom side.
     pub side_back: bool,
+    /// Edge positions: fraction along the edge (0..1) to start the slide from.
+    pub edge_at: Option<f64>,
 }
 
 /// A keep-together group: members hug the anchor within max_mm.
@@ -162,7 +164,7 @@ fn overlaps(a: Rect, b: Rect, gap: f64) -> bool {
 
 impl Placer {
     pub fn new(board_w: f64, board_h: f64) -> Placer {
-        Placer { board_w, board_h, pitch: 10.0, gap: 0.3, margin: 0.5, escape_ring: 2.0 }
+        Placer { board_w, board_h, pitch: 10.0, gap: 0.6, margin: 0.5, escape_ring: 3.0 }
     }
 
     /// Courtyard-aware placement from real footprint geometry.
@@ -295,7 +297,15 @@ impl Placer {
             let Some(idx) = part_of(&pi.reference) else { continue };
             let p = &parts[idx];
             let pos = pi.pos.unwrap_or(Pos::Center);
-            let (ux, uy) = pos.unit();
+            let (mut ux, mut uy) = pos.unit();
+            if let Some(f) = pi.edge_at {
+                let f = f.clamp(0.0, 1.0);
+                match pos {
+                    Pos::LeftEdge | Pos::RightEdge => uy = f,
+                    Pos::TopEdge | Pos::BottomEdge => ux = f,
+                    _ => {}
+                }
+            }
             let hw = (p.rel.2 - p.rel.0) / 2.0;
             let hh = (p.rel.3 - p.rel.1) / 2.0;
             let (tx, ty) = if pos.is_edge() {
@@ -371,7 +381,37 @@ impl Placer {
             let i = remaining.remove(pick);
             let p = &parts[i];
             let target = if let Some((_, anchor)) = intent.near.iter().find(|(pr, _)| pr == &p.reference) {
-                solved.iter().find(|s| &s.reference == anchor).map(|s| (s.x, s.y))
+                // Aim at the anchor's pads that share a net with this part
+                // (a 1V8 cap goes to the 1V8 pins, not the IC's centre).
+                solved.iter().find(|s| &s.reference == anchor).map(|s| {
+                    let part_nets: std::collections::HashSet<&String> = board
+                        .footprints
+                        .iter()
+                        .find(|f| f.reference == p.reference)
+                        .map(|f| f.pads.iter().filter_map(|pd| pd.net.as_ref().map(|n| &n.1)).filter(|n| !intent.ignore_nets.contains(n)).collect())
+                        .unwrap_or_default();
+                    let afp = board.footprints.iter().find(|f| &f.reference == anchor);
+                    let pts: Vec<(f64, f64)> = afp
+                        .map(|f| {
+                            f.pads
+                                .iter()
+                                .filter(|pd| pd.net.as_ref().map(|n| part_nets.contains(&n.1)).unwrap_or(false))
+                                .map(|pd| (s.x + (pd.x - f.x), s.y + (pd.y - f.y)))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if pts.is_empty() {
+                        (s.x, s.y)
+                    } else {
+                        let n = pts.len() as f64;
+                        let (mx, my) = (pts.iter().map(|q| q.0).sum::<f64>() / n, pts.iter().map(|q| q.1).sum::<f64>() / n);
+                        // push the target outward from the anchor centre so the
+                        // part lands outside the anchor, on the pins' side
+                        let (dx, dy) = (mx - s.x, my - s.y);
+                        let d = (dx * dx + dy * dy).sqrt().max(1e-9);
+                        (mx + dx / d * 4.0, my + dy / d * 4.0)
+                    }
+                })
             } else {
                 None
             }
@@ -606,7 +646,7 @@ mod tests {
         let nl = netlist_2comp(&b);
         let p = Placer::new(100.0, 80.0);
         let intent = PlacementIntent {
-            places: vec![PlaceIntent { reference: "R1".into(), pos: Pos::parse("top_left"), rot: None, side_back: false }],
+            places: vec![PlaceIntent { reference: "R1".into(), pos: Pos::parse("top_left"), rot: None, side_back: false, edge_at: None }],
             ..Default::default()
         };
         let solved = p.arrange(&b, &nl, &intent);
@@ -677,7 +717,7 @@ mod tests {
         let nl = Netlist::from_board(&b);
         let p = Placer::new(40.0, 30.0);
         let intent = PlacementIntent {
-            places: vec![PlaceIntent { reference: "J1".into(), pos: Pos::parse("left_edge"), rot: None, side_back: false }],
+            places: vec![PlaceIntent { reference: "J1".into(), pos: Pos::parse("left_edge"), rot: None, side_back: false, edge_at: None }],
             ignore_nets: vec!["GND".into()],
             ..Default::default()
         };
@@ -704,7 +744,7 @@ mod tests {
         let u1 = solved.iter().find(|s| s.reference == "U1").unwrap();
         for s in solved.iter().filter(|s| s.reference.starts_with('C')) {
             let d = ((s.x - u1.x).powi(2) + (s.y - u1.y).powi(2)).sqrt();
-            assert!(d < 10.0, "{} is {:.1}mm from U1", s.reference, d);
+            assert!(d < 13.0, "{} is {:.1}mm from U1 (gap 0.6 ring)", s.reference, d);
         }
     }
 }

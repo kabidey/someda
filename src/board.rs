@@ -96,6 +96,43 @@ impl Pad {
     }
 }
 
+/// A keep-out area (absolute board mm) carried by a footprint.
+#[derive(Debug, Clone)]
+pub struct Keepout {
+    pub layers: Vec<String>,
+    pub polygon: Vec<(f64, f64)>,
+    pub tracks: bool,
+    pub vias: bool,
+}
+
+impl Keepout {
+    pub fn on_layer(&self, layer: &str) -> bool {
+        self.layers.iter().any(|l| l == layer || l == "*.Cu" || (l == "F&B.Cu" && (layer == "F.Cu" || layer == "B.Cu")))
+    }
+    /// Even-odd point-in-polygon.
+    pub fn contains(&self, x: f64, y: f64) -> bool {
+        let n = self.polygon.len();
+        let mut inside = false;
+        let mut j = n - 1;
+        for i in 0..n {
+            let (xi, yi) = self.polygon[i];
+            let (xj, yj) = self.polygon[j];
+            if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+                inside = !inside;
+            }
+            j = i;
+        }
+        inside
+    }
+    pub fn bbox(&self) -> (f64, f64, f64, f64) {
+        let mut b = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for &(x, y) in &self.polygon {
+            b.0 = b.0.min(x); b.1 = b.1.min(y); b.2 = b.2.max(x); b.3 = b.3.max(y);
+        }
+        b
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Footprint {
     pub reference: String,
@@ -109,6 +146,8 @@ pub struct Footprint {
     /// Courtyard bbox relative to the origin in the footprint's own
     /// (unrotated) frame: (min_x, min_y, max_x, max_y)
     pub courtyard: Option<(f64, f64, f64, f64)>,
+    /// Keep-out areas (absolute) the router must honour
+    pub keepouts: Vec<Keepout>,
     /// The library definition this footprint was instantiated from, if
     /// any. The writer re-emits it verbatim (with placement, reference
     /// and pad nets injected) so silkscreen, fab and 3D data survive.
@@ -149,13 +188,19 @@ impl Footprint {
         out
     }
 
-    /// Move the footprint (and its absolute pads) by a delta.
+    /// Move the footprint (and its absolute pads / keep-outs) by a delta.
     pub fn translate(&mut self, dx: f64, dy: f64) {
         self.x += dx;
         self.y += dy;
         for p in &mut self.pads {
             p.x += dx;
             p.y += dy;
+        }
+        for k in &mut self.keepouts {
+            for pt in &mut k.polygon {
+                pt.0 += dx;
+                pt.1 += dy;
+            }
         }
     }
 }
@@ -204,6 +249,8 @@ pub struct Zone {
     pub polygon: Vec<(f64, f64)>,
     pub clearance: f64,
     pub min_thickness: f64,
+    /// Higher priority fills first where zones overlap (split planes)
+    pub priority: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -453,8 +500,8 @@ impl Board {
                 .map(|(x, y)| format!("(xy {:.4} {:.4})", x, y))
                 .collect();
             out.push_str(&format!(
-                "  (zone (net {}) (net_name \"{}\") (layer \"{}\") (hatch edge 0.508)\n    (connect_pads (clearance {:.3}))\n    (min_thickness {:.3}) (filled_areas_thickness no)\n    (fill yes (thermal_gap 0.3) (thermal_bridge_width 0.3))\n    (polygon (pts {}))\n  )\n",
-                z.net.0, z.net.1, z.layer, z.clearance, z.min_thickness, pts.join(" ")
+                "  (zone (net {}) (net_name \"{}\") (layer \"{}\") (hatch edge 0.508) (priority {})\n    (connect_pads (clearance {:.3}))\n    (min_thickness {:.3}) (filled_areas_thickness no)\n    (fill yes (thermal_gap 0.3) (thermal_bridge_width 0.3))\n    (polygon (pts {}))\n  )\n",
+                z.net.0, z.net.1, z.layer, z.priority, z.clearance, z.min_thickness, pts.join(" ")
             ));
         }
 
@@ -574,6 +621,13 @@ fn emit_library_footprint(fp: &Footprint) -> String {
     let mut saw_reference = false;
     for c in items.iter_mut() {
         if let Sexp::List(parts) = c {
+            // Footprint zones (keep-outs) are stored in ABSOLUTE board
+            // coordinates inside a .kicad_pcb, unlike pads and graphics
+            // (live-verified: a verbatim relative polygon landed at the
+            // board origin and KiCad flagged items_not_allowed there).
+            if parts.first().and_then(|p| p.atom()) == Some("zone") {
+                transform_zone_points(parts, fp.x, fp.y, fp.rotation);
+            }
             if parts.len() >= 3 && parts[0].atom() == Some("property") {
                 match parts[1].str_value() {
                     Some("Reference") => {
@@ -631,6 +685,64 @@ fn emit_library_footprint(fp: &Footprint) -> String {
         ]));
     }
     format!("  {}\n", Sexp::List(items))
+}
+
+/// Rotate+translate every (xy ...) of a footprint zone's polygon.
+fn transform_zone_points(parts: &mut [Sexp], fx: f64, fy: f64, rot: f64) {
+    for sub in parts.iter_mut() {
+        if let Sexp::List(poly) = sub {
+            if poly.first().and_then(|p| p.atom()) != Some("polygon") {
+                continue;
+            }
+            for pp in poly.iter_mut() {
+                if let Sexp::List(pts) = pp {
+                    if pts.first().and_then(|p| p.atom()) != Some("pts") {
+                        continue;
+                    }
+                    for xy in pts.iter_mut() {
+                        if let Sexp::List(v) = xy {
+                            if v.first().and_then(|p| p.atom()) == Some("xy") && v.len() >= 3 {
+                                if let (Some(x), Some(y)) = (v[1].f64_value(), v[2].f64_value()) {
+                                    let (ox, oy) = rotate_offset(x, y, rot);
+                                    v[1] = Sexp::Atom(format!("{:.4}", fx + ox));
+                                    v[2] = Sexp::Atom(format!("{:.4}", fy + oy));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Inverse of [`transform_zone_points`]: absolute → footprint-relative.
+fn untransform_zone_points(parts: &mut [Sexp], fx: f64, fy: f64, rot: f64) {
+    for sub in parts.iter_mut() {
+        if let Sexp::List(poly) = sub {
+            if poly.first().and_then(|p| p.atom()) != Some("polygon") {
+                continue;
+            }
+            for pp in poly.iter_mut() {
+                if let Sexp::List(pts) = pp {
+                    if pts.first().and_then(|p| p.atom()) != Some("pts") {
+                        continue;
+                    }
+                    for xy in pts.iter_mut() {
+                        if let Sexp::List(v) = xy {
+                            if v.first().and_then(|p| p.atom()) == Some("xy") && v.len() >= 3 {
+                                if let (Some(x), Some(y)) = (v[1].f64_value(), v[2].f64_value()) {
+                                    let (rx, ry) = inverse_rotate(x - fx, y - fy, rot);
+                                    v[1] = Sexp::Atom(format!("{:.4}", rx));
+                                    v[2] = Sexp::Atom(format!("{:.4}", ry));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn trim_angle(a: f64) -> String {
@@ -772,9 +884,27 @@ fn parse_footprint(item: &Sexp, nets: &[(usize, String)]) -> Option<Footprint> {
         rotation,
         pads,
         courtyard: lib.courtyard,
-        // Stored sources always carry LIBRARY-relative pad angles; a board
-        // file has absolute ones, so subtract the footprint rotation.
-        source: Some(shift_pad_angles(item, -rotation)),
+        // Board-file zone polygons are already absolute
+        keepouts: lib
+            .keepouts
+            .iter()
+            .map(|k| Keepout { layers: k.layers.clone(), polygon: k.polygon.clone(), tracks: k.tracks, vias: k.vias })
+            .collect(),
+        // Stored sources always carry LIBRARY-relative pad angles and zone
+        // points; a board file has absolute ones, so undo the placement.
+        source: Some({
+            let mut src = shift_pad_angles(item, -rotation);
+            if let Sexp::List(items) = &mut src {
+                for c in items.iter_mut() {
+                    if let Sexp::List(parts) = c {
+                        if parts.first().and_then(|p| p.atom()) == Some("zone") {
+                            untransform_zone_points(parts, x, y, rotation);
+                        }
+                    }
+                }
+            }
+            src
+        }),
     })
 }
 
@@ -874,9 +1004,13 @@ fn parse_zone(item: &Sexp, nets: &[(usize, String)]) -> Option<Zone> {
     let mut polygon = Vec::new();
     let mut clearance = 0.2;
     let mut min_thickness = 0.25;
+    let mut priority = 0;
     for child in items {
         if let Some(n) = child.as_tagged("net") {
             net = resolve_net(n, nets);
+        }
+        if let Some(pr) = child.as_tagged("priority") {
+            priority = pr.first().and_then(|s| s.f64_value()).unwrap_or(0.0) as i32;
         }
         if let Some(n) = child.as_tagged("net_name") {
             net_name = n.first().and_then(|s| s.str_value()).map(String::from);
@@ -915,7 +1049,7 @@ fn parse_zone(item: &Sexp, nets: &[(usize, String)]) -> Option<Zone> {
     if name.is_empty() {
         name = net_name.unwrap_or_default();
     }
-    Some(Zone { net: (idx, name), layer, polygon, clearance, min_thickness })
+    Some(Zone { net: (idx, name), layer, polygon, clearance, min_thickness, priority })
 }
 
 #[cfg(test)]
@@ -1062,7 +1196,7 @@ mod tests {
         b.layer_count = 6;
         b.nets.push((1, "GND".into()));
         b.outline = vec![((0.0, 0.0), (10.0, 0.0)), ((10.0, 0.0), (10.0, 10.0)), ((10.0, 10.0), (0.0, 10.0)), ((0.0, 10.0), (0.0, 0.0))];
-        b.zones.push(Zone { net: (1, "GND".into()), layer: "In1.Cu".into(), polygon: vec![(0.5, 0.5), (9.5, 0.5), (9.5, 9.5), (0.5, 9.5)], clearance: 0.2, min_thickness: 0.25 });
+        b.zones.push(Zone { net: (1, "GND".into()), layer: "In1.Cu".into(), polygon: vec![(0.5, 0.5), (9.5, 0.5), (9.5, 9.5), (0.5, 9.5)], clearance: 0.2, min_thickness: 0.25, priority: 0 });
         let out = b.to_kicad_pcb();
         for l in ["F.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu", "B.Cu", "F.Mask", "B.Mask", "F.Paste", "F.SilkS", "F.CrtYd", "Edge.Cuts"] {
             assert!(out.contains(&format!("\"{}\"", l)), "layer {} missing", l);

@@ -31,11 +31,23 @@ pub struct LibPad {
     pub net_hint: Option<Vec<Sexp>>,
 }
 
+/// A keep-out area inside a footprint (e.g. a card socket's slot).
+#[derive(Debug, Clone)]
+pub struct LibKeepout {
+    /// Copper layers it applies to ("F.Cu", "B.Cu", "*.Cu"...)
+    pub layers: Vec<String>,
+    /// Polygon relative to the footprint origin (unrotated)
+    pub polygon: Vec<(f64, f64)>,
+    pub tracks: bool,
+    pub vias: bool,
+}
+
 /// A parsed library footprint.
 #[derive(Debug, Clone)]
 pub struct LibFootprint {
     pub name: String,
     pub pads: Vec<LibPad>,
+    pub keepouts: Vec<LibKeepout>,
     /// Courtyard bbox relative to origin: (min_x, min_y, max_x, max_y)
     pub courtyard: Option<(f64, f64, f64, f64)>,
     pub is_smd: bool,
@@ -124,6 +136,23 @@ impl LibFootprint {
                 items[1] = Sexp::Str(lib_id.to_string());
             }
         }
+        let keepouts = self
+            .keepouts
+            .iter()
+            .map(|k| crate::board::Keepout {
+                layers: k.layers.clone(),
+                polygon: k
+                    .polygon
+                    .iter()
+                    .map(|&(px, py)| {
+                        let (ox, oy) = crate::board::rotate_offset(px, py, rotation);
+                        (x + ox, y + oy)
+                    })
+                    .collect(),
+                tracks: k.tracks,
+                vias: k.vias,
+            })
+            .collect();
         Footprint {
             reference: reference.to_string(),
             lib_name: lib_id.to_string(),
@@ -133,6 +162,7 @@ impl LibFootprint {
             rotation,
             pads,
             courtyard: self.courtyard,
+            keepouts,
             source: Some(sexp),
         }
     }
@@ -208,9 +238,15 @@ pub fn parse_footprint_sexp(doc: &Sexp) -> Result<LibFootprint, String> {
     }
     let name = items.get(1).and_then(|s| s.str_value()).unwrap_or("").to_string();
     let mut pads = Vec::new();
+    let mut keepouts = Vec::new();
     let mut crt = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
     let mut is_smd = false;
     for child in items.iter().skip(2) {
+        if let Some(z) = child.as_tagged("zone") {
+            if let Some(k) = parse_keepout(z) {
+                keepouts.push(k);
+            }
+        }
         if let Some(attr) = child.as_tagged("attr") {
             if attr.iter().any(|a| a.atom() == Some("smd")) {
                 is_smd = true;
@@ -251,7 +287,52 @@ pub fn parse_footprint_sexp(doc: &Sexp) -> Result<LibFootprint, String> {
     if !is_smd {
         is_smd = !pads.is_empty() && pads.iter().all(|p| p.pad_type == PadType::Smd);
     }
-    Ok(LibFootprint { name, pads, courtyard, is_smd, sexp: doc.clone() })
+    Ok(LibFootprint { name, pads, keepouts, courtyard, is_smd, sexp: doc.clone() })
+}
+
+/// `(zone ... (keepout (tracks not_allowed) (vias not_allowed) ...) (polygon (pts ...)))`
+fn parse_keepout(z: &[Sexp]) -> Option<LibKeepout> {
+    let mut layers = Vec::new();
+    let mut polygon = Vec::new();
+    let mut tracks = false;
+    let mut vias = false;
+    let mut is_keepout = false;
+    for c in z {
+        if let Some(l) = c.as_tagged("layer") {
+            layers.extend(l.iter().filter_map(|v| v.str_value()).map(String::from));
+        }
+        if let Some(l) = c.as_tagged("layers") {
+            layers.extend(l.iter().filter_map(|v| v.str_value()).map(String::from));
+        }
+        if let Some(k) = c.as_tagged("keepout") {
+            is_keepout = true;
+            for rule in k {
+                if let Some(v) = rule.as_tagged("tracks") {
+                    tracks = v.first().and_then(|a| a.atom()) == Some("not_allowed");
+                }
+                if let Some(v) = rule.as_tagged("vias") {
+                    vias = v.first().and_then(|a| a.atom()) == Some("not_allowed");
+                }
+            }
+        }
+        if let Some(poly) = c.as_tagged("polygon") {
+            for pp in poly {
+                if let Some(pts) = pp.as_tagged("pts") {
+                    for xy in pts {
+                        if let Some(v) = xy.as_tagged("xy") {
+                            if let (Some(x), Some(y)) = (v.first().and_then(|a| a.f64_value()), v.get(1).and_then(|a| a.f64_value())) {
+                                polygon.push((x, y));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !is_keepout || polygon.len() < 3 || !(tracks || vias) {
+        return None;
+    }
+    Some(LibKeepout { layers, polygon, tracks, vias })
 }
 
 fn graphic_points(parts: &[Sexp], tag: &str) -> Vec<(f64, f64)> {
@@ -437,6 +518,23 @@ mod tests {
         let bp2 = &back.footprints[0].pads[1];
         assert!((bp2.x - 10.54).abs() < 1e-6 && (bp2.y - 20.0).abs() < 1e-6, "{:?}", bp2);
         assert_eq!(back.footprints[0].reference, "J1");
+    }
+
+    #[test]
+    fn parses_keepout_zones() {
+        let fp = parse_kicad_mod(r#"(footprint "K" (layer "F.Cu")
+            (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+            (zone (layer "F.Cu") (hatch full 0.508) (keepout (tracks not_allowed) (vias not_allowed) (pads not_allowed) (copperpour not_allowed) (footprints allowed))
+              (polygon (pts (xy -2 -2) (xy 2 -2) (xy 2 2) (xy -2 2))))
+        )"#).unwrap();
+        assert_eq!(fp.keepouts.len(), 1);
+        assert!(fp.keepouts[0].tracks && fp.keepouts[0].vias);
+        assert_eq!(fp.keepouts[0].layers, vec!["F.Cu"]);
+        let placed = fp.instantiate("J1", "x", "L:K", 10.0, 10.0, 90.0, &|_| None);
+        assert_eq!(placed.keepouts[0].polygon.len(), 4);
+        // rotated 90°: rel (-2,-2) → (10 + (-2·0 + -2·1), 10 + (2·1 + -2·0)) = (8, 12)
+        let p0 = placed.keepouts[0].polygon[0];
+        assert!((p0.0 - 8.0).abs() < 1e-9 && (p0.1 - 12.0).abs() < 1e-9, "{:?}", p0);
     }
 
     #[test]

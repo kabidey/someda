@@ -40,10 +40,26 @@ pub struct BoardSpec {
 }
 
 /// A copper plane: `net` fills copper layer `layer` (e.g. "In1.Cu").
+/// With `region` (x0, y0, x1, y1 in mm from the board's top-left corner)
+/// the plane covers only that rectangle; a higher `priority` wins where
+/// planes overlap (split power planes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaneSpec {
     pub net: String,
     pub layer: String,
+    /// `[x0, y0, x1, y1]` in mm, or "auto" = the bounding box of the net's
+    /// pads after placement plus a 2 mm margin.
+    #[serde(default)]
+    pub region: Option<PlaneRegionSpec>,
+    #[serde(default)]
+    pub priority: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PlaneRegionSpec {
+    Rect([f64; 4]),
+    Auto(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +90,10 @@ pub struct PlannedComponent {
     /// Keep this part next to another reference (decoupling caps hug their IC).
     #[serde(default)]
     pub near: Option<String>,
+    /// For edge positions: where along the edge (0.0 = left/top end,
+    /// 1.0 = right/bottom end). Still intent, not a coordinate.
+    #[serde(default)]
+    pub edge_at: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,6 +298,7 @@ pub fn build(
                         pos: Some(p),
                         rot: c.rotation.map(|r| r as i32),
                         side_back: false,
+                        edge_at: c.edge_at,
                     }),
                     None => println!("  [warning] {}: unknown position '{}' ignored", c.reference, pos),
                 }
@@ -351,16 +372,57 @@ pub fn build(
         .into_iter()
         .filter(|l| !plane_layers.contains(l))
         .collect();
+    // Resolve plane regions now that pads are placed ("auto" = pad bbox + 2mm)
+    let mut plane_rects: Vec<Option<(f64, f64, f64, f64)>> = Vec::new();
     for ps in &plane_specs {
+        let (bx0, by0, _, _) = board.outline_bbox().unwrap_or((0.0, 0.0, 100.0, 80.0));
+        let r = match &ps.region {
+            None => None,
+            Some(PlaneRegionSpec::Rect([x0, y0, x1, y1])) => Some((*x0, *y0, *x1, *y1)),
+            Some(PlaneRegionSpec::Auto(_)) => {
+                // The island follows the footprint that owns most of the
+                // net's pins (the SoC's rail pins) plus 3.5mm for the
+                // decoupling caps hugging them. Pads elsewhere are routed
+                // to the island as traces.
+                let anchor = board
+                    .footprints
+                    .iter()
+                    .max_by_key(|fp| fp.pads.iter().filter(|pd| pd.net.as_ref().map(|n| n.1 == ps.net).unwrap_or(false)).count());
+                let mut b = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+                if let Some(fp) = anchor {
+                    for pd in &fp.pads {
+                        if pd.net.as_ref().map(|n| n.1 == ps.net).unwrap_or(false) {
+                            b.0 = b.0.min(pd.x - bx0); b.1 = b.1.min(pd.y - by0);
+                            b.2 = b.2.max(pd.x - bx0); b.3 = b.3.max(pd.y - by0);
+                        }
+                    }
+                }
+                if b.0.is_finite() { Some((b.0 - 3.5, b.1 - 3.5, b.2 + 3.5, b.3 + 3.5)) } else { None }
+            }
+        };
+        if let Some(r) = r {
+            println!("  plane {} on {}: region x {:.1}..{:.1} y {:.1}..{:.1} (priority {})", ps.net, ps.layer, r.0, r.2, r.1, r.3, ps.priority.unwrap_or(0));
+        }
+        plane_rects.push(r);
+    }
+    for (pi, ps) in plane_specs.iter().enumerate() {
         if let Some((idx, name)) = board.nets.iter().find(|(_, n)| n == &ps.net).cloned() {
-            let (x0, y0, x1, y1) = board.outline_bbox().unwrap_or((0.0, 0.0, 100.0, 80.0));
+            let (bx0, by0, bx1, by1) = board.outline_bbox().unwrap_or((0.0, 0.0, 100.0, 80.0));
             let m = rules.edge_clearance_mm;
+            let (x0, y0, x1, y1) = match plane_rects[pi] {
+                Some((rx0, ry0, rx1, ry1)) => (
+                    (bx0 + rx0).max(bx0 + m), (by0 + ry0).max(by0 + m),
+                    (bx0 + rx1).min(bx1 - m), (by0 + ry1).min(by1 - m),
+                ),
+                None => (bx0 + m, by0 + m, bx1 - m, by1 - m),
+            };
             board.zones.push(crate::board::Zone {
                 net: (idx, name),
                 layer: ps.layer.clone(),
-                polygon: vec![(x0 + m, y0 + m), (x1 - m, y0 + m), (x1 - m, y1 - m), (x0 + m, y1 - m)],
+                polygon: vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
                 clearance: rules.clearance_mm.max(0.2),
                 min_thickness: 0.25,
+                priority: ps.priority.unwrap_or(0),
             });
         }
     }
@@ -394,12 +456,22 @@ pub fn build(
                 power_nets.push(net.name.clone());
             }
         }
-        let cfg = crate::router::RouterConfig::from_rules(
+        let mut cfg = crate::router::RouterConfig::from_rules(
             &rules,
             signal_layers.clone(),
             plane_specs.iter().map(|p| p.net.clone()).collect(),
             power_nets,
         );
+        cfg.plane_regions = plane_specs
+            .iter()
+            .enumerate()
+            .map(|(i, p)| crate::router::PlaneRegion {
+                net: p.net.clone(),
+                layer: p.layer.clone(),
+                region: plane_rects[i],
+                priority: p.priority.unwrap_or(0),
+            })
+            .collect();
         let mut router = crate::router::Router::new(cfg).stackup_with(stackup.clone());
         for net in &plan.nets {
             let mut member_values: Vec<&str> = Vec::new();
@@ -847,7 +919,7 @@ pub fn resolve_planes(plan: &CircuitPlan, board: &crate::board::Board) -> Vec<Pl
     }
     let gnd = ["GND", "GNDD", "AGND", "VSS"].iter().find(|n| has(n)).map(|s| s.to_string());
     let Some(gnd) = gnd else { return out };
-    out.push(PlaneSpec { net: gnd.clone(), layer: "In1.Cu".into() });
+    out.push(PlaneSpec { net: gnd.clone(), layer: "In1.Cu".into(), region: None, priority: None });
     if board.layer_count >= 6 {
         // the busiest power net becomes the In3 plane
         let mut best: Option<(usize, String)> = None;
@@ -860,9 +932,9 @@ pub fn resolve_planes(plan: &CircuitPlan, board: &crate::board::Board) -> Vec<Pl
             }
         }
         if let Some((_, pwr)) = best {
-            out.push(PlaneSpec { net: pwr, layer: "In3.Cu".into() });
+            out.push(PlaneSpec { net: pwr, layer: "In3.Cu".into(), region: None, priority: None });
         }
-        out.push(PlaneSpec { net: gnd, layer: "In4.Cu".into() });
+        out.push(PlaneSpec { net: gnd, layer: "In4.Cu".into(), region: None, priority: None });
     }
     out
 }
@@ -972,6 +1044,7 @@ pub fn generate_schematic(plan: &CircuitPlan) -> String {
     // Place symbols in a grid: 50mm apart, 2 per row
     let mut lib_symbols = String::new();
     let mut symbols = String::new();
+    let mut emitted_symbols: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (i, comp) in plan.components.iter().enumerate() {
         // KiCad schematic grid: 1.27 mm (50 mil). Snap the symbol origin so
@@ -981,20 +1054,9 @@ pub fn generate_schematic(plan: &CircuitPlan) -> String {
         let x = snap(comp.x_mm.unwrap_or(50.8 + (i % 2) as f64 * 63.5));
         let y = snap(comp.y_mm.unwrap_or(50.8 + (i / 2) as f64 * 38.1));
 
-        // Embed a minimal lib symbol for this component type
-        let lib_name = &comp.lib_id;
-        // KiCad requires sub-symbol names as "libname:Name_unit_style" (e.g. "Device:R_0_1")
-        let base_name = lib_name.split(':').last().unwrap_or(lib_name);
-        let sub_name = format!("{}_0_1", base_name);
-        lib_symbols.push_str(&format!(
-            "    (symbol \"{}\" (pin_names (offset 0.254))\n      (symbol \"{}\"\n",
-            lib_name, sub_name
-        ));
         // ONE SYMBOL PIN PER PLAN-REFERENCED PIN — mirror of the board fix.
-        // (Live-validated: the 2-pin-only schematic dropped U1:3/U1:8,
-        // so ERC saw pins_not_connected for pins the plan actually uses.)
         let mut pin_nums: Vec<String> = Vec::new();
-        for (net_index, net) in plan.nets.iter().enumerate() {
+        for net in plan.nets.iter() {
             for pin in &net.pins {
                 if let Some((refdes, num)) = pin.split_once(':') {
                     if refdes == comp.reference && !pin_nums.iter().any(|p| p == num) {
@@ -1003,6 +1065,26 @@ pub fn generate_schematic(plan: &CircuitPlan) -> String {
                 }
             }
         }
+        // Embed a lib symbol per (lib_id, pin set): two "Device:C" parts
+        // using different pins must not share one definition (the parser
+        // keeps one, and the other's pins float — live-verified ERC noise).
+        let lib_name = symbol_name_for(&comp.lib_id, &pin_nums);
+        let base_name = lib_name.split(':').last().unwrap_or(&lib_name).to_string();
+        let sub_name = format!("{}_0_1", base_name);
+        if !emitted_symbols.insert(lib_name.clone()) {
+            // definition already written: only place the instance below
+            symbols.push_str(&format!(
+                "  (symbol (lib_id \"{}\") (at {:.2} {:.2} 0) (unit 1)\n\
+                 (property \"Reference\" \"{}\" (at 0 -5 0))\n\
+                 (property \"Value\" \"{}\" (at 0 5 0))\n  )\n",
+                lib_name, x, y, comp.reference, comp.value
+            ));
+            continue;
+        }
+        lib_symbols.push_str(&format!(
+            "    (symbol \"{}\" (pin_names (offset 0.254))\n      (symbol \"{}\"\n",
+            lib_name, sub_name
+        ));
         // Components no net references (mounting holes, mechanical parts)
         // get a pin-less symbol: nothing to float, nothing to connect.
         // Pin geometry: 2 pins inline; >2 pins on a DIP rectangle
@@ -1131,6 +1213,18 @@ pub fn generate_schematic(plan: &CircuitPlan) -> String {
     out.push_str(&symbols);
     out.push_str(")\n");
     out
+}
+
+/// The embedded symbol name for a lib_id with a given pin set: the lib_id
+/// itself when the part uses pins "1".."n" in order, otherwise suffixed
+/// with the pin list so different pin sets never collide.
+fn symbol_name_for(lib_id: &str, pins: &[String]) -> String {
+    let canonical = pins.iter().enumerate().all(|(i, p)| p == &(i + 1).to_string());
+    if canonical && !pins.is_empty() {
+        return lib_id.to_string();
+    }
+    let sig: String = pins.iter().map(|p| p.replace(|c: char| !c.is_ascii_alphanumeric(), "_")).collect::<Vec<_>>().join("_");
+    format!("{}__p{}", lib_id, sig)
 }
 
 /// Parse "REF:PIN" to (x, y) using the component placement grid.
@@ -1325,6 +1419,7 @@ fn synthetic_footprint(
         rotation,
         pads: Vec::new(),
         courtyard: None,
+        keepouts: Vec::new(),
         source: None,
     };
     // ONE PAD PER PLAN-REFERENCED PIN — never a fixed 2-pad model.

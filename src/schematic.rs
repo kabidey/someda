@@ -133,18 +133,30 @@ impl Schematic {
 
     /// All pins of an instance, resolved from its lib symbol.
     pub fn instance_pins(&self, inst: &Instance) -> Vec<(String, String, f64, f64)> {
-        // lib_id may be "lib:NAME" or "lib:NAME_N" (unit variant); match base name
+        // Exact lib_id first; then "lib:NAME_N" (a unit variant) against
+        // "lib:NAME". Never truncate at the first underscore: "Conn_01x03"
+        // and "Conn_02x13" are different symbols, "Crystal" is not
+        // "Crystal_GND24" (live-verified ERC noise from that shortcut).
+        let resolve = |lib: &LibSymbol| -> Vec<(String, String, f64, f64)> {
+            lib.pins.iter().map(|p| {
+                let (ax, ay) = self.pin_absolute(inst, p);
+                (p.number.clone(), p.name.clone(), ax, ay)
+            }).collect()
+        };
+        if let Some(lib) = self.lib_symbols.iter().find(|l| l.name == inst.lib_id) {
+            return resolve(lib);
+        }
         let base = inst.lib_id.rsplit(':').next().unwrap_or("");
-        let base = base.split('_').next().unwrap_or(base);
-        for lib in &self.lib_symbols {
-            let lib_base = lib.name.rsplit(':').next().unwrap_or("");
-            let lib_base = lib_base.split('_').next().unwrap_or(lib_base);
-            if lib_base == base {
-                return lib.pins.iter().map(|p| {
-                    let (ax, ay) = self.pin_absolute(inst, p);
-                    (p.number.clone(), p.name.clone(), ax, ay)
-                }).collect();
-            }
+        if let Some(lib) = self.lib_symbols.iter().find(|l| l.name.rsplit(':').next().unwrap_or("") == base) {
+            return resolve(lib);
+        }
+        // unit variant: strip a trailing _<digits>
+        let stripped = match base.rfind('_') {
+            Some(i) if base[i + 1..].chars().all(|c| c.is_ascii_digit()) && i + 1 < base.len() => &base[..i],
+            _ => base,
+        };
+        if let Some(lib) = self.lib_symbols.iter().find(|l| l.name.rsplit(':').next().unwrap_or("") == stripped) {
+            return resolve(lib);
         }
         Vec::new()
     }
