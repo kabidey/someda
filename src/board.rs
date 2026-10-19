@@ -191,13 +191,17 @@ fn parse_pad(child: &Sexp, fp_at: Option<(f64, f64, f64)>) -> Option<Pad> {
     }
 
     let (rx, ry) = rel_at?;
-    let (fx, fy, _rot) = fp_at?;
+    let (fx, fy, rot) = fp_at?;
     let (w, h) = size.unwrap_or((0.0, 0.0));
+    // KiCad rotates pad offsets by the footprint rotation
+    let r = rot.to_radians();
+    let ox = rx * r.cos() - ry * r.sin();
+    let oy = rx * r.sin() + ry * r.cos();
     Some(Pad {
         number,
         net,
-        x: fx + rx,
-        y: fy + ry,
+        x: fx + ox,
+        y: fy + oy,
         width: w,
         height: h,
     })
@@ -239,6 +243,33 @@ mod tests {
         assert!((p1.x - 65.766).abs() < 1e-9);
         assert!((p1.y - 20.889).abs() < 1e-9);
         assert_eq!(p1.net.as_ref().unwrap().1, "GND");
+    }
+
+    #[test]
+    fn rotated_footprint_pad_positions() {
+        // A DIP-20 rotated 90°: pad offsets must be rotated too (KiCad semantics).
+        // Footprint at (150, 124, 90), pad at rel (0, 20.32):
+        // rotated → absolute (150 - 20.32, 124) = (129.68, 124)
+        let b = Board::from_kicad_pcb(r#"(kicad_pcb
+          (gr_line (start 0 0) (end 200 0) (layer "Edge.Cuts"))
+          (gr_line (start 200 0) (end 200 200) (layer "Edge.Cuts"))
+          (gr_line (start 200 200) (end 0 200) (layer "Edge.Cuts"))
+          (gr_line (start 0 200) (end 0 0) (layer "Edge.Cuts"))
+          (footprint "somlib:DIP-20" (layer "F.Cu") (at 150 124 90)
+            (fp_text reference "U1" (at 0 0) (layer "F.SilkS"))
+            (pad "1" smd rect (at 0 0) (size 1.6 1.6) (net 1 "A"))
+            (pad "9" smd rect (at 0 20.32) (size 1.6 1.6) (net 2 "B"))
+          )
+        )"#).unwrap();
+        let u1 = &b.footprints[0];
+        assert_eq!(u1.pads.len(), 2);
+        let p1 = &u1.pads[0];
+        let p9 = &u1.pads[1];
+        // pad 1 at origin: absolute (150, 124)
+        assert!((p1.x - 150.0).abs() < 1e-9 && (p1.y - 124.0).abs() < 1e-9);
+        // pad 9 at rel (0, 20.32) rotated 90° → absolute (150 - 20.32, 124)
+        assert!((p9.x - 129.68).abs() < 1e-9, "p9.x = {}", p9.x);
+        assert!((p9.y - 124.0).abs() < 1e-9, "p9.y = {}", p9.y);
     }
 
     #[test]

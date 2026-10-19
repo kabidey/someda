@@ -4,12 +4,9 @@
 //! AI-EDA study: s-expression board model, DRC engine, net classes,
 //! and the verify-before-done ("honest-done") repair loop.
 
-mod sexp;
-mod board;
-mod drc;
-mod netclass;
-mod geometry;
-
+use someda::board;
+use someda::drc;
+use someda::netclass;
 use std::path::Path;
 use std::process::exit;
 
@@ -23,6 +20,7 @@ fn main() {
         eprintln!("  someda drc     <board.kicad_pcb>     run design-rule checks");
         eprintln!("  someda repair   <board.kicad_pcb>     run the honest-done repair loop");
         eprintln!("  someda validate <board.kicad_pcb>    full validation (parse + DRC)");
+eprintln!("  someda report  <board.kicad_pcb> [json|md]  DRC report");
         exit(1);
     }
 
@@ -55,6 +53,7 @@ fn main() {
         "info" => cmd_info(&b),
         "drc" => cmd_drc(&b),
         "validate" => cmd_validate(&b),
+        "report" => cmd_report(&b),
         "repair" => cmd_repair(b),
         "netclasses" => cmd_netclasses(b),
         other => {
@@ -171,6 +170,15 @@ fn cmd_netclasses(b: board::Board) {
     let unknown = t.validate_nets(&b);
     if !unknown.is_empty() {
         println!("warning: classed nets not on board: {}", unknown.join(", "));
+    }
+}
+
+fn cmd_report(b: &board::Board) {
+    let report = drc::run_drc(b, &drc::DrcConfig::default());
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(3).map(|s| s.as_str()) {
+        Some("json") => println!("{}", report.to_json()),
+        _ => println!("{}", report.to_markdown()),
     }
 }
 
