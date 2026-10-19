@@ -350,6 +350,22 @@ fn main() -> eframe::Result {
             }
             state.go(Screen::Interview);
         }
+        Ok("edit") => {
+            // SOMEDA_APP_PROJECT=<dir>: show the latest version as a proposal against v1
+            if let Some(dir) = std::env::var_os("SOMEDA_APP_PROJECT") {
+                let dir = std::path::PathBuf::from(dir);
+                let v = someda::app::project::Project::latest_version(&dir).unwrap_or(1);
+                let p = someda::app::project::Project { dir, version: v };
+                if let (Ok(old), Ok(new)) = (p.load_plan(1), p.load_plan(v)) {
+                    state.proposal_diff = someda::app::project::diff(&old, &new);
+                    state.proposal = Some(new);
+                    state.project = Some(p);
+                    state.version = 1;
+                    state.status = format!("{} change(s) proposed; confirm to rebuild.", state.proposal_diff.len());
+                }
+            }
+            state.go(Screen::Edit);
+        }
         Ok("results") => {
             // SOMEDA_APP_PROJECT=<dir with plan.v1.json + build-v1/>: show its result
             if let Some(dir) = std::env::var_os("SOMEDA_APP_PROJECT") {
