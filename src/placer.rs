@@ -148,6 +148,9 @@ pub struct Placer {
     pub gap: f64,
     /// Courtyard-to-outline margin (mm).
     pub margin: f64,
+    /// Keep-out ring other parts leave around fine-pitch footprints (mm):
+    /// room for escape lanes plus a fanout via row.
+    pub escape_ring: f64,
 }
 
 /// An axis-aligned rectangle (min_x, min_y, max_x, max_y).
@@ -159,7 +162,7 @@ fn overlaps(a: Rect, b: Rect, gap: f64) -> bool {
 
 impl Placer {
     pub fn new(board_w: f64, board_h: f64) -> Placer {
-        Placer { board_w, board_h, pitch: 10.0, gap: 0.3, margin: 0.5 }
+        Placer { board_w, board_h, pitch: 10.0, gap: 0.3, margin: 0.5, escape_ring: 2.0 }
     }
 
     /// Courtyard-aware placement from real footprint geometry.
@@ -176,6 +179,8 @@ impl Placer {
         struct Part {
             reference: String,
             rel: Rect,
+            /// extra keep-out ring other parts must respect (mm)
+            ring: f64,
             rot: i32,
             degree: usize,
         }
@@ -183,9 +188,22 @@ impl Placer {
         let neighbours = Self::neighbour_map(netlist, &intent.ignore_nets);
         for fp in &board.footprints {
             let (x0, y0, x1, y1) = fp.abs_bbox();
+            // Fine-pitch parts need room for their escape lanes and fanout
+            // vias: other parts stay outside a ring around the courtyard.
+            let mut min_pitch = f64::INFINITY;
+            for (i, a) in fp.pads.iter().enumerate() {
+                for b in fp.pads.iter().skip(i + 1) {
+                    let d = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
+                    if d > 1e-6 {
+                        min_pitch = min_pitch.min(d);
+                    }
+                }
+            }
+            let ring = if min_pitch < 0.65 && fp.pads.len() >= 8 { self.escape_ring } else { 0.0 };
             parts.push(Part {
                 reference: fp.reference.clone(),
                 rel: (x0 - fp.x, y0 - fp.y, x1 - fp.x, y1 - fp.y),
+                ring,
                 rot: fp.rotation.round() as i32,
                 degree: neighbours.get(&fp.reference).map(|v| v.len()).unwrap_or(0),
             });
@@ -193,7 +211,8 @@ impl Placer {
         let part_of = |r: &str| parts.iter().position(|p| p.reference == r);
 
         let mut solved: Vec<Solved> = Vec::new();
-        let mut placed_rects: Vec<(String, Rect)> = Vec::new();
+        // placed (reference, courtyard rect, keep-out ring)
+        let mut placed_rects: Vec<(String, Rect, f64)> = Vec::new();
         let hot: std::collections::HashMap<String, Vec<(String, f64)>> = {
             let mut m: std::collections::HashMap<String, Vec<(String, f64)>> = std::collections::HashMap::new();
             for ap in &intent.apart {
@@ -204,14 +223,14 @@ impl Placer {
         };
 
         // The free-spot test for a part's bbox centred at (cx, cy)
-        let fits = |reference: &str, rel: Rect, cx: f64, cy: f64, placed: &[(String, Rect)], solved: &[Solved]| -> bool {
+        let fits = |reference: &str, rel: Rect, ring: f64, cx: f64, cy: f64, placed: &[(String, Rect, f64)], solved: &[Solved]| -> bool {
             let hw = (rel.2 - rel.0) / 2.0;
             let hh = (rel.3 - rel.1) / 2.0;
             let r = (cx - hw, cy - hh, cx + hw, cy + hh);
             if r.0 < self.margin || r.1 < self.margin || r.2 > self.board_w - self.margin || r.3 > self.board_h - self.margin {
                 return false;
             }
-            if placed.iter().any(|(_, q)| overlaps(r, *q, self.gap)) {
+            if placed.iter().any(|(_, q, qring)| overlaps(r, *q, self.gap + ring.max(*qring))) {
                 return false;
             }
             if let Some(constraints) = hot.get(reference) {
@@ -227,19 +246,19 @@ impl Placer {
             true
         };
         // Deterministic spiral search on a 0.5mm lattice from a target point
-        let spiral = |reference: &str, rel: Rect, tx: f64, ty: f64, placed: &[(String, Rect)], solved: &[Solved]| -> Option<(f64, f64)> {
+        let spiral = |reference: &str, rel: Rect, ring: f64, tx: f64, ty: f64, placed: &[(String, Rect, f64)], solved: &[Solved]| -> Option<(f64, f64)> {
             let step = 0.5;
             let max_r = ((self.board_w.max(self.board_h)) / step).ceil() as i32 + 2;
             let snap = |v: f64| (v / step).round() * step;
             let (sx, sy) = (snap(tx), snap(ty));
-            if fits(reference, rel, sx, sy, placed, solved) {
+            if fits(reference, rel, ring, sx, sy, placed, solved) {
                 return Some((sx, sy));
             }
-            for ring in 1..=max_r {
-                let r = ring as f64 * step;
+            for rg in 1..=max_r {
+                let r = rg as f64 * step;
                 // walk the ring perimeter clockwise from the top-left corner
                 let mut cands: Vec<(f64, f64)> = Vec::new();
-                let n = ring * 2;
+                let n = rg * 2;
                 for i in 0..n {
                     let t = i as f64 * step;
                     cands.push((sx - r + t, sy - r));
@@ -254,21 +273,21 @@ impl Placer {
                     da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
                 });
                 for (cx, cy) in cands {
-                    if fits(reference, rel, cx, cy, placed, solved) {
+                    if fits(reference, rel, ring, cx, cy, placed, solved) {
                         return Some((cx, cy));
                     }
                 }
             }
             None
         };
-        let commit = |p: &Part, cx: f64, cy: f64, solved: &mut Vec<Solved>, placed: &mut Vec<(String, Rect)>| {
+        let commit = |p: &Part, cx: f64, cy: f64, solved: &mut Vec<Solved>, placed: &mut Vec<(String, Rect, f64)>| {
             let hw = (p.rel.2 - p.rel.0) / 2.0;
             let hh = (p.rel.3 - p.rel.1) / 2.0;
             // origin = bbox centre minus the bbox's own offset from the origin
             let ox = cx - (p.rel.0 + hw);
             let oy = cy - (p.rel.1 + hh);
             solved.push(Solved { reference: p.reference.clone(), x: ox, y: oy, rot: p.rot, back: false });
-            placed.push((p.reference.clone(), (cx - hw, cy - hh, cx + hw, cy + hh)));
+            placed.push((p.reference.clone(), (cx - hw, cy - hh, cx + hw, cy + hh), p.ring));
         };
 
         // 1. Semantic / edge positions first
@@ -302,16 +321,16 @@ impl Placer {
                             Pos::LeftEdge | Pos::RightEdge => (tx, ty + d),
                             _ => (tx + d, ty),
                         };
-                        if fits(&p.reference, p.rel, cx, cy, &placed_rects, &solved) {
+                        if fits(&p.reference, p.rel, p.ring, cx, cy, &placed_rects, &solved) {
                             found = Some((cx, cy));
                             break;
                         }
                     }
                     if found.is_some() { break; }
                 }
-                found.or_else(|| spiral(&p.reference, p.rel, tx, ty, &placed_rects, &solved))
+                found.or_else(|| spiral(&p.reference, p.rel, p.ring, tx, ty, &placed_rects, &solved))
             } else {
-                spiral(&p.reference, p.rel, tx, ty, &placed_rects, &solved)
+                spiral(&p.reference, p.rel, p.ring, tx, ty, &placed_rects, &solved)
             };
             if let Some((cx, cy)) = spot {
                 commit(p, cx, cy, &mut solved, &mut placed_rects);
@@ -363,7 +382,7 @@ impl Placer {
                 }
             })
             .unwrap_or((self.board_w / 2.0, self.board_h / 2.0));
-            if let Some((cx, cy)) = spiral(&p.reference, p.rel, target.0, target.1, &placed_rects, &solved) {
+            if let Some((cx, cy)) = spiral(&p.reference, p.rel, p.ring, target.0, target.1, &placed_rects, &solved) {
                 commit(p, cx, cy, &mut solved, &mut placed_rects);
             } else {
                 // No room: park at the centre so the pin-coverage/DRC gates

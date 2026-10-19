@@ -116,6 +116,8 @@ pub struct RouterConfig {
     pub via_drill: f64,
     /// Hole edge to hole edge spacing (mm) for vias and through-hole pads.
     pub hole_to_hole: f64,
+    /// Copper to drilled-hole edge clearance (mm).
+    pub hole_clearance: f64,
     /// Board edge clearance (mm).
     pub edge_clearance: f64,
     /// Max A* expansions per connection before honest give-up.
@@ -132,6 +134,8 @@ pub struct RouterConfig {
     pub rip_up_passes: usize,
     /// Cost of a layer change, in mm of trace.
     pub via_cost_mm: f64,
+    /// Escape lane reserved outward from every fine-pitch pad (mm).
+    pub escape_mm: f64,
 }
 
 impl Default for RouterConfig {
@@ -147,6 +151,7 @@ impl Default for RouterConfig {
             via_size: 0.6,
             via_drill: 0.3,
             hole_to_hole: 0.5,
+            hole_clearance: 0.25,
             edge_clearance: 0.5,
             max_expansions: 300_000,
             signal_layers: vec!["F.Cu".into(), "B.Cu".into()],
@@ -155,6 +160,7 @@ impl Default for RouterConfig {
             fanout_max_mm: 3.0,
             rip_up_passes: 2,
             via_cost_mm: 2.0,
+            escape_mm: 1.2,
         }
     }
 }
@@ -177,6 +183,7 @@ impl RouterConfig {
             via_size: rules.via_diameter_mm,
             via_drill: rules.via_drill_mm,
             hole_to_hole: rules.hole_to_hole_mm,
+            hole_clearance: rules.hole_clearance_mm,
             edge_clearance: rules.edge_clearance_mm,
             max_expansions: cells_per_layer_estimate * signal_layers.len().max(1),
             signal_layers,
@@ -185,6 +192,7 @@ impl RouterConfig {
             fanout_max_mm: 3.0,
             rip_up_passes: 2,
             via_cost_mm: 2.0,
+            escape_mm: 1.2,
         }
     }
 }
@@ -237,10 +245,15 @@ struct RPad {
     hy: f64,
     through: bool,
     npth: bool,
+    /// circle / oval pads: copper is the inscribed ellipse, not the box
+    round: bool,
     drill: f64,
     /// signal-layer indexes the pad has copper on
     layers: Vec<u8>,
     fine_pitch: bool,
+    /// footprint origin (board-relative) — the pad escapes away from it
+    fp_cx: f64,
+    fp_cy: f64,
 }
 
 /// Dense occupancy over (layer, y, x).
@@ -478,14 +491,26 @@ impl Router {
                     hy,
                     through,
                     npth: pad.pad_type == PadType::NpThruHole,
+                    round: matches!(pad.shape.as_str(), "circle" | "oval"),
                     drill: pad.drill.max(pad.drill_oval.map(|(a, b)| a.max(b)).unwrap_or(0.0)),
                     layers,
                     fine_pitch: fine,
+                    fp_cx: fp.x - bx0,
+                    fp_cy: fp.y - by0,
                 });
             }
         }
-        let pad_lookup = |reference: &str, number: &str| -> Option<u32> {
-            pads.iter().find(|p| p.reference == reference && p.number == number).map(|p| p.id)
+        // Same-numbered pads (e.g. a switch's two "1" pads) are distinct
+        // copper: resolve by position, not only by name.
+        let pad_lookup = |reference: &str, number: &str, x: f64, y: f64| -> Option<u32> {
+            pads.iter()
+                .filter(|p| p.reference == reference && p.number == number)
+                .min_by(|p, q| {
+                    let dp = (p.x - (x - bx0)).powi(2) + (p.y - (y - by0)).powi(2);
+                    let dq = (q.x - (x - bx0)).powi(2) + (q.y - (y - by0)).powi(2);
+                    dp.partial_cmp(&dq).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|p| p.id)
         };
 
         // Ratsnest edges to route: everything not on a plane net
@@ -498,9 +523,15 @@ impl Router {
             if plane_ids.contains(&nid) {
                 continue;
             }
-            let (Some(a), Some(b)) = (pad_lookup(&e.from_ref, &e.from_pin), pad_lookup(&e.to_ref, &e.to_pin)) else {
+            let (Some(a), Some(b)) = (
+                pad_lookup(&e.from_ref, &e.from_pin, e.from_x, e.from_y),
+                pad_lookup(&e.to_ref, &e.to_pin, e.to_x, e.to_y),
+            ) else {
                 continue;
             };
+            if a == b {
+                continue;
+            }
             edges.push((i, e, a, b, nid));
         }
         // Deterministic order: impedance nets first (widest, most
@@ -538,9 +569,19 @@ impl Router {
         let mut dsu = Dsu::new(pads.len());
         self.stamp_static(&mut grid, &pads, bx1 - bx0, by1 - by0);
         self.fanout_planes(&mut grid, &pads, &plane_ids, &mut state);
+        let edge_width = |e: &RatsnestEdge, a: u32, b: u32| -> f64 {
+            // NECK-DOWN: a wide (power / impedance) trace cannot land on a
+            // fine-pitch pad without grazing its neighbour — route that
+            // connection at the default width (a stub ≪ λ/4 electrically).
+            if pads[a as usize].fine_pitch || pads[b as usize].fine_pitch {
+                self.config.trace_width
+            } else {
+                self.width_for_net(&e.net)
+            }
+        };
         for &k in &order {
             let (ei, e, a, b, nid) = edges[k];
-            let width = self.width_for_net(&e.net);
+            let width = edge_width(e, a, b);
             match self.route_edge(&mut grid, &pads, &mut dsu, a, b, nid, width) {
                 Some(cells) => {
                     self.stamp_path(&mut grid, &cells, nid, width, a);
@@ -609,7 +650,7 @@ impl Router {
                 }
                 let mut trial_failed: Vec<usize> = state.failed.iter().cloned().filter(|&f| f != k).collect();
                 // The failed edge first
-                let width = self.width_for_net(&e.net);
+                let width = edge_width(e, a, b);
                 match self.route_edge(&mut g2, &pads, &mut dsu2, a, b, nid, width) {
                     Some(cells) => {
                         self.stamp_path(&mut g2, &cells, nid, width, a);
@@ -623,7 +664,7 @@ impl Router {
                 ripped_sorted.sort_by_key(|r| order.iter().position(|&o| edges[o].0 == r.edge_index).unwrap_or(usize::MAX));
                 for r in &ripped_sorted {
                     let (kk, ee, aa, bb, nn) = edges.iter().enumerate().find(|(_, x)| x.0 == r.edge_index).map(|(i, x)| (i, x.1, x.2, x.3, x.4)).unwrap();
-                    let wv = self.width_for_net(&ee.net);
+                    let wv = edge_width(ee, aa, bb);
                     match self.route_edge(&mut g2, &pads, &mut dsu2, aa, bb, nn, wv) {
                         Some(cells) => {
                             self.stamp_path(&mut g2, &cells, nn, wv, aa);
@@ -642,6 +683,75 @@ impl Router {
             }
         }
         let _ = (&grid, &dsu);
+
+        // ─── Verify path ends (debug aid: SOMEDA_ROUTE_DEBUG) ───
+        if std::env::var("SOMEDA_ROUTE_DEBUG").is_ok() {
+            let verbose = std::env::var("SOMEDA_ROUTE_DEBUG").map(|v| v == "2").unwrap_or(false);
+            for r in &state.routed {
+                let Some(ed) = edges.iter().find(|x| x.0 == r.edge_index) else { continue };
+                if verbose {
+                    let path: Vec<String> = r.cells.iter().map(|c| format!("({:.3},{:.3},{})", c.x as f64 * pitch + bx0, c.y as f64 * pitch + by0, self.config.signal_layers[c.layer as usize])).collect();
+                    eprintln!("route-debug: PATH {} {}:{} → {}:{} w={} {}", ed.1.net, ed.1.from_ref, ed.1.from_pin, ed.1.to_ref, ed.1.to_pin, r.width, path.join(" "));
+                }
+                let pb = &pads[ed.3 as usize];
+                if let Some(last) = r.cells.last() {
+                    let (lx, ly) = (last.x as f64 * pitch, last.y as f64 * pitch);
+                    let inside = (lx - pb.x).abs() <= pb.hx + 1e-6 && (ly - pb.y).abs() <= pb.hy + 1e-6;
+                    let cp = grid.idx(last.x, last.y, last.layer).map(|i| grid.copper_pad[i]).unwrap_or(0);
+                    eprintln!(
+                        "route-debug: {} {}:{} → {}:{} cells={} end=({:.3},{:.3},{}) inside_target={} end_copper_pad={}",
+                        ed.1.net, ed.1.from_ref, ed.1.from_pin, ed.1.to_ref, ed.1.to_pin, r.cells.len(), lx + bx0, ly + by0,
+                        self.config.signal_layers[last.layer as usize], inside,
+                        if cp == 0 { "none".to_string() } else { format!("{}:{}", pads[(cp - 1) as usize].reference, pads[(cp - 1) as usize].number) }
+                    );
+                }
+            }
+            if verbose {
+                for f in &state.fanouts {
+                    let pd = &pads[f.pad as usize];
+                    let path: Vec<String> = f.cells.iter().map(|c| format!("({:.3},{:.3},{})", c.x as f64 * pitch + bx0, c.y as f64 * pitch + by0, self.config.signal_layers[c.layer as usize])).collect();
+                    eprintln!("route-debug: FANOUT {}:{} via={:?} {}", pd.reference, pd.number, f.via.map(|(x, y)| (x as f64 * pitch + bx0, y as f64 * pitch + by0)), path.join(" "));
+                }
+            }
+            for &k in &state.failed {
+                let (_, e, a, b, _) = edges[k];
+                let (pa, pb) = (&pads[a as usize], &pads[b as usize]);
+                let sa = self.pad_cells(&grid, pa, pa.layers[0]);
+                let sb = self.pad_cells(&grid, pb, pb.layers[0]);
+                let free_around = |c: &Cell| -> usize {
+                    [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().filter(|(dx, dy)| {
+                        let o = grid.owner_at(Cell { x: c.x + dx, y: c.y + dy, layer: c.layer });
+                        o == FREE || o == e.net.len() as u32 + 1 || o == (edges[k].4 as u32 + 1)
+                    }).count()
+                };
+                if verbose {
+                    for (label, pd) in [("from", pa), ("to", pb)] {
+                        let r = (2.0 / pitch) as i32;
+                        let (gx, gy) = ((pd.x / pitch).round() as i32, (pd.y / pitch).round() as i32);
+                        eprintln!("route-debug: occupancy around {} {}:{} (net tag {}; '.' free, '#' block, 'o' own net, 'x' other net, 'O' own copper, 'X' other copper):", label, pd.reference, pd.number, edges[k].4 + 1);
+                        for l in 0..grid.layers as u8 {
+                            eprintln!("  layer {}:", self.config.signal_layers[l as usize]);
+                            for y in (gy - r)..=(gy + r) {
+                                let mut line = String::from("    ");
+                                for x in (gx - r)..=(gx + r) {
+                                    let c = Cell { x, y, layer: l };
+                                    let o = grid.owner_at(c);
+                                    let cp = grid.idx(x, y, l).map(|i| grid.copper_pad[i]).unwrap_or(0);
+                                    let tag = edges[k].4 as u32 + 1;
+                                    line.push(if o == BLOCK { '#' } else if o == FREE { '.' } else if o == tag { if cp != 0 { 'O' } else { 'o' } } else if cp != 0 { 'X' } else { 'x' });
+                                }
+                                eprintln!("{}", line);
+                            }
+                        }
+                    }
+                }
+                eprintln!(
+                    "route-debug: FAILED {} {}:{} ({:.2},{:.2} hx{:.2} hy{:.2} cells{} free-neighbours{:?}) → {}:{} ({:.2},{:.2} hx{:.2} hy{:.2} cells{} free-neighbours{:?})",
+                    e.net, pa.reference, pa.number, pa.x + bx0, pa.y + by0, pa.hx, pa.hy, sa.len(), sa.iter().map(|c| free_around(c)).collect::<Vec<_>>(),
+                    pb.reference, pb.number, pb.x + bx0, pb.y + by0, pb.hx, pb.hy, sb.len(), sb.iter().map(|c| free_around(c)).collect::<Vec<_>>()
+                );
+            }
+        }
 
         // ─── Emit ───
         let mut result = RouteResult::default();
@@ -735,6 +845,23 @@ impl Router {
                     }
                 }
             }
+            // Drilled holes: copper of OTHER nets must keep hole_clearance
+            // from the hole edge on every layer (NPTH: everyone)
+            if (p.through || p.npth) && p.drill > 0.0 {
+                let hr = p.drill / 2.0 + self.config.hole_clearance + tw2;
+                let (gx0, gx1) = (((p.x - hr) / pitch).floor() as i32, ((p.x + hr) / pitch).ceil() as i32);
+                let (gy0, gy1) = (((p.y - hr) / pitch).floor() as i32, ((p.y + hr) / pitch).ceil() as i32);
+                for l in 0..grid.layers as u8 {
+                    for y in gy0..=gy1 {
+                        for x in gx0..=gx1 {
+                            let (cx, cy) = (x as f64 * pitch, y as f64 * pitch);
+                            if ((cx - p.x).powi(2) + (cy - p.y).powi(2)).sqrt() <= hr + 1e-9 {
+                                grid.claim(x, y, l, tag);
+                            }
+                        }
+                    }
+                }
+            }
             // Holes: no via may land hole-to-hole close
             if p.through || p.npth {
                 let r = p.drill / 2.0 + self.config.hole_to_hole + self.config.via_drill / 2.0;
@@ -746,17 +873,19 @@ impl Router {
                 Some(n) if !p.npth => n as u32 + 1,
                 _ => BLOCK,
             };
-            // Copper cells: centres strictly inside the pad rectangle — a
-            // trace starting there stays inside the pad's copper. Always at
-            // least the nearest cell.
+            // Copper cells: centres inside the pad rectangle shrunk by half
+            // a trace width — a trace ending there lies entirely inside the
+            // pad's copper (KiCad's connection-width check wants the full
+            // trace width overlapping). Always at least the nearest cell.
             let mut any = false;
+            let (ix, iy) = ((p.hx - tw2).max(0.0), (p.hy - tw2).max(0.0));
             let (gx0, gx1) = (((p.x - p.hx) / pitch).floor() as i32, ((p.x + p.hx) / pitch).ceil() as i32);
             let (gy0, gy1) = (((p.y - p.hy) / pitch).floor() as i32, ((p.y + p.hy) / pitch).ceil() as i32);
             for &l in &p.layers {
                 for y in gy0..=gy1 {
                     for x in gx0..=gx1 {
                         let (cx, cy) = (x as f64 * pitch, y as f64 * pitch);
-                        if (cx - p.x).abs() <= p.hx + 1e-9 && (cy - p.y).abs() <= p.hy + 1e-9 {
+                        if Self::inside_pad(p, cx, cy, ix, iy) {
                             grid.force(x, y, l, tag, p.id);
                             any = true;
                         }
@@ -770,6 +899,59 @@ impl Router {
                 }
             }
         }
+        // ESCAPE CORRIDORS: every fine-pitch pad reserves a lane from its
+        // outer end away from the footprint centre. Nets routed earlier
+        // can no longer run along a pin row and wall the remaining pins in
+        // (live-verified: traces hugging an LQFP row trapped U1:5/U1:11).
+        // The lane is owned by the pad's net; other pads' copper is never
+        // overwritten.
+        let lane_len = (self.config.escape_mm / pitch).ceil() as i32;
+        for p in pads {
+            if !p.fine_pitch || p.npth || p.net.is_none() || p.through {
+                continue;
+            }
+            let tag = p.net.unwrap() as u32 + 1;
+            let along_x = p.hx >= p.hy;
+            let dir = if along_x { (p.x - p.fp_cx).signum() } else { (p.y - p.fp_cy).signum() };
+            if dir == 0.0 {
+                continue;
+            }
+            let (ix, iy) = ((p.hx - tw2).max(0.0), (p.hy - tw2).max(0.0));
+            for &l in &p.layers {
+                for k in 0..=lane_len {
+                    let d = if along_x { p.hx } else { p.hy } + k as f64 * pitch;
+                    let (cx, cy) = if along_x { (p.x + dir * d, p.y) } else { (p.x, p.y + dir * d) };
+                    let (gx, gy) = ((cx / pitch).round() as i32, (cy / pitch).round() as i32);
+                    // the lane is as wide as the pad's copper rows
+                    let span = if along_x { (iy / pitch).floor() as i32 } else { (ix / pitch).floor() as i32 };
+                    for t in -span..=span {
+                        let (x, y) = if along_x { (gx, gy + t) } else { (gx + t, gy) };
+                        if let Some(i) = grid.idx(x, y, l) {
+                            if grid.copper_pad[i] != 0 && grid.owner[i] != tag {
+                                continue;
+                            }
+                            if grid.owner[i] == FREE {
+                                grid.owner[i] = tag;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Is (cx, cy) inside the pad's copper shrunk to half extents (ix, iy)?
+    fn inside_pad(p: &RPad, cx: f64, cy: f64, ix: f64, iy: f64) -> bool {
+        let (dx, dy) = ((cx - p.x).abs(), (cy - p.y).abs());
+        if dx > ix + 1e-9 || dy > iy + 1e-9 {
+            return false;
+        }
+        if p.round && ix > 1e-9 && iy > 1e-9 {
+            // oval: a stadium (two semicircles + rectangle). Approximate by
+            // the inscribed ellipse — conservative at the straight sides.
+            return (dx / ix).powi(2) + (dy / iy).powi(2) <= 1.0 + 1e-9;
+        }
+        true
     }
 
     /// Cells of a pad's copper (as stamped) on one layer.
@@ -810,6 +992,12 @@ impl Router {
         }
     }
 
+    /// Cells (radius) whose centres lie inside the copper of a trace of
+    /// `width` — only those may be treated as copper for connectivity.
+    fn copper_cells(&self, width: f64) -> i32 {
+        ((width / 2.0 - 1e-9) / self.config.grid).floor().max(0.0) as i32
+    }
+
     fn via_halo_cells(&self) -> i32 {
         let s = self.config.via_size / 2.0 + self.config.clearance + self.config.trace_width / 2.0;
         ((s / self.config.grid).ceil() as i32 - 1).max(0)
@@ -819,9 +1007,12 @@ impl Router {
     fn stamp_path(&self, grid: &mut Grid, cells: &[Cell], net: usize, width: f64, pad_id: u32) {
         let tag = net as u32 + 1;
         let halo = self.halo_cells(width);
-        let body = self.body_cells(width);
+        // Copper for connectivity: only cells inside the actual copper.
+        // (Marking the clearance body as copper let later routes end up to
+        // a cell away from real copper — live-verified unconnected tracks.)
+        let body = self.copper_cells(width);
         let vhalo = self.via_halo_cells();
-        let vbody = ((self.config.via_size / 2.0) / self.config.grid).floor() as i32;
+        let vbody = self.copper_cells(self.config.via_size);
         let mut prev: Option<Cell> = None;
         for c in cells {
             for dy in -halo..=halo {
@@ -870,7 +1061,7 @@ impl Router {
     fn stamp_via(&self, grid: &mut Grid, vx: i32, vy: i32, net: usize, pad_id: u32) {
         let tag = net as u32 + 1;
         let vhalo = self.via_halo_cells();
-        let vbody = ((self.config.via_size / 2.0) / self.config.grid).floor() as i32;
+        let vbody = self.copper_cells(self.config.via_size);
         for l in 0..grid.layers as u8 {
             for dy in -vhalo..=vhalo {
                 for dx in -vhalo..=vhalo {
@@ -1014,9 +1205,35 @@ impl Router {
         let via_cost = self.config.via_cost_mm / self.config.grid;
         let pitch = self.config.grid;
 
+        // Start from EVERY copper cell of pad a's connected component (its
+        // pads, traces and vias), not only pad a: the component is one
+        // conductor, and the nearest piece of it may be far from the pad.
+        let root_a = dsu.find(a);
         let mut starts: Vec<Cell> = Vec::new();
         for &l in &pa.layers {
             starts.extend(self.pad_cells(grid, pa, l));
+        }
+        {
+            let mut member = vec![false; pads.len()];
+            for p in pads.iter() {
+                if p.net == Some(net) && dsu.find(p.id) == root_a {
+                    member[p.id as usize] = true;
+                }
+            }
+            for l in 0..grid.layers as u8 {
+                for y in 0..grid.h as i32 {
+                    for x in 0..grid.w as i32 {
+                        let i = ((l as usize) * grid.h + y as usize) * grid.w + x as usize;
+                        let cp = grid.copper_pad[i];
+                        if cp != 0 && grid.owner[i] == tag && member[(cp - 1) as usize] {
+                            let c = Cell { x, y, layer: l };
+                            if !starts.contains(&c) {
+                                starts.push(c);
+                            }
+                        }
+                    }
+                }
+            }
         }
         if starts.is_empty() {
             return None;

@@ -745,9 +745,12 @@ pub fn build(
         .map_err(|e| OrchestrateError::Io(e.to_string()))?;
     let board = crate::board::Board::from_kicad_pcb(&pcb_text)
         .map_err(|e| OrchestrateError::Verification(format!("board parse: {}", e)))?;
-    let drc_report = crate::drc::run_drc(&board, &crate::drc::DrcConfig::default());
-    // Same honest classification: the >200-segment pairwise-truncation is the
-    // known M2 spatial-index limitation — a note, not a design failure.
+    let drc_report = crate::drc::run_drc(
+        &board,
+        &crate::drc::DrcConfig::from_rules(&crate::rules::DesignRules::for_layers(board.layer_count)),
+    );
+    // Same honest classification: the segment-check truncation is a
+    // note, not a design failure.
     let drc_real = drc_report
         .errors()
         .saturating_sub(

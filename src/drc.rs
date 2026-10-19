@@ -62,6 +62,18 @@ impl Default for DrcConfig {
     }
 }
 
+impl DrcConfig {
+    /// The DRC configuration matching the design rules a board was routed
+    /// with (the engine must judge by the same numbers it routed by).
+    pub fn from_rules(rules: &crate::rules::DesignRules) -> DrcConfig {
+        DrcConfig {
+            min_clearance_mm: rules.clearance_mm,
+            edge_clearance_mm: rules.edge_clearance_mm.min(0.25),
+            min_trace_width_mm: rules.trace_width_mm,
+        }
+    }
+}
+
 pub fn run_drc(board: &Board, config: &DrcConfig) -> DrcReport {
     run_drc_with_classes(board, config, None)
 }
@@ -107,31 +119,56 @@ fn check_pad_outside_outline(board: &Board, findings: &mut Vec<Finding>) {
 }
 
 fn check_pad_clearance(board: &Board, config: &DrcConfig, findings: &mut Vec<Finding>) {
-    // Collect all pads with positions
-    let mut all_pads: Vec<(String, String, f64, f64)> = Vec::new();
+    use crate::geometry::{roirect_clearance, RotRect};
+    // Edge-to-edge clearance between pads of DIFFERENT nets (or no net)
+    // on footprints other than each other's. Same-footprint pads are
+    // placed by the land pattern; same-net pads may touch.
+    struct P<'a> { reference: &'a str, number: &'a str, net: Option<&'a (usize, String)>, rect: RotRect, through: bool, front: bool }
+    let mut all: Vec<P> = Vec::new();
     for fp in &board.footprints {
         for pad in &fp.pads {
-            all_pads.push((fp.reference.clone(), pad.number.clone(), pad.x, pad.y));
+            all.push(P {
+                reference: &fp.reference,
+                number: &pad.number,
+                net: pad.net.as_ref(),
+                rect: RotRect::new(pad.x, pad.y, pad.width.max(0.01), pad.height.max(0.01), pad.rotation),
+                through: pad.is_through(),
+                front: pad.on_copper("F.Cu"),
+            });
         }
     }
-    // O(n^2) pairwise check (fine for the scales this tool targets)
-    for i in 0..all_pads.len() {
-        for j in (i + 1)..all_pads.len() {
-            let (ref_a, num_a, ax, ay) = &all_pads[i];
-            let (ref_b, num_b, bx, by) = &all_pads[j];
-            if ref_a == ref_b {
-                continue; // same footprint: pads are placed by the land pattern
+    // Spatial pre-filter: sort by x and only compare neighbours in range
+    let max_reach = 6.0 + config.min_clearance_mm;
+    let mut order: Vec<usize> = (0..all.len()).collect();
+    order.sort_by(|&a, &b| all[a].rect.cx.partial_cmp(&all[b].rect.cx).unwrap_or(std::cmp::Ordering::Equal));
+    for (oi, &i) in order.iter().enumerate() {
+        for &j in order.iter().skip(oi + 1) {
+            let (a, b) = (&all[i], &all[j]);
+            if b.rect.cx - a.rect.cx > max_reach {
+                break;
             }
-            let dx = ax - bx;
-            let dy = ay - by;
-            let dist = (dx * dx + dy * dy).sqrt();
-            if dist < config.min_clearance_mm && dist > 0.0 {
+            if a.reference == b.reference {
+                continue;
+            }
+            let same_net = match (a.net, b.net) {
+                (Some((_, x)), Some((_, y))) if !x.is_empty() && x == y => true,
+                _ => false,
+            };
+            if same_net {
+                continue;
+            }
+            // Different copper layers never clear each other
+            if !(a.through || b.through || (a.front && b.front) || (!a.front && !b.front)) {
+                continue;
+            }
+            let d = roirect_clearance(&a.rect, &b.rect);
+            if d < config.min_clearance_mm - 1e-6 {
                 findings.push(Finding {
                     severity: Severity::Error,
                     code: "pad-clearance".into(),
                     message: format!(
-                        "Pads {}:{} and {}:{} are {:.3} mm apart (min {:.3} mm).",
-                        ref_a, num_a, ref_b, num_b, dist, config.min_clearance_mm
+                        "Pads {}:{} and {}:{} are {:.3} mm apart edge to edge (min {:.3} mm).",
+                        a.reference, a.number, b.reference, b.number, d.max(0.0), config.min_clearance_mm
                     ),
                 });
             }
@@ -183,23 +220,29 @@ fn check_trace_width(board: &Board, config: &DrcConfig, classes: Option<&crate::
 fn check_segment_clearance(board: &Board, config: &DrcConfig, findings: &mut Vec<Finding>) {
     use crate::geometry::{RotRect, roirect_segment_clearance};
 
-    // Segment-to-segment clearance (same layer, different nets)
+    // Segment-to-segment clearance (same layer, different nets). Pairwise
+    // with a bounding-box prefilter; capped at 20k segments.
     let seg_count = board.segments.len();
-    if seg_count > 200 {
-        // O(n^2) pairwise: cap at 200 segments for now to avoid pathological runtime
-        // on dense boards. Full spatial-indexing is an M2 item.
+    if seg_count > 20_000 {
         findings.push(Finding {
             severity: Severity::Warning,
             code: "segment-check-truncated".into(),
-            message: format!("Board has {} segments; pairwise clearance checked on the first 200 only (spatial index lands in M2).", seg_count),
+            message: format!("Board has {} segments; pairwise clearance checked on the first 20000 only.", seg_count),
         });
     }
-    let check_n = seg_count.min(200);
+    let check_n = seg_count.min(20_000);
+    let bbox = |s: &crate::board::Segment| -> (f64, f64, f64, f64) {
+        let r = s.width / 2.0 + config.min_clearance_mm;
+        (s.start.0.min(s.end.0) - r, s.start.1.min(s.end.1) - r, s.start.0.max(s.end.0) + r, s.start.1.max(s.end.1) + r)
+    };
+    let boxes: Vec<(f64, f64, f64, f64)> = board.segments.iter().take(check_n).map(bbox).collect();
     for i in 0..check_n {
         let a = &board.segments[i];
         for j in (i + 1)..check_n {
             let b = &board.segments[j];
             if a.layer != b.layer { continue; }
+            let (ba, bb) = (boxes[i], boxes[j]);
+            if ba.2 < bb.0 || bb.2 < ba.0 || ba.3 < bb.1 || bb.3 < ba.1 { continue; }
             let same_net = match (&a.net, &b.net) {
                 (Some((_, x)), Some((_, y))) if !x.is_empty() && !y.is_empty() && x == y => true,
                 (Some((ia, _)), Some((ib, _))) if ia == ib && *ia > 0 => true,
@@ -211,7 +254,7 @@ fn check_segment_clearance(board: &Board, config: &DrcConfig, findings: &mut Vec
             ).min(segment_segment_distance(b.start, b.end, a.start, a.end));
             // Subtract half-widths for edge-to-edge clearance
             let edge_gap = clearance - (a.width + b.width) / 2.0;
-            if edge_gap < config.min_clearance_mm && edge_gap >= 0.0 {
+            if edge_gap < config.min_clearance_mm - 1e-6 && edge_gap >= 0.0 {
                 let na = a.net.as_ref().map(|(_, n)| n.as_str()).unwrap_or("?");
                 let nb = b.net.as_ref().map(|(_, n)| n.as_str()).unwrap_or("?");
                 findings.push(Finding {
@@ -230,8 +273,13 @@ fn check_segment_clearance(board: &Board, config: &DrcConfig, findings: &mut Vec
     let pad_list: Vec<(&crate::board::Footprint, &crate::board::Pad)> = board.footprints.iter()
         .flat_map(|fp| fp.pads.iter().map(move |p| (fp, p)))
         .collect();
-    for seg in board.segments.iter().take(200) {
+    for seg in board.segments.iter().take(check_n) {
+        let sb = bbox(seg);
         for (fp, pad) in &pad_list {
+            let r = pad.radius() + config.min_clearance_mm;
+            if pad.x + r < sb.0 || pad.x - r > sb.2 || pad.y + r < sb.1 || pad.y - r > sb.3 { continue; }
+            // a surface pad only clears tracks on its own layer
+            if !pad.is_through() && !pad.on_copper(&seg.layer) { continue; }
             let same_net = match (&seg.net, &pad.net) {
                 (Some((ia, a)), Some((ib, b))) if !a.is_empty() && !b.is_empty() && a == b => true,
                 // Old-format files: net names may be empty; fall back to net index
@@ -243,7 +291,7 @@ fn check_segment_clearance(board: &Board, config: &DrcConfig, findings: &mut Vec
             let d = roirect_segment_clearance(
                 &rect, seg.start.0, seg.start.1, seg.end.0, seg.end.1,
             ) - seg.width / 2.0;
-            if d < config.min_clearance_mm && d >= 0.0 {
+            if d < config.min_clearance_mm - 1e-6 && d >= 0.0 {
                 let sn = seg.net.as_ref().map(|(_, n)| n.as_str()).unwrap_or("?");
                 // Distance ~0 with an endpoint inside the pad = possible intentional
                 // connection (jumpers, old-format files) — warn, don't hard-fail.
