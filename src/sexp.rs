@@ -32,7 +32,7 @@ impl std::error::Error for ParseError {}
 pub fn parse(input: &str) -> Result<Sexp, ParseError> {
     let bytes = input.as_bytes();
     let mut pos = 0usize;
-    let result = parse_expr(input, bytes, &mut pos)?;
+    let result = parse_expr(input, bytes, &mut pos, 0)?;
     skip_ws(bytes, &mut pos);
     if pos != bytes.len() {
         return Err(ParseError {
@@ -49,7 +49,15 @@ fn skip_ws(b: &[u8], pos: &mut usize) {
     }
 }
 
-fn parse_expr(input: &str, b: &[u8], pos: &mut usize) -> Result<Sexp, ParseError> {
+const MAX_DEPTH: usize = 1000;
+
+fn parse_expr(input: &str, b: &[u8], pos: &mut usize, depth: usize) -> Result<Sexp, ParseError> {
+    if depth > MAX_DEPTH {
+        return Err(ParseError {
+            message: format!("nesting too deep (limit {})", MAX_DEPTH),
+            offset: *pos,
+        });
+    }
     skip_ws(b, pos);
     if *pos >= b.len() {
         return Err(ParseError {
@@ -73,7 +81,7 @@ fn parse_expr(input: &str, b: &[u8], pos: &mut usize) -> Result<Sexp, ParseError
                     *pos += 1;
                     return Ok(Sexp::List(items));
                 }
-                items.push(parse_expr(input, b, pos)?);
+                items.push(parse_expr(input, b, pos, depth + 1)?);
             }
         }
         b'"' => {
@@ -124,6 +132,20 @@ fn parse_expr(input: &str, b: &[u8], pos: &mut usize) -> Result<Sexp, ParseError
                     message: format!("unexpected character '{}'", b[*pos] as char),
                     offset: *pos,
                 });
+            }
+            // UTF-8 safety: slicing must land on a char boundary.
+            // Walk back if we stopped mid-character.
+            while *pos > start && !input.is_char_boundary(*pos) {
+                *pos -= 1;
+            }
+            // If we walked all the way back (lone continuation byte), consume
+            // at least one byte so the caller always makes progress.
+            if *pos == start {
+                *pos = start + 1;
+                // skip any remaining continuation bytes
+                while *pos < b.len() && !input.is_char_boundary(*pos) {
+                    *pos += 1;
+                }
             }
             Ok(Sexp::Atom(input[start..*pos].to_string()))
         }
