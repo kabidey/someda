@@ -1,0 +1,33 @@
+** Drc report for custom_pads_test.kicad_pcb **
+** Created on 2026-10-19T10:34:35 **
+** Report includes: Errors, Warnings **
+
+** Found 5 DRC violations **
+[lib_footprint_issues]: The current configuration does not include the footprint library 'Diodes_SMD'
+    Local override; warning
+    @(136.9000 mm, 101.5000 mm): Footprint R2
+[lib_footprint_issues]: The current configuration does not include the footprint library 'Connect'
+    Local override; warning
+    @(166.3000 mm, 72.5000 mm): Footprint AE2
+[lib_footprint_issues]: The current configuration does not include the footprint library 'Connect'
+    Local override; warning
+    @(100.1500 mm, 65.8600 mm): Footprint AE1
+[lib_footprint_issues]: The current configuration does not include the footprint library 'Dip_sockets'
+    Local override; warning
+    @(165.9000 mm, 123.6000 mm): Footprint U***
+[lib_footprint_issues]: The current configuration does not include the footprint library 'Discret'
+    Local override; warning
+    @(104.2990 mm, 99.7200 mm): Footprint SW1
+
+** Found 0 unconnected pads **
+
+** Found 0 Footprint errors **
+
+** Ignored checks **
+    - Footprint has no courtyard defined
+    - Track endpoint not centered on via
+    - Tuning profile track geometries
+    - Footprint doesn't match symbol's footprint filters
+    - Footprint component type doesn't match footprint pads
+
+** End of Report **

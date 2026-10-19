@@ -21,7 +21,30 @@ someda info    <board.kicad_pcb>     summary of the board
 someda drc     <board.kicad_pcb>     run design-rule checks
 someda validate <board.kicad_pcb>    parse + DRC (exit 1 on errors)
 someda repair  <board.kicad_pcb>     run the honest-done repair loop
+someda report  <board.kicad_pcb> [json|md]  DRC report
+someda erc     <schematic.kicad_sch> electrical rule check
+someda netclasses <board.kicad_pcb>  net class summary
+someda ai plan <description>         plan a circuit with an LLM (print JSON)
+someda ai build <description>        plan + generate + verify + export (full project)
 ```
+
+### AI Mode (optional — works with any OpenAI-compatible API)
+
+```bash
+export SOMEDA_API_KEY="sk-..."   # or OPENAI_API_KEY
+export SOMEDA_BASE_URL="https://api.openai.com/v1"  # or any compatible API
+export SOMEDA_MODEL="gpt-4o-mini"  # or any model
+
+someda ai build "Build a 555 timer LED blinker with 1Hz output"
+```
+
+The LLM plans the circuit as a strict JSON contract (components + nets);
+someda's deterministic generators write `.kicad_sch` + `.kicad_pcb`; kicad-cli
+runs ERC/DRC and exports Gerbers, drill, position, and BOM. The honest-done
+loop verifies every stage.
+
+Works with: OpenAI, Azure OpenAI, vLLM, Ollama (`/v1` mode), LM Studio,
+llama.cpp server — any OpenAI-compatible `/chat/completions` endpoint.
 
 ## Example
 

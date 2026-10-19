@@ -22,10 +22,17 @@ fn main() {
         eprintln!("  someda validate <board.kicad_pcb>    full validation (parse + DRC)");
 eprintln!("  someda report  <board.kicad_pcb> [json|md]  DRC report");
 eprintln!("  someda erc    <schematic.kicad_sch>      electrical rule check");
+eprintln!("  someda ai build <description>           AI: plan + generate + verify (needs API key)");
         exit(1);
     }
 
     let cmd = args[1].as_str();
+
+    // ai operates on descriptions, not files — handle before file checks
+    if cmd == "ai" {
+        cmd_ai(&args[2..]);
+    }
+
     let path = match args.get(2) {
         Some(p) => Path::new(p),
         None => {
@@ -161,6 +168,92 @@ fn cmd_repair(mut b: board::Board) {
         }
         _ => unreachable!(),
     }
+}
+
+fn cmd_ai(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("someda ai — AI-driven circuit builder");
+        eprintln!();
+        eprintln!("USAGE:");
+        eprintln!("  someda ai build <description>     plan + generate + verify a circuit");
+        eprintln!("  someda ai plan <description>      plan only (print JSON)");
+        eprintln!();
+        eprintln!("CONFIG:");
+        eprintln!("  SOMEDA_API_KEY / OPENAI_API_KEY  the API key (required)");
+        eprintln!("  SOMEDA_BASE_URL / OPENAI_BASE_URL API base URL (default: OpenAI)");
+        eprintln!("  SOMEDA_MODEL / OPENAI_MODEL      model name (default: gpt-4o-mini)");
+        eprintln!("  SOMEDA_KICAD_CLI                 kicad-cli binary path (default: kicad-cli)");
+        eprintln!();
+        eprintln!("Works with any OpenAI-compatible API: OpenAI, Azure, vLLM,");
+        eprintln!("Ollama (/v1 mode), LM Studio, llama.cpp server, etc.");
+        exit(1);
+    }
+
+    let sub = args[0].as_str();
+    let description = if args.len() > 1 {
+        args[1..].join(" ")
+    } else {
+        eprintln!("error: provide a circuit description");
+        exit(1);
+    };
+
+    let gateway = match someda::gateway::Gateway::from_env() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            exit(1);
+        }
+    };
+
+    println!("model: {} at {}", gateway.model, gateway.base_url);
+
+    match sub {
+        "plan" => {
+            // Plan only: print the JSON contract
+            let plan_json = gateway
+                .chat_json(someda::orchestrator::PLANNER_SYSTEM_PROMPT, &description)
+                .unwrap_or_else(|e| { eprintln!("error: {}", e); exit(1); });
+            println!("{}", serde_json::to_string_pretty(&plan_json).unwrap());
+        }
+        "build" => {
+            // Full pipeline: plan → generate → kicad-cli → verify
+            let project_dir = std::env::var("SOMEDA_PROJECT_DIR")
+                .unwrap_or_else(|_| "./someda-build".into());
+            let dir = std::path::Path::new(&project_dir);
+            let cli = someda::kicad_cli::KiCadCli::new(dir);
+
+            let result = someda::orchestrator::build(&gateway, &cli, dir, &description)
+                .unwrap_or_else(|e| { eprintln!("error: {}", e); exit(1); });
+
+            println!();
+            println!("─── BUILD COMPLETE ───");
+            println!("  project:  {}", result.project_dir);
+            println!("  schematic: {}", result.schematic_file);
+            println!("  board:     {}", result.board_file);
+            println!("  plan:      {} components, {} nets",
+                result.plan.components.len(), result.plan.nets.len());
+            println!();
+            for stage in &result.stages {
+                let mark = if stage.success { "✓" } else { "✗" };
+                println!("  {} [{}] {}", mark, stage.stage, stage.detail);
+            }
+
+            let all_ok = result.stages.iter().all(|s| s.success || s.stage == "kicad-cli");
+            if all_ok {
+                println!();
+                println!("honest-done: VERIFIED — all stages passed");
+            } else {
+                println!();
+                println!("honest-done: NOT DONE — some stages failed");
+                exit(1);
+            }
+        }
+        other => {
+            eprintln!("error: unknown ai subcommand '{}'", other);
+            exit(1);
+        }
+    }
+    exit(0);
 }
 
 fn cmd_erc(path: &Path) {

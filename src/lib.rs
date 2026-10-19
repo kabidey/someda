@@ -12,3 +12,8 @@ pub mod geometry;
 pub mod report;
 pub mod schematic;
 pub mod verified;
+pub mod netlist;
+pub mod stackup;
+pub mod gateway;
+pub mod kicad_cli;
+pub mod orchestrator;
