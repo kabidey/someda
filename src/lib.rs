@@ -10,3 +10,4 @@ pub mod drc;
 pub mod netclass;
 pub mod geometry;
 pub mod report;
+pub mod schematic;

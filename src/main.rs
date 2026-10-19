@@ -21,6 +21,7 @@ fn main() {
         eprintln!("  someda repair   <board.kicad_pcb>     run the honest-done repair loop");
         eprintln!("  someda validate <board.kicad_pcb>    full validation (parse + DRC)");
 eprintln!("  someda report  <board.kicad_pcb> [json|md]  DRC report");
+eprintln!("  someda erc    <schematic.kicad_sch>      electrical rule check");
         exit(1);
     }
 
@@ -28,10 +29,15 @@ eprintln!("  someda report  <board.kicad_pcb> [json|md]  DRC report");
     let path = match args.get(2) {
         Some(p) => Path::new(p),
         None => {
-            eprintln!("error: command '{}' needs a board file", cmd);
+            eprintln!("error: command '{}' needs a file", cmd);
             exit(1);
         }
     };
+
+    // erc operates on schematics - handle before board parsing
+    if cmd == "erc" {
+        cmd_erc(path);
+    }
 
     let input = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -154,6 +160,26 @@ fn cmd_repair(mut b: board::Board) {
             exit(1);
         }
         _ => unreachable!(),
+    }
+}
+
+fn cmd_erc(path: &Path) {
+    let input = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("error: cannot read {}: {}", path.display(), e);
+        exit(1);
+    });
+    match someda::schematic::Schematic::from_kicad_sch(&input) {
+        Ok(sch) => {
+            println!("schematic parsed: {} instances, {} wires, {} labels",
+                sch.instances.len(), sch.wires.len(), sch.labels.len());
+            let report = someda::schematic::run_erc(&sch);
+            println!("{}", report);
+            exit(if report.is_clean() { 0 } else { 1 });
+        }
+        Err(e) => {
+            eprintln!("error: parse failed: {}", e);
+            exit(1);
+        }
     }
 }
 
