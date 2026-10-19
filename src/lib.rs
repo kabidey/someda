@@ -34,3 +34,4 @@ pub mod pdn;
 pub mod bom;
 pub mod jlcpcb;
 pub mod repair;
+pub mod app;

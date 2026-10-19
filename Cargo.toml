@@ -2,6 +2,7 @@
 name = "someda"
 version = "0.7.0"
 edition = "2021"
+default-run = "someda"
 description = "Clean-room KiCad-compatible EDA core with AI orchestration: s-expression board model, DRC/ERC engines, net classes, verify-before-done repair loop, LLM gateway, and kicad-cli integration"
 license = "MIT"
 repository = "https://github.com/kabidey/someda"
@@ -10,6 +11,23 @@ repository = "https://github.com/kabidey/someda"
 ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The desktop app (someda-app) only: the CLI and the test suite never compile these.
+eframe = { version = "0.37", optional = true }
+egui_extras = { version = "0.37", features = ["image"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+dirs = { version = "7", optional = true }
+
+[features]
+app = ["dep:eframe", "dep:egui_extras", "dep:image", "dep:dirs"]
+
+[[bin]]
+name = "someda"
+path = "src/main.rs"
+
+[[bin]]
+name = "someda-app"
+path = "src/bin/someda-app/main.rs"
+required-features = ["app"]
 
 [profile.release]
 lto = true
