@@ -7,6 +7,8 @@
 mod sexp;
 mod board;
 mod drc;
+mod netclass;
+mod geometry;
 
 use std::path::Path;
 use std::process::exit;
@@ -54,6 +56,7 @@ fn main() {
         "drc" => cmd_drc(&b),
         "validate" => cmd_validate(&b),
         "repair" => cmd_repair(b),
+        "netclasses" => cmd_netclasses(b),
         other => {
             eprintln!("error: unknown command '{}'", other);
             exit(1);
@@ -147,6 +150,27 @@ fn cmd_repair(mut b: board::Board) {
             exit(1);
         }
         _ => unreachable!(),
+    }
+}
+
+fn cmd_netclasses(b: board::Board) {
+    // Report every net with its effective class geometry (all defaults until classes are loaded from file)
+    let mut t = netclass::NetClassTable::new(0.25, 0.2);
+    t.add_class("default", 0.25, 0.2, Vec::new());
+    println!("net class summary (defaults; file-loaded classes land in M1):");
+    println!("  default trace width: {:.3} mm", t.default_trace_width_mm);
+    println!("  default clearance:  {:.3} mm", t.default_clearance_mm);
+    println!();
+    println!("nets on board:");
+    for (idx, name) in &b.nets {
+        let width = t.trace_width_for(name);
+        let cls = t.class_of(name).unwrap_or("default");
+        println!("  net {:>3} {:<20} class={:<10} width={:.3} mm", idx, name, cls, width);
+    }
+    // validate example classes against board nets
+    let unknown = t.validate_nets(&b);
+    if !unknown.is_empty() {
+        println!("warning: classed nets not on board: {}", unknown.join(", "));
     }
 }
 
