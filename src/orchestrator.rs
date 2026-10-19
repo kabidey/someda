@@ -13,7 +13,7 @@ use std::path::Path;
 use crate::board::rotate_offset;
 
 /// The circuit plan the LLM must produce (strict JSON contract).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CircuitPlan {
     pub name: String,
     pub description: String,
@@ -41,7 +41,7 @@ pub struct CircuitPlan {
 /// coupled pair at `z_diff` Ω (default 100), with intra-pair length
 /// mismatch held under `skew_mm` (default: the interface class budget —
 /// see `pair_skew_budget_mm`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PairSpec {
     pub p: String,
     pub n: String,
@@ -52,7 +52,7 @@ pub struct PairSpec {
 }
 
 /// A fixed board outline request (mm).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BoardSpec {
     pub width_mm: f64,
     pub height_mm: f64,
@@ -62,7 +62,7 @@ pub struct BoardSpec {
 /// With `region` (x0, y0, x1, y1 in mm from the board's top-left corner)
 /// the plane covers only that rectangle; a higher `priority` wins where
 /// planes overlap (split power planes).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlaneSpec {
     pub net: String,
     pub layer: String,
@@ -74,14 +74,14 @@ pub struct PlaneSpec {
     pub priority: Option<i32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum PlaneRegionSpec {
     Rect([f64; 4]),
     Auto(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlannedComponent {
     /// Reference designator: R1, C1, U1, ...
     pub reference: String,
@@ -129,7 +129,7 @@ pub struct PlannedComponent {
     pub edge_overhang_mm: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlannedNet {
     /// Net name: "VCC", "GND", "SIG_A", ...
     pub name: String,
@@ -2287,8 +2287,15 @@ pub fn count_missing_models(pcb_text: &str, model_dir: Option<&str>) -> (usize, 
 /// someda-fetched directory has at that absolute file, so kicad-cli renders
 /// it (one KICAD*_3DMODEL_DIR cannot name two directories).
 pub fn resolve_fetched_models(pcb_text: &str, model_dir: Option<&str>) -> String {
-    let Ok(home) = std::env::var("HOME") else { return pcb_text.to_string() };
-    let fetched = format!("{}/.local/share/someda/3dmodels", home);
+    // SOMEDA_FETCHED_DIR: where fetched models live (the desktop app sets it);
+    // default ~/.local/share/someda/3dmodels (the plugin's fetch-libs convention)
+    let fetched = match std::env::var("SOMEDA_FETCHED_DIR") {
+        Ok(d) => d,
+        Err(_) => {
+            let Ok(home) = std::env::var("HOME") else { return pcb_text.to_string() };
+            format!("{}/.local/share/someda/3dmodels", home)
+        }
+    };
     if !std::path::Path::new(&fetched).is_dir() {
         return pcb_text.to_string();
     }

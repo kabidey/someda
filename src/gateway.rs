@@ -22,6 +22,9 @@ pub struct Gateway {
     pub api_key: String,
     pub model: String,
     pub timeout: Duration,
+    /// Wire protocol: OpenAI chat completions (the default and every
+    /// compatible vendor) or Anthropic's Messages API.
+    pub protocol: crate::app::providers::Protocol,
 }
 
 impl Gateway {
@@ -34,6 +37,7 @@ impl Gateway {
             api_key: String::new(),
             model: "(plan file)".into(),
             timeout: Duration::from_secs(1),
+            protocol: crate::app::providers::Protocol::OpenAi,
         }
     }
 }
@@ -108,7 +112,54 @@ impl Gateway {
             api_key,
             model,
             timeout: Duration::from_secs(120),
+            protocol: crate::app::providers::Protocol::OpenAi,
         })
+    }
+
+    /// A gateway for a chosen provider (the app's path; the CLI uses `from_env`).
+    pub fn new(protocol: crate::app::providers::Protocol, base_url: &str, api_key: &str, model: &str) -> Gateway {
+        Gateway {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            api_key: api_key.trim().to_string(),
+            model: model.trim().to_string(),
+            timeout: Duration::from_secs(180),
+            protocol,
+        }
+    }
+
+    /// The models the provider offers (`GET {base}/models`, both protocols
+    /// answer `{"data": [{"id": ...}]}`). Sorted; empty when the provider
+    /// has no listing.
+    pub fn list_models(&self) -> Result<Vec<String>, GatewayError> {
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let req = ureq::get(&url).timeout(Duration::from_secs(30));
+        let req = self.auth(req);
+        let v: serde_json::Value = req
+            .call()
+            .map_err(|e| GatewayError::Http(e.to_string()))?
+            .into_json()
+            .map_err(|e| GatewayError::Parse(e.to_string()))?;
+        let mut ids: Vec<String> = v
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|a| a.iter().filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    fn auth(&self, req: ureq::Request) -> ureq::Request {
+        match self.protocol {
+            crate::app::providers::Protocol::OpenAi => {
+                if self.api_key.is_empty() {
+                    req
+                } else {
+                    req.set("Authorization", &format!("Bearer {}", self.api_key))
+                }
+            }
+            crate::app::providers::Protocol::Anthropic => req.set("x-api-key", &self.api_key).set("anthropic-version", "2023-06-01"),
+        }
     }
 
     /// Send a chat completion request. Returns the assistant's message content.
@@ -123,6 +174,9 @@ impl Gateway {
         user: &str,
         temperature: Option<f64>,
     ) -> Result<String, GatewayError> {
+        if self.protocol == crate::app::providers::Protocol::Anthropic {
+            return self.chat_anthropic(system, user, temperature);
+        }
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         let body = ChatRequest {
@@ -134,8 +188,8 @@ impl Gateway {
             temperature,
         };
 
-        let response = ureq::post(&url)
-            .set("Authorization", &format!("Bearer {}", self.api_key))
+        let response = self
+            .auth(ureq::post(&url))
             .set("Content-Type", "application/json")
             .timeout(self.timeout)
             .send_json(serde_json::to_value(&body).map_err(|e| GatewayError::Parse(e.to_string()))?)
@@ -152,6 +206,39 @@ impl Gateway {
             .and_then(|c| c.message.content)
             .filter(|c| !c.is_empty())
             .ok_or(GatewayError::Empty)
+    }
+
+    /// Anthropic Messages API: `POST {base}/messages`, `x-api-key` +
+    /// `anthropic-version`, the system prompt as a top-level field, text at
+    /// `content[0].text` (platform.claude.com/docs/en/api/messages, 2026-10-19).
+    fn chat_anthropic(&self, system: &str, user: &str, temperature: Option<f64>) -> Result<String, GatewayError> {
+        let url = format!("{}/messages", self.base_url.trim_end_matches('/'));
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "max_tokens": 8192,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+        });
+        if let Some(t) = temperature {
+            body["temperature"] = serde_json::json!(t);
+        }
+        let v: serde_json::Value = self
+            .auth(ureq::post(&url))
+            .set("Content-Type", "application/json")
+            .timeout(self.timeout)
+            .send_json(body)
+            .map_err(|e| GatewayError::Http(e.to_string()))?
+            .into_json()
+            .map_err(|e| GatewayError::Parse(e.to_string()))?;
+        let text: String = v
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|blocks| blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join(""))
+            .unwrap_or_default();
+        if text.is_empty() {
+            return Err(GatewayError::Empty);
+        }
+        Ok(text)
     }
 
     /// Chat and extract a JSON object from the response (handles markdown fences).
