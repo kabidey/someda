@@ -1,174 +1,201 @@
 # someda
 
-**A clean-room KiCad-compatible EDA core in Rust.**
+**From a circuit plan to a fab-ready KiCad project, with every claim checked.**
 
-SomTronics ([somtronics.org](https://somtronics.org)) · MIT license
+`someda` is a KiCad-compatible EDA engine in Rust. It takes a small JSON
+description of a circuit — parts, nets, intent such as "this connector on the
+left edge" — and produces a KiCad schematic and board, placed and routed,
+audited for signal integrity, stability and thermals, verified by KiCad's own
+ERC/DRC, and exported as Gerbers, drill, position and BOM files plus a
+JLCPCB order package and 3D renders. It never says "done" unless six
+independent gates agree.
 
-`someda` implements the architecture patterns documented in the
-[SomTronics AI-EDA Study](https://github.com/kabidey/somtronics-ai-eda-study)
-as original, working code:
+The plan can come from a person, a script, or any language model: the model
+writes intent, the engine owns geometry, and the engine repairs what a plan
+edit can fix before building again.
 
-- **S-expression parser** for KiCad board/schematic files
-- **Board model**: footprints, pads, nets, and the Edge.Cuts outline
-- **DRC engine**: pad-outside-board, pad clearance, outline closure
-- **The honest-done repair loop**: done claims are re-verified against the
-  board's own state — claiming done with open work is rejected
+[![release](https://img.shields.io/github/v/release/kabidey/someda)](https://github.com/kabidey/someda/releases)
+MIT license · maintained by [SomTronics](https://somtronics.org)
 
-## 0.7: differential pairs, crosstalk as a rule, oscillation gates (2026-10-19)
-
-- **Differential pairs are routed as pairs.** `pairs: [{"p","n","z_diff","skew_mm"}]` in the plan. The cross-section comes from JLCPCB's own impedance calculator (6-layer JLC06161H-3313 and 4-layer JLC04161H-7628 tables, run 2026-10-19) or, off-table, from the Kirschning–Jansen coupled-microstrip closed form (`formulas::coupled_microstrip`, transcribed from the Qucs/KiCad transline source; it agrees within 8 % with a public calculator that implements the IPC-2141 coupled-line approximation). The router routes every pair first as a coupled corridor on one plane-referenced layer (direction-aware A*, handedness carried from the start pads to the far pads, straight terminals), two offset tracks, short single-ended tails, and compensates the intra-pair skew (4·offset per corner, tail differences) with tail detours and 45° bumps on the shorter track. The `pairs` stage fails on an uncoupled trunk or a skew above the budget (Toradex 102492 interface tables by default).
-- **Crosstalk spacing is enforced, not warned.** Every net with a frequency or a clock/highspeed/rf role carries a 3W/5W edge gap (W = design trace width) that the router honours in both directions (aggressor halos; victims' traces dilated into near maps) outside breakout zones (1 mm around pads, fine-pitch escape bands). The SI audit measures same-layer parallel runs on the routed copper against the same zones: `crosstalk-violation` is an error.
-- **Oscillation checks that mean something.** The lumped LC "self-resonance" warning no longer fires on terminated transmission lines (it flagged every 20 mm MIPI lane); instead: `unterminated-line` for electrically long nets without a termination, per-capacitor mounting-loop inductance from the routed stubs and via pair (`decoupling-loop`), regulator output capacitance vs datasheet minimums, crystal load capacitors and trace geometry, buck switch/feedback nodes (`stability.rs`), and a per-rail PDN |Z(f)| sweep against the ΔV/ΔI target (`pdn.rs`).
-- **Breakout zones are honest.** Inside a fine-pitch escape band the spacing rule is relaxed only for copper running along the pins' escape direction (neighbours must leave side by side at the pin pitch); copper running along the pin row is a normal aggressor (an audio net once ran 3.4 mm along a USB pair at 0.21 mm inside the SoC's band). Escape lanes are no longer exempt on every layer. Nets that carry one signal through a small pass-through part (an ESD array) form a crosstalk family in both the router and the audit.
-- **Connectors face their edge and sit on it.** The engine reads each edge connector's opening direction from its footprint (courtyard/fab overhang beyond the pads), rotates it toward the edge, and puts the courtyard on the edge; `edge_overhang_mm` is how far the BODY FRONT protrudes (USB-C shells). Placement order is mechanical first: mounting holes at their exact corners, the centre anchor, edge connectors largest first, then the rest; a fine-pitch connector's escape ring applies only on its inward side. A connector with no room on its edge is moved to an adjacent edge, re-oriented and the board re-placed (`repair:` lines, bounded); a connector that fits no edge fails the placement stage. Rail capacitors are aimed at their rail's pins even when the rail is a plane, and a split-plane island grows (≤ 6 mm per side) to cover the capacitors placed at its IC.
-- **The pair corridor never crosses its own pads** (it starts and ends outside the real P/N pads' clearance, in front of them) and keeps a minimum leg between corners so the two offset tracks cannot cross at a tight U-turn — both live-verified shorts on a SOT-23-6 ESD array.
-- **Repair loop.** `ai build` runs up to `SOMEDA_REPAIR_ROUNDS` (default 3) repair rounds by itself: footprint names corrected to the closest library footprint, a 100 nF capacitor added where ERC finds an IC rail without one, output capacitance added where a regulator's datasheet minimum is missing, the board grown (×1.15, at most twice) when parts overlap, connections stay unrouted or a pair fails — only when the plan fixes no size; otherwise the size is printed as a `suggest:` line. Every change is a `repair:` line, every edit only the author can make a `suggest:` line, and the plan as built is written as `plan.built.json` (`repair.rs`).
-- Impedance-controlled single-ended nets are confined to layers over a solid plane; the KiCad project's minimum track width is the fab's (0.10 mm) so fab-table pair widths pass DRC. Silkscreen clipped by the board edge (a protruding connector shell) is a listed warning, not a fab-blocking finding.
-- `cargo run --example formula_probe` prints the pair cross-sections alongside the other formulas.
-- **Checkpoints (0.7.0, kicad-cli 10.0.6):** the 555 fixture with a decoupling capacitor (2-layer, 10 connections) and a 26-part 6-layer LQFP-48 board (31 connections, 46 fanouts) reach all six gates with DRC 0 errors; a 555 plan with a misspelled footprint and no decoupling capacitor reaches all six gates after one repair round (footprint substituted, 100 nF added). The 132-part V3s SBC routes 187 of 187 connections (225 plane fanouts, 104 escape vias) with its seven USB/Ethernet/MIPI pairs coupled within budget (USB J1↔U8 skew −0.65 mm of 1.1, U8↔U1 +0.52 mm with a via crossover, Ethernet ≤ 0.01 mm of 0.25, MIPI 0.00 mm of 0.15), 0 crosstalk violations, kicad-cli DRC 0 errors and all six gates; the 3.5 mm jack found no room on the top edge and was moved to the bottom edge by the engine, the +1V8 island grew 4 mm to reach six capacitors (evidence in the plugin repository). Remaining warnings on the SBC are real: crystal traces of 11–17 mm with vias, the camera connector's +1V8 capacitor 23 mm from the island (7.4 nH), three +1V8 capacitors more than 6 mm outside the island, board density 147 %.
-
-## 0.6: real footprints, multilayer, escape vias (2026-10-19)
-
-What changed between 0.5.4 and 0.6.0, each verified against kicad-cli 10.0.6 on real boards:
-
-- **Real KiCad footprints.** `footprint: "Lib:Name"` resolves to the installed `.kicad_mod`, which is embedded verbatim (silk, fab, courtyard, keep-outs, 3D) with placement, reference and pad nets injected. Pad angles and zone polygons follow KiCad's board-file conventions; the footprint rotation transform was corrected to KiCad's (130/130 rotated pads on `tests/corpus/interf_u` match the IPC-D-356 export; the old transform matched 0).
-- **Layers.** `layers` 2/4/6 (up to 12) with the full technical layer table, `planes` on inner layers (whole-layer, rectangle or `"auto"` region with priority for split planes), JLCPCB stackup presets per layer count, and a `.kicad_pro` written next to the board so kicad-cli judges by the fab rules instead of its 0.2mm defaults.
-- **Placement.** Courtyard-aware: connectors flush to their edge at an `edge_at` slot, parts next to the pins they share a net with (`near`), no courtyard overlaps, a keep-out ring around fine-pitch ICs, thermal keep-apart.
-- **Router.** Dense occupancy over every signal layer; pads rasterized as their real rotated rectangles (circles as ellipses); through-hole pads block every layer; hole clearance; footprint keep-outs; plane fanout per pad (sites under the body preferred) with trace fallback; depth-staggered **escape vias** for every fine-pitch signal pin; escape lanes and bands that keep other nets and wide traces out of pin rows; route-to-net with union-find components; whole-net rip-up-and-reroute plus final retries; collinear segment merging; 0.35/0.2mm vias on multilayer rules.
-- **Honest gates.** The kicad-cli DRC stage parses the report file (errors + unconnected fail, warnings are listed) — the stdout classification used to pass boards with unconnected pads. Gerber set per copper count with zones checked, drill map, PNG renders. Engine DRC and ERC judge by the board's rules; the schematic parser matches symbols by full name.
-- **Checkpoints.** The README's 555 example reaches all six gates with DRC 0 errors (it did not before: 2–5 unrouted). A 26-part 6-layer LQFP-48 board and a 132-part Allwinner V3s SBC (192 connections, 220 fanouts, 130 escape vias) both reach all six gates with kicad-cli DRC at 0 errors.
-- **Still not done (0.6):** differential-pair routing and length matching — done in 0.7; bottom-side placement, electrical simulation.
-
-## Usage
+## What a build does
 
 ```
-someda info    <board.kicad_pcb>     summary of the board
-someda drc     <board.kicad_pcb>     run design-rule checks
-someda validate <board.kicad_pcb>    parse + DRC (exit 1 on errors)
-someda repair  <board.kicad_pcb>     run the honest-done repair loop
-someda report  <board.kicad_pcb> [json|md]  DRC report
-someda erc     <schematic.kicad_sch> electrical rule check
-someda netclasses <board.kicad_pcb>  net class summary
-someda ai plan <description>         plan a circuit with an LLM (print JSON)
-someda ai build <description>        plan + generate + verify + export (full project)
+plan ─▶ schematic ─▶ footprints ─▶ placement ─▶ routing ─▶ audits ─▶ kicad-cli ─▶ exports ─▶ six gates
 ```
 
-### AI Mode (optional — works with any OpenAI-compatible API)
+- **Schematic** — a readable sheet (library symbols, labelled pins, project symbol library), judged by kicad-cli ERC.
+- **Footprints** — real KiCad library footprints resolved from `Lib:Name`; a misspelled name is replaced by the closest library footprint in a repair round, a part the libraries lack is reported, never guessed.
+- **Placement** — courtyard-aware: mounting holes at their corners, the centre part, edge connectors largest first (rotated so the connector's opening faces its edge, courtyard on the edge or protruding by `edge_overhang_mm`), parts next to the pins they share a net with, a keep-out ring for fine-pitch escape vias, hot parts kept apart. A connector that finds no room on its edge is moved to an adjacent edge and the board re-placed.
+- **Routing** — 2, 4 or 6 copper layers on JLCPCB rules; copper planes on inner layers with per-pad fanout vias (split-plane islands grow to reach their decoupling capacitors); depth-staggered escape vias for every fine-pitch pin; **differential pairs first** as coupled corridors at a fab-table cross-section with matched lengths; **3W/5W crosstalk spacing enforced** for every fast net; impedance-controlled nets at widths solved from the stackup, confined to plane-referenced layers; rip-up and reroute.
+- **Audits on the routed copper** — per-net frequency, stray L/C and SWR, λ/20 stubs, unterminated transmission lines, crosstalk re-measured against the router's own breakout zones, per-capacitor mounting-loop inductance, regulator output capacitance vs datasheet minimums, crystal loads and traces, buck switch/feedback nodes, PDN |Z(f)| per rail, junction temperatures, JLCPCB fab scope.
+- **kicad-cli** — ERC, DRC with zones refilled (judged from the report file), Gerbers, drill + map, position file, BOM, 3D renders with component bodies.
+- **Exports** — detailed BOM (qty, references, value, MPN, LCSC, package) and a JLCPCB order package (Protel-named Gerber zip, merged Excellon, assembly BOM, CPL with per-package rotation corrections).
+- **Six gates** — DRC, shorts, unrouted, pours, Gerbers, drill. All six pass = `HONEST-DONE`; anything else = `NOT DONE`, with the failing gate named.
+- **Repair rounds** — up to `SOMEDA_REPAIR_ROUNDS` (default 3): footprint substitution, a 100 nF capacitor where ERC finds an IC rail without one, regulator output capacitance, board growth when parts overlap or connections stay unrouted (only when the plan fixes no size). Every change is a `repair:` line, every edit only the author can make a `suggest:` line with the exact plan edit, and the plan as built is written to `plan.built.json`.
+
+## Install
+
+Prebuilt binaries for Linux x86_64, macOS (Apple silicon and Intel) and Windows x86_64 are on the
+[releases page](https://github.com/kabidey/someda/releases). Or build from source with stable Rust (three direct dependencies: `ureq`, `serde`, `serde_json`):
 
 ```bash
-export SOMEDA_API_KEY="sk-..."   # or OPENAI_API_KEY
-export SOMEDA_BASE_URL="https://api.openai.com/v1"  # or any compatible API
-export SOMEDA_MODEL="gpt-4o-mini"  # or any model
-
-someda ai build "Build a 555 timer LED blinker with 1Hz output"
+cargo build --release          # target/release/someda
 ```
 
-The LLM plans the circuit as a strict JSON contract (components + nets);
-someda's deterministic generators write `.kicad_sch` + `.kicad_pcb`; kicad-cli
-runs ERC/DRC and exports Gerbers, drill, position, and BOM. The honest-done
-loop verifies every stage.
+For the verification and export stages you need [KiCad](https://www.kicad.org/) with `kicad-cli`
+on your PATH (developed and verified against KiCad 10.0.6; set `SOMEDA_KICAD_CLI` to point at it otherwise)
+and KiCad's footprint and 3D model libraries (`kicad-footprints`, `kicad-packages3d` on Debian).
+Without `kicad-cli` the engine still plans, places, routes and audits, and reports the skipped
+stages as such.
 
-Works with: OpenAI, Azure OpenAI, vLLM, Ollama (`/v1` mode), LM Studio,
-llama.cpp server — any OpenAI-compatible `/chat/completions` endpoint.
+Using it from [Claude Code](https://claude.com/claude-code)? Install the
+[someda plugin](https://github.com/kabidey/someda-claude-plugin): it writes the plan from a
+conversation, fetches missing footprints and 3D models (KiCad GitLab, LCSC/EasyEDA, vendor
+zips), runs this engine, and reports the gates.
 
-## Example
+## Quick start
 
+`examples/plan_555.json` is an NE555 astable blinking an LED, with the supply on a header at the
+left edge and the 555's decoupling capacitor asked to sit next to it:
+
+```json
+{
+  "name": "555 LED blinker",
+  "description": "NE555 astable at about 1 Hz driving an LED",
+  "layers": 2,
+  "components": [
+    {"reference": "U1", "value": "NE555", "lib_id": "Timer:NE555", "footprint": "Package_DIP:DIP-8_W7.62mm", "position": "center"},
+    {"reference": "R1", "value": "10k",   "lib_id": "Device:R",   "footprint": "Resistor_SMD:R_0603_1608Metric"},
+    {"reference": "R2", "value": "100k",  "lib_id": "Device:R",   "footprint": "Resistor_SMD:R_0603_1608Metric"},
+    {"reference": "R3", "value": "330",   "lib_id": "Device:R",   "footprint": "Resistor_SMD:R_0603_1608Metric"},
+    {"reference": "C1", "value": "4.7uF", "lib_id": "Device:C",   "footprint": "Capacitor_SMD:C_0805_2012Metric"},
+    {"reference": "C2", "value": "100nF", "lib_id": "Device:C",   "footprint": "Capacitor_SMD:C_0603_1608Metric", "near": "U1"},
+    {"reference": "D1", "value": "red",   "lib_id": "Device:LED", "footprint": "LED_SMD:LED_0805_2012Metric"},
+    {"reference": "J1", "value": "5V in", "lib_id": "Connector:Conn_01x02", "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical", "position": "left_edge"}
+  ],
+  "nets": [
+    {"name": "VCC", "pins": ["J1:1", "U1:8", "U1:4", "R1:1", "C2:1"]},
+    {"name": "GND", "pins": ["J1:2", "U1:1", "C1:2", "C2:2", "D1:1"]},
+    {"name": "DIS", "pins": ["U1:7", "R1:2", "R2:1"]},
+    {"name": "THR", "pins": ["U1:6", "U1:2", "R2:2", "C1:1"]},
+    {"name": "OUT", "pins": ["U1:3", "R3:1"]},
+    {"name": "LED", "pins": ["R3:2", "D1:2"]}
+  ]
+}
 ```
-$ someda validate board.kicad_pcb
-parse: OK
-DRC: 0 error(s), 0 warning(s)
-result: CLEAN — board is parseable and passes all checks
-
-$ someda repair broken.kicad_pcb
-repair loop: inspecting board...
-DRC: 1 error(s), 0 warning(s)
-  [ERROR] pad-outside-board: Pad R1:1 has copper outside the board outline. ...
-round 1: nudging 1 footprint(s) into outline: R1
-DONE ACCEPTED: repair attempted; verify
-rounds used: 2
-DRC: 0 error(s), 0 warning(s)
-```
-
-## Build
-
-```
-cargo build --release    # zero dependencies
-cargo test               # 13 tests
-```
-
-## What it is / is not
-
-This is an **original implementation** of the concepts from our architecture
-study of a commercial AI-EDA product: the file formats are public KiCad
-s-expression syntax; the DRC rules and repair-loop contract are clean-room
-implementations of the design patterns we documented. It contains no code,
-text, or material from the analyzed product.
-
-## v0.4.0 — The Full Idea-to-PCB Pipeline (PCB-Superpower Skills 101-103)
-
-The application now walks a circuit from **idea to fab-ready PCB** in one pipeline,
-implementing the [PCB-Superpower](https://github.com/kabidey/PCB-Superpower)
-orchestration layer (skills 101-103) as deterministic Rust:
-
-| Skill | someda module | What it does |
-|-------|--------------|--------------|
-| 102 Placement Handoff | `placer.rs` | The deterministic solver that owns geometry: 9-region semantic positions, rows, groups, apart (2D distance), center-out ring packing ordered by ratsnest centrality. The LLM never emits coordinates. |
-| 101 SomRoute Autorouting | `router.rs` | A* grid router with the skill's verified defaults: 0.25 mm trace, 0.2 mm clearance, 0.6/0.3 vias, 0.25 mm edge clearance, Manhattan-only moves, full segment rasterization, via halos, honest `routed N of M` reporting. |
-| 103 DRC Repair Loop | `bringup.rs` + orchestrator stage 7 | The 6-gate export preflight (DRC, shorts, unrouted, pours, Gerbers, drill) as the honest-done contract: all six pass = orderable, anything else = NOT DONE. |
-| All 103 skills | `formulas.rs` | Every quantitative formula: IPC-2152 current, microstrip Z0 + width solver, λ/20 via stubs, critical length, 3W/5W crosstalk, shielding A/R losses, slot leakage, ground bounce, via loop inductance, thermal chain (θJA, Tj, via grids), PDN targets, cap SRF, L-match RF networks, area budgets, USB3/DDR/PCIe length budgets — each verified against the skills' own worked examples. |
-| Plan schema | `boardplan.rs` | The 7-form contract: plan / bringup phases (layers → stackup → net classes → placement → planes → route → checks), route/unroute flags with net scoping, strict validation. |
-
-### Live-verified end to end
-
-```
-someda ai build "555 LED blinker"
-  Stage 1  plan (LLM JSON contract)
-  Stage 2b placement (deterministic solver, 5 footprints)
-  Stage 2c route: routed 303 of 303 connections (0 unrouted)
-  Stage 6  someda DRC: 0 errors
-  Stage 7  export preflight: drc PASS shorts PASS unrouted PASS pours PASS gerbers PASS drill PASS
-
-kicad-cli pcb drc circuit.kicad_pcb
-  Found 0 unconnected items        (was 4 before routing)
-  0 electrical violations          (only missing-lib env warnings)
-kicad-cli pcb export gerbers → fab/circuit-F_Cu.gtl (routed copper), .drl, .gbrjob
-```
-
-KiCad's own DRC drove two router fixes (grid must encode fab geometry; Manhattan-only
-moves) — the honest-done loop working exactly as the skills demand.
-
-## v0.5.0 — The Physics-Aware Design Harness
-
-The design now carries physics end to end, per the harness directive:
-
-| Module | What it does |
-|--------|--------------|
-| `netfreq.rs` | Every NET knows its frequency: declared in the plan (freq_hz/role), derived from component specs ("2.4GHz", "NE555", "74HC00"), or classified by name (power=DC, clock, RF, high-speed). Transmission-line and 3W/5W decisions read this. |
-| `materials.rs` | JLCPCB's actual materials and scope (fetched 2026-10-19): FR-4 Er 4.5, 7628/3313/2116 prepregs, soldermask Er 3.8, 4/4mil min, 0.15/0.25 vias, ±10% impedance — the fab contract every design is checked against. |
-| `si.rs` | Microwave stability on the ROUTED board: stray L and C measured per net from actual geometry (trace L/C per mm, 0.5nH vias, pad C), SWR from Z0 mismatch vs target, λ/20 stub resonance, net LC self-resonance (oscillation risk), crosstalk parallel-run analysis. |
-| `thermal.rs` | Power dissipation parsed per component; θJA package classes; junction temps vs limits; thermal via budgets; copper balance; thermal-aware area claims. |
-| Router upgrades | Impedance-controlled nets route at width SOLVED from the microstrip equation on the JLCPCB stackup (50Ω → 1.44mm on 1.6mm FR-4); impedance nets route first; neck-down near fine-pitch pads; width-aware pad clearance; stackup counsel when the solved width says "use a thinner dielectric". |
-
-Live-verified with an RF fixture (2.4GHz path + 555): the harness flagged the
-naive board's SWR 2.16 at default width, then the router solved the RF trace
-to 50Ω and KiCad DRC passed clean. The honest-done loop applied to physics.
-
-## Claude Code Plugin — PCB from a vibe
-
-Use someda directly inside Claude Code:
 
 ```bash
-claude plugin marketplace add kabidey/someda-claude-plugin
-claude plugin install someda@someda
+SOMEDA_PLAN_FILE=examples/plan_555.json SOMEDA_PROJECT_DIR=out someda ai build "555 LED blinker"
 ```
 
-Then just describe a circuit in conversation:
+The build prints every stage and ends with the gate table. With someda 0.7.0 and kicad-cli
+10.0.6 this plan places 8 parts on a 43 × 35 mm board, routes 15 of 15 connections, passes
+kicad-cli ERC and DRC with 0 errors, and reaches all six gates. `out/` then holds:
 
 ```
-/pcb-build a 555 timer blinking an LED at 1Hz with proper decoupling
+out/circuit.kicad_sch  circuit.kicad_pcb  circuit.kicad_pro   the KiCad project
+out/circuit-erc.rpt    circuit-drc.rpt                         kicad-cli reports
+out/fab/               Gerbers, drill + map, positions.csv, bom.csv, bom-detailed.csv, bom.md
+out/fab/jlcpcb/        jlcpcb-gerbers.zip, jlcpcb-bom.csv, jlcpcb-cpl.csv
+out/render/            board-top.png, board-bottom.png, board-iso.png
+out/plan.built.json    the plan as built (rotations, repairs, grown regions)
 ```
 
-Claude plans the circuit (real pinouts, per-net frequencies, per-component
-power); the compiled someda engine places, routes with physics, audits
-against JLCPCB's real materials, verifies through kicad-cli, and exports
-Gerbers — gated by the honest-done contract.
+The plan can also come from a language model: with `SOMEDA_API_KEY`, `SOMEDA_BASE_URL` and
+`SOMEDA_MODEL` set (any OpenAI-compatible `/chat/completions` endpoint: OpenAI, Azure, vLLM,
+Ollama, LM Studio, llama.cpp), `someda ai build "<description>"` asks the model for the plan
+and continues exactly as above. `someda ai plan "<description>"` prints the plan only.
+
+## The plan
+
+A plan is intent, never coordinates. The full reference lives in the plugin's
+[CONTRACT.md](https://github.com/kabidey/someda-claude-plugin/blob/master/skills/someda/references/CONTRACT.md);
+the fields are:
+
+| Field | Meaning |
+|---|---|
+| `components[].reference`, `value`, `lib_id`, `footprint` | Designator, value (may carry power: `"1W"`), KiCad symbol, KiCad footprint `Lib:Name` |
+| `components[].position` | `top_left` … `bottom_right`, `center`, or an edge: `left_edge`, `right_edge`, `top_edge`, `bottom_edge` |
+| `components[].edge_at`, `edge_overhang_mm` | Slot along the edge (0 … 1); how far the body front protrudes past the edge (USB-C shells) |
+| `components[].near` | Sit next to this reference, on the side of the pins they share |
+| `components[].rotation` | Optional; edge connectors need none, the engine turns the opening toward the edge |
+| `components[].lcsc`, `mpn` | Part numbers for the BOM, the JLCPCB package and library fetching |
+| `nets[].name`, `pins` | Net name and `"REF:PIN"` members |
+| `nets[].freq_hz`, `role`, `termination` | Highest frequency; `clock` / `highspeed` / `rf` / `power`; `series` / `parallel` / `on-chip` |
+| `layers`, `board` | 2, 4 or 6 copper layers; optional fixed `{width_mm, height_mm}` (otherwise budgeted from the courtyards) |
+| `planes[]` | `{net, layer, region, priority}` — whole-layer, a rectangle, or `"auto"` (the owning IC's pins plus 5 mm) |
+| `pairs[]` | `{p, n, z_diff, skew_mm}` — differential pairs routed as coupled pairs |
+
+## What has been verified
+
+Every number below comes from an unedited build log; the SBC's complete outputs are kept as
+evidence in the plugin repository
+([examples/sompi-v3s/evidence](https://github.com/kabidey/someda-claude-plugin/tree/master/examples/sompi-v3s/evidence)).
+
+- **555 blinker** (above): 15 of 15 routed, DRC 0 errors, six gates. The same plan with a misspelled footprint and no decoupling capacitor reaches the six gates after one repair round.
+- **6-layer LQFP-48 board**, 26 parts: 31 connections and 46 plane fanouts, DRC 0 errors, six gates.
+- **SomPi-V3s**, an Allwinner V3s single-board computer: 132 parts, 90 × 60 mm, six layers (JLC06161H-3313), USB-C, 10/100 Ethernet, microSD, SPI NOR, 40-pin LCD and 24-pin MIPI camera FPCs, audio jack, GPIO header, two bucks and two LDOs. 187 of 187 connections routed, 225 plane fanouts, 104 escape vias; seven differential pairs coupled within their skew budgets (USB 90 Ω: −0.65 mm and +0.52 mm of 1.1, one through a via crossover; Ethernet 100 Ω: ≤ 0.01 mm of 0.25; MIPI 100 Ω: 0.00 mm of 0.15); 0 crosstalk violations; kicad-cli DRC 0 errors; six gates. The engine rotated every edge connector from its footprint, moved the audio jack to the bottom edge when the top edge had no 18 mm slot left, and grew the +1V8 island to reach its capacitors. Its warnings are real and listed: crystal traces of 11–17 mm, a camera 1.8 V capacitor with a 7.4 nH loop, three capacitors beyond the island, board density 147 %.
+
+What "six gates" does not mean: the boards are not simulated and have not been built. Connector
+pinouts follow conventions that must be checked against the parts you buy; the 3D bodies fetched
+from LCSC are not verified against physical parts; clock-to-data skew across pairs is not
+enforced; everything is placed on the top side.
+
+## Environment
+
+| Variable | Effect |
+|---|---|
+| `SOMEDA_PLAN_FILE` | Build this plan instead of asking a model |
+| `SOMEDA_PROJECT_DIR` | Output directory (default `./someda-build`) |
+| `SOMEDA_FOOTPRINT_DIRS` | Extra `.pretty` directories, colon-separated, searched before KiCad's |
+| `SOMEDA_REPAIR_ROUNDS` | Repair rounds after the first build (default 3; 0 disables) |
+| `SOMEDA_STOP_AFTER` | `schematic` or `route`: write that far and stop (review a schematic before fetching libraries) |
+| `SOMEDA_KICAD_CLI` | Path to `kicad-cli` |
+| `SOMEDA_API_KEY`, `SOMEDA_BASE_URL`, `SOMEDA_MODEL` | Planner endpoint (also read as `OPENAI_*`) |
+| `SOMEDA_ROUTE_DEBUG` (`1`/`2`), `SOMEDA_ROUTE_DEBUG_NET`, `SOMEDA_PLACE_DEBUG` | Router and placer diagnostics: occupancy maps around failed pins, corridor decisions, placement targets |
+| `KICAD10_3DMODEL_DIR` (or 9/8) | Where the 3D bodies for the renders live, when KiCad is not in a standard place |
+
+## Board tools
+
+The engine also works on existing KiCad files:
+
+```
+someda info       <board.kicad_pcb>          summary of the board
+someda drc        <board.kicad_pcb>          design-rule checks
+someda validate   <board.kicad_pcb>          parse + DRC (exit 1 on errors)
+someda repair     <board.kicad_pcb>          nudge pads inside the outline until DRC is clean
+someda report     <board.kicad_pcb> [json|md]
+someda erc        <schematic.kicad_sch>      electrical rule check
+someda netclasses <board.kicad_pcb>          net class summary
+```
+
+## Repository
+
+```
+src/orchestrator.rs   the pipeline: plan → stages → gates
+src/repair.rs         repair rounds and plan edits
+src/placer.rs         courtyard placement
+src/router.rs         grid router; router/pairs.rs: differential-pair corridors
+src/si.rs stability.rs pdn.rs thermal.rs   audits on the routed board
+src/formulas.rs materials.rs netfreq.rs    physics, JLCPCB stackups, per-net frequency
+src/footprint_lib.rs board.rs sexp.rs      KiCad footprints, board model, s-expressions
+src/schematic.rs drc.rs rules.rs           schematic generation + ERC, engine DRC, fab rules
+src/kicad_cli.rs bom.rs jlcpcb.rs          kicad-cli stages, BOM, JLCPCB package
+examples/             plan_555.json, formula_probe (prints every formula), pipeline examples
+tests/                corpus of real boards and fixtures
+```
+
+`cargo test` runs the suite (about 200 tests); `cargo run --example formula_probe` prints the
+physics outputs so they can be compared with independent references. Pushing a `v*` tag builds
+the release binaries.
+
+[ARCHITECTURE.md](ARCHITECTURE.md) explains the design and its honest-done invariant,
+[ROADMAP.md](ROADMAP.md) the milestones, [CHANGELOG.md](CHANGELOG.md) what each version
+changed and what it was verified against.
+
+## Provenance
+
+someda is an original implementation of the architecture patterns documented in the
+[SomTronics AI-EDA study](https://github.com/kabidey/somtronics-ai-eda-study) of a commercial
+AI-EDA product: public KiCad file formats, clean-room DRC rules and repair-loop contract. It
+contains no code, text or material from the analysed product. MIT license.
