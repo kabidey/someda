@@ -158,7 +158,7 @@ impl DesignRules {
         "min_text_height": 0.8,
         "min_text_thickness": 0.08,
         "min_through_hole_diameter": 0.2,
-        "min_track_width": {tw},
+        "min_track_width": {fab_tw},
         "min_via_annular_width": 0.075,
         "min_via_diameter": {vd},
         "solder_mask_clearance": 0.0,
@@ -181,6 +181,7 @@ impl DesignRules {
   "pcbnew": {{ "page_layout_descr_file": "" }}
 }}
 "#,
+            fab_tw = crate::materials::FabLimits::default().min_trace_mm,
             clr = self.clearance_mm,
             tw = self.trace_width_mm,
             edge = self.edge_clearance_mm,
@@ -224,7 +225,7 @@ mod tests {
         let json = r.kicad_project_json("circuit.kicad_pro", &[("power".into(), 0.4, 0.2)]);
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["board"]["design_settings"]["rules"]["min_clearance"], 0.127);
-        assert_eq!(v["board"]["design_settings"]["rules"]["min_track_width"], 0.127);
+        assert_eq!(v["board"]["design_settings"]["rules"]["min_track_width"], 0.1);
         assert_eq!(v["net_settings"]["classes"][1]["name"], "power");
         assert_eq!(v["net_settings"]["classes"][1]["track_width"], 0.4);
     }

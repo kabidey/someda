@@ -193,9 +193,94 @@ pub struct Stackup {
     pub fab_50ohm_width_mm: Option<f64>,
     /// Where that number comes from.
     pub fab_width_source: &'static str,
+    /// The fab's own edge-coupled pair geometries for this stackup's outer
+    /// layer: (Z_diff Ω, trace width mm, edge gap mm). Field-solver
+    /// results with solder mask, which the closed form cannot reproduce on
+    /// a 0.1 mm prepreg where copper thickness ≈ dielectric height.
+    pub fab_pairs: &'static [(f64, f64, f64)],
+    pub fab_pairs_source: &'static str,
+}
+
+/// JLCPCB impedance calculator (jlcpcb.com/pcb-impedance-calculator), run
+/// 2026-10-19: 6-layer 1.6 mm, L1 over L2, 1 oz outer copper, differential
+/// pair (non-coplanar), recommended stackup JLC06161H-3313. Width for the
+/// trace-spacing menu values 5/6/7/8 mil.
+pub const JLC06161H_3313_PAIRS: &[(f64, f64, f64)] = &[
+    (90.0, 0.1234, 0.1270),
+    (90.0, 0.1356, 0.1524),
+    (90.0, 0.1466, 0.1778),
+    (90.0, 0.1537, 0.2032),
+    (100.0, 0.0935, 0.1270),
+    (100.0, 0.1041, 0.1524),
+    (100.0, 0.1128, 0.1778),
+    (100.0, 0.1191, 0.2032),
+];
+
+/// Same calculator run, 4-layer 1.6 mm, L1 over L2, recommended stackup
+/// JLC04161H-7628.
+pub const JLC04161H_7628_PAIRS: &[(f64, f64, f64)] = &[
+    (90.0, 0.2113, 0.1270),
+    (90.0, 0.2906, 0.2032),
+    (100.0, 0.1537, 0.1270),
+];
+
+/// A pair cross-section chosen for a stackup (mm, Ω) with its provenance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairCrossSection {
+    pub width_mm: f64,
+    pub gap_mm: f64,
+    pub z_diff: f64,
+    pub source: String,
 }
 
 impl Stackup {
+    /// Edge-coupled pair geometry for a differential target on the outer
+    /// layer. The fab's own table wins when it has the target (±2 Ω):
+    /// among entries with width ≥ `min_trace_mm`, the one whose width is
+    /// closest to the fab's 50 Ω single-ended width (etch-robust, one
+    /// width class per board). Otherwise the Kirschning–Jansen closed form is
+    /// solved with gap = max(min_space, 1.2·w) and the width scaled by the
+    /// fab/closed-form ratio of the 50 Ω single-ended width when known.
+    pub fn pair_geometry(&self, z_diff: f64, min_trace_mm: f64, min_space_mm: f64) -> Option<PairCrossSection> {
+        let mut candidates: Vec<&(f64, f64, f64)> = self
+            .fab_pairs
+            .iter()
+            .filter(|(z, w, s)| (z - z_diff).abs() <= 2.0 && *w >= min_trace_mm - 1e-9 && *s >= min_space_mm - 1e-9)
+            .collect();
+        let ref_w = self.fab_50ohm_width_mm.unwrap_or(min_trace_mm.max(0.127));
+        candidates.sort_by(|a, b| (a.1 - ref_w).abs().partial_cmp(&(b.1 - ref_w).abs()).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((z, w, s)) = candidates.first() {
+            return Some(PairCrossSection { width_mm: *w, gap_mm: *s, z_diff: *z, source: self.fab_pairs_source.to_string() });
+        }
+        // Closed form with calibration
+        let scale = match self.fab_50ohm_width_mm {
+            Some(fab) => {
+                let closed = crate::formulas::microstrip_width_for_z0(50.0, self.er, self.h_mm, self.copper_thickness_mm);
+                if closed > 0.0 { fab / closed } else { 1.0 }
+            }
+            None => 1.0,
+        };
+        // Bisect w with s = max(min_space, 1.2 w): Z_diff falls with w
+        let z_at = |w: f64| crate::formulas::diff_microstrip_z(self.er, self.h_mm, w, (1.2 * w * scale).max(min_space_mm), self.copper_thickness_mm);
+        let (mut lo, mut hi) = (0.02, 10.0);
+        if z_at(lo) < z_diff || z_at(hi) > z_diff {
+            return None;
+        }
+        for _ in 0..100 {
+            let mid = 0.5 * (lo + hi);
+            if z_at(mid) > z_diff { lo = mid } else { hi = mid }
+        }
+        let w_closed = 0.5 * (lo + hi);
+        let width = (w_closed * scale).max(min_trace_mm);
+        let gap = (1.2 * width).max(min_space_mm);
+        Some(PairCrossSection {
+            width_mm: (width * 1e4).round() / 1e4,
+            gap_mm: (gap * 1e4).round() / 1e4,
+            z_diff,
+            source: format!("Kirschning-Jansen closed form{}", if scale != 1.0 { format!(", width scaled ×{:.3} by the fab 50 Ω calibration", scale) } else { String::new() }),
+        })
+    }
+
     /// Outer-layer microstrip width for a Z₀ target on this stackup. The
     /// fab-calibrated 50 Ω width wins when known (scaled by the closed-form
     /// ratio for other targets); otherwise Hammerstad–Jensen.
@@ -232,6 +317,8 @@ impl Stackup {
                 mask_thickness_mm: 0.0254,
                 fab_50ohm_width_mm: None,
                 fab_width_source: "closed form (no published JLCPCB 7628 width verified)",
+                fab_pairs: JLC04161H_7628_PAIRS,
+                fab_pairs_source: "JLCPCB impedance calculator 2026-10-19, JLC04161H-7628 L1/L2",
             },
             _ => Stackup {
                 name: "JLC06161H-3313",
@@ -248,6 +335,8 @@ impl Stackup {
                 // here); the bare Hammerstad–Jensen form gives 0.175 mm
                 fab_50ohm_width_mm: Some(0.1425),
                 fab_width_source: "JLCPCB impedance calculator via forum.kicad.info/t/69673 (JLC06161-3313B)",
+                fab_pairs: JLC06161H_3313_PAIRS,
+                fab_pairs_source: "JLCPCB impedance calculator 2026-10-19, JLC06161H-3313 L1/L2",
             },
         }
     }
@@ -272,6 +361,8 @@ impl Default for Stackup {
             mask_thickness_mm: 0.0254, // ~1 mil over traces
             fab_50ohm_width_mm: None,
             fab_width_source: "closed form (Hammerstad–Jensen)",
+            fab_pairs: &[],
+            fab_pairs_source: "closed form (Kirschning-Jansen, no fab table for 2-layer)",
         }
     }
 }
@@ -279,6 +370,31 @@ impl Default for Stackup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn six_layer_pairs_come_from_the_fab_table() {
+        let s = Stackup::for_layers(6);
+        let g90 = s.pair_geometry(90.0, 0.1, 0.127).expect("90 Ω pair");
+        assert!((g90.width_mm - 0.1466).abs() < 1e-9 && (g90.gap_mm - 0.1778).abs() < 1e-9, "{:?}", g90);
+        let g100 = s.pair_geometry(100.0, 0.1, 0.127).expect("100 Ω pair");
+        assert!((g100.width_mm - 0.1191).abs() < 1e-9 && (g100.gap_mm - 0.2032).abs() < 1e-9, "{:?}", g100);
+        assert!(g100.source.contains("JLCPCB"));
+        // An off-table target falls back to the calibrated closed form
+        let g85 = s.pair_geometry(85.0, 0.1, 0.127).expect("85 Ω closed form");
+        assert!(g85.source.contains("Kirschning"));
+        assert!(g85.width_mm >= 0.1 && g85.gap_mm >= 0.127);
+    }
+
+    #[test]
+    fn two_layer_pairs_use_closed_form() {
+        let s = Stackup::default();
+        let g = s.pair_geometry(100.0, 0.2, 0.2).expect("2-layer 100 Ω pair");
+        assert!(g.source.contains("Kirschning"));
+        // 1.5 mm core: a 100 Ω pair needs ~2.5 mm traces (the 50 Ω
+        // single-ended width on this core is 2.7 mm) — why 2-layer boards
+        // do not carry controlled pairs.
+        assert!(g.width_mm > 1.5 && g.width_mm < 3.5, "{:?}", g);
+    }
 
     #[test]
     fn jlcpcb_dielectric_constants_match_published() {

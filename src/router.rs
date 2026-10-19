@@ -26,6 +26,9 @@
 //! Honest-done: anything the router cannot finish is reported UNROUTED with
 //! a cause. "routed N of M connections".
 
+mod pairs;
+pub use pairs::{PairConfig, PairReport};
+
 use crate::board::{Board, PadType};
 use crate::netlist::{Netlist, RatsnestEdge};
 use std::collections::BinaryHeap;
@@ -78,6 +81,30 @@ pub struct RouteResult {
     pub escapes: usize,
     /// Escape vias no route used (left in place; harmless)
     pub escapes_unused: usize,
+    /// One report per routed/attempted differential-pair trunk.
+    pub pairs: Vec<PairReport>,
+    /// Breakout zones where the crosstalk spacing rule is relaxed (board
+    /// mm, per layer name or "*"): the SI audit uses the same zones.
+    pub exempt_rects: Vec<ExemptRect>,
+    /// Crosstalk families (net names): nets that carry one signal through
+    /// a small pass-through part and are never aggressors of each other.
+    pub families: Vec<Vec<String>>,
+}
+
+/// A rectangle (board mm) where parallel runs closer than the crosstalk
+/// spacing are tolerated: pad breakouts and fine-pitch escape bands.
+#[derive(Debug, Clone)]
+pub struct ExemptRect {
+    pub x0: f64,
+    pub y0: f64,
+    pub x1: f64,
+    pub y1: f64,
+    /// Copper layer name, or "*" for every layer.
+    pub layer: String,
+    /// 0: tolerated in every direction (pad surroundings); 1 / 2: a
+    /// fine-pitch escape band whose pins escape along x / y — only runs
+    /// along that axis are tolerated.
+    pub axis: u8,
 }
 
 impl RouteResult {
@@ -159,6 +186,23 @@ pub struct RouterConfig {
     pub escape_band_mm: f64,
     /// Extra cost per sideways step inside an escape band (grid units).
     pub band_side_cost: f64,
+    /// Differential pairs to route as coupled corridors.
+    pub pairs: Vec<PairConfig>,
+    /// Layers a pair corridor (and any impedance-controlled net) may use,
+    /// in preference order: layers over a solid reference plane.
+    pub pair_layers: Vec<String>,
+    /// Nets confined to `pair_layers` (impedance-controlled single-ended).
+    pub restricted_nets: Vec<String>,
+    /// Required edge-to-edge gap to OTHER nets' traces (crosstalk 3W/5W
+    /// rule), per net name; absent = the design clearance.
+    pub net_gap: std::collections::HashMap<String, f64>,
+    /// Distance from any pad within which the crosstalk rule is relaxed
+    /// (breakouts cannot honour 3W).
+    pub xt_exempt_pad_mm: f64,
+    /// Depth of the breakout zone beyond fine-pitch pad tips in which the
+    /// crosstalk rule is relaxed (pairs leave a dense IC side by side and
+    /// spread out past it).
+    pub xt_exempt_band_mm: f64,
 }
 
 impl Default for RouterConfig {
@@ -187,6 +231,12 @@ impl Default for RouterConfig {
             escape_mm: 1.0,
             escape_band_mm: 3.2,
             band_side_cost: 4.0,
+            pairs: Vec::new(),
+            pair_layers: Vec::new(),
+            restricted_nets: Vec::new(),
+            net_gap: std::collections::HashMap::new(),
+            xt_exempt_pad_mm: 1.0,
+            xt_exempt_band_mm: 6.0,
         }
     }
 }
@@ -222,6 +272,12 @@ impl RouterConfig {
             escape_mm: 1.0,
             escape_band_mm: 3.2,
             band_side_cost: 4.0,
+            pairs: Vec::new(),
+            pair_layers: Vec::new(),
+            restricted_nets: Vec::new(),
+            net_gap: std::collections::HashMap::new(),
+            xt_exempt_pad_mm: 1.0,
+            xt_exempt_band_mm: 6.0,
         }
     }
 }
@@ -231,7 +287,7 @@ const BLOCK: u32 = u32::MAX;
 
 /// A grid cell coordinate (x, y, signal-layer index).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct Cell {
+pub(crate) struct Cell {
     x: i32,
     y: i32,
     layer: u8,
@@ -283,9 +339,12 @@ struct RPad {
     /// footprint origin (board-relative) — the pad escapes away from it
     fp_cx: f64,
     fp_cy: f64,
+    /// A pair-corridor terminal, not real copper of a footprint.
+    virtual_pad: bool,
 }
 
 /// Dense occupancy over (layer, y, x).
+#[derive(Clone)]
 struct Grid {
     w: usize,
     h: usize,
@@ -306,6 +365,72 @@ struct Grid {
     /// Per cell/layer: escape band orientation — 1 = lanes run along x
     /// (sideways = y moves are penalized), 2 = lanes along y, 0 = none.
     band_axis: Vec<u8>,
+    /// Per cell/layer: crosstalk ownership — cells inside an aggressor
+    /// net's 3W/5W halo (FREE, net+1, BLOCK). Pair mates share.
+    xt: Vec<u32>,
+    /// Per cell/layer: trace copper of some net within the 3W (near3) or
+    /// 5W (near5) radius — what an aggressor arriving later must avoid.
+    near3: Vec<u32>,
+    near5: Vec<u32>,
+    /// Per cell/layer: breakout zone (pad proximity, escape band or lane)
+    /// where the crosstalk rule is relaxed.
+    exempt: Vec<bool>,
+    /// Fine-pitch escape band per cell: 0 none, 1 = pins escape along x,
+    /// 2 = along y. Inside a band the crosstalk rule is relaxed ONLY for
+    /// copper running along the escape direction (neighbouring pins must
+    /// leave side by side at the pin pitch); copper running across the
+    /// band — along the pin row — is a normal aggressor/victim
+    /// (live-verified: an audio net ran 3.4 mm along a USB pair at 0.21 mm
+    /// inside the SoC's top band when the whole band was exempt).
+    xt_band: Vec<u8>,
+    /// Per cell/layer: inside a pair corridor's halo (the pair's P tag) —
+    /// tails of other families stay out (they join only through their own
+    /// terminal approach cells).
+    corridor: Vec<u32>,
+    /// Per-net-tag facts the stamping/search code needs.
+    tags: TagMaps,
+}
+
+/// Per net tag (net id + 1): pair mate tag (0 = none), required crosstalk
+/// edge gap, whether the net is confined to the clean layers; plus which
+/// signal layers are clean.
+#[derive(Clone, Default)]
+struct TagMaps {
+    mate_of: Vec<u32>,
+    gap_of: Vec<f64>,
+    restricted: Vec<bool>,
+    layer_allowed: Vec<bool>,
+    /// Crosstalk family per tag (0 = none): a pair's two nets, and pairs
+    /// chained through a shared component (SoC → ESD → connector carry the
+    /// same signal), may sit inside each other's halos.
+    family: Vec<u32>,
+}
+impl TagMaps {
+    #[inline]
+    fn mate(&self, tag: u32) -> u32 {
+        self.mate_of.get(tag as usize).copied().unwrap_or(0)
+    }
+    /// Same net, or the same crosstalk family.
+    #[inline]
+    fn friendly(&self, a: u32, b: u32) -> bool {
+        if a == b {
+            return true;
+        }
+        let fa = self.family.get(a as usize).copied().unwrap_or(0);
+        fa != 0 && fa == self.family.get(b as usize).copied().unwrap_or(0)
+    }
+    #[inline]
+    fn gap(&self, tag: u32, default: f64) -> f64 {
+        self.gap_of.get(tag as usize).copied().unwrap_or(default)
+    }
+    #[inline]
+    fn is_restricted(&self, tag: u32) -> bool {
+        self.restricted.get(tag as usize).copied().unwrap_or(false)
+    }
+    #[inline]
+    fn layer_ok(&self, layer: u8) -> bool {
+        self.layer_allowed.get(layer as usize).copied().unwrap_or(true)
+    }
 }
 
 impl Grid {
@@ -322,6 +447,27 @@ impl Grid {
             cost: vec![0; n],
             lane: vec![0; w * h],
             band_axis: vec![0; n],
+            xt: vec![FREE; n],
+            near3: vec![FREE; n],
+            near5: vec![FREE; n],
+            exempt: vec![false; n],
+            xt_band: vec![0; n],
+            corridor: vec![0; n],
+            tags: TagMaps::default(),
+        }
+    }
+    /// Claim into a side map with the tag's crosstalk family treated as self.
+    #[inline]
+    fn claim_fam(map: &mut [u32], i: usize, tag: u32, family: &[u32]) {
+        let cur = map[i];
+        if cur == FREE {
+            map[i] = tag;
+        } else if cur != tag {
+            let fa = family.get(tag as usize).copied().unwrap_or(0);
+            let fb = family.get(cur as usize).copied().unwrap_or(0);
+            if fa == 0 || fa != fb {
+                map[i] = BLOCK;
+            }
         }
     }
     #[inline]
@@ -349,6 +495,40 @@ impl Grid {
                 self.owner[i] = BLOCK;
             }
         }
+    }
+    /// Claim a clearance-halo cell: like `claim`, but a cell reserved as
+    /// another net's escape lane keeps its owner (a BLOCKed lane would
+    /// strand that pin — live-verified with 3-cell pair halos).
+    #[inline]
+    fn claim_halo(&mut self, x: i32, y: i32, l: u8, net_tag: u32) {
+        if let Some(i) = self.idx(x, y, l) {
+            let lane = self.lane[y as usize * self.w + x as usize];
+            // only a lane materialized on THIS layer (the pad's layer)
+            if lane != 0 && lane != net_tag && self.owner[i] == lane {
+                return;
+            }
+        }
+        self.claim(x, y, l, net_tag);
+    }
+    /// Is another net's escape lane (materialized on this layer) within
+    /// Chebyshev radius `r` of (x, y)? Copper may not hug a lane: its halo
+    /// never claims lane cells, so the search has to keep the distance.
+    fn lane_adjacent(&self, x: i32, y: i32, l: u8, net_tag: u32, r: i32) -> bool {
+        self.lane_adjacent_except(x, y, l, &[net_tag], r)
+    }
+    /// Same, with several tags treated as own (a pair's two nets).
+    fn lane_adjacent_except(&self, x: i32, y: i32, l: u8, own: &[u32], r: i32) -> bool {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if let Some(i) = self.idx(x + dx, y + dy, l) {
+                    let lane = self.lane[(y + dy) as usize * self.w + (x + dx) as usize];
+                    if lane != 0 && !own.contains(&lane) && self.owner[i] == lane {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
     #[inline]
     fn force(&mut self, x: i32, y: i32, l: u8, net_tag: u32, pad_id: u32) {
@@ -404,12 +584,19 @@ struct Fanout {
 }
 
 /// Union-find over pad ids (connected components of a net's copper).
+#[derive(Clone)]
 struct Dsu {
     parent: Vec<u32>,
 }
 impl Dsu {
     fn new(n: usize) -> Dsu {
         Dsu { parent: (0..n as u32).collect() }
+    }
+    /// Extend to `n` elements (new singletons).
+    fn grow(&mut self, n: usize) {
+        while self.parent.len() < n {
+            self.parent.push(self.parent.len() as u32);
+        }
     }
     fn find(&mut self, mut a: u32) -> u32 {
         while self.parent[a as usize] != a {
@@ -460,6 +647,9 @@ impl Router {
     /// Solve this net's trace width: impedance target → microstrip solve on
     /// the stackup (clamped to the fab scope); power → power width; else default.
     fn width_for_net(&self, net: &str) -> f64 {
+        if let Some(pc) = self.config.pairs.iter().find(|p| p.p == net || p.n == net) {
+            return pc.width_mm;
+        }
         if let Some(z0) = self.impedance_targets.get(net) {
             let w = self.stackup.width_for_z0(*z0);
             let fab_min = crate::materials::FabLimits::default().min_trace_mm;
@@ -492,7 +682,7 @@ impl Router {
         };
         let plane_ids: Vec<usize> = self.config.plane_nets.iter().filter_map(|n| net_id(n)).collect();
 
-        // Pads as the router sees them
+        // Pads as the router sees them (pair terminals are appended later)
         let mut pads: Vec<RPad> = Vec::new();
         for fp in &board.footprints {
             // Fine pitch: the closest two same-footprint pad centres
@@ -537,9 +727,122 @@ impl Router {
                     fine_pitch: fine,
                     fp_cx: fp.x - bx0,
                     fp_cy: fp.y - by0,
+                    virtual_pad: false,
                 });
             }
         }
+        // ─── Grid, static copper, escapes, plane fanouts, PAIRS ───
+        // Per-net-tag facts: pair mates, crosstalk gaps, layer restriction
+        let max_tag = board.nets.iter().map(|(i, _)| *i).max().unwrap_or(0) as usize + 2;
+        let mut tags = TagMaps {
+            mate_of: vec![0; max_tag],
+            gap_of: vec![self.config.clearance; max_tag],
+            restricted: vec![false; max_tag],
+            layer_allowed: self.config.signal_layers.iter().map(|l| self.config.pair_layers.is_empty() || self.config.pair_layers.contains(l)).collect(),
+            family: vec![0; max_tag],
+        };
+        // Crosstalk families: each pair, merged with pairs that share a
+        // component with it (chained through an ESD array or series parts)
+        {
+            let refs_of = |n: usize| -> Vec<String> {
+                let mut v: Vec<String> = pads.iter().filter(|p| p.net == Some(n)).map(|p| p.reference.clone()).collect();
+                v.sort();
+                v.dedup();
+                v
+            };
+            let pair_nets: Vec<Option<(usize, usize)>> = self.config.pairs.iter().map(|pc| match (net_id(&pc.p), net_id(&pc.n)) { (Some(a), Some(b)) => Some((a, b)), _ => None }).collect();
+            // Only a small pass-through part (an ESD array, series
+            // resistors/capacitors: ≤ 8 pads) chains two pairs into one
+            // signal; the SoC and the connectors are shared by every pair
+            // and must NOT merge them (live-verified: merged MIPI pairs let
+            // bumps short into each other).
+            let small_part = |r: &str| pads.iter().filter(|p| p.reference == r && !p.virtual_pad).count() <= 8;
+            let pair_refs: Vec<Vec<String>> = pair_nets.iter().map(|pn| pn.map(|(a, b)| { let mut r = refs_of(a); r.extend(refs_of(b)); r.sort(); r.dedup(); r.retain(|x| small_part(x)); r }).unwrap_or_default()).collect();
+            let mut fam: Vec<usize> = (0..pair_nets.len()).collect();
+            fn root(f: &mut Vec<usize>, i: usize) -> usize { let mut i = i; while f[i] != i { f[i] = f[f[i]]; i = f[i]; } i }
+            for i in 0..pair_nets.len() {
+                for j in (i + 1)..pair_nets.len() {
+                    if pair_refs[i].iter().any(|r| pair_refs[j].contains(r)) {
+                        let (ri, rj) = (root(&mut fam, i), root(&mut fam, j));
+                        if ri != rj { fam[rj] = ri; }
+                    }
+                }
+            }
+            for (i, pn) in pair_nets.iter().enumerate() {
+                if let Some((a, b)) = pn {
+                    let fid = root(&mut fam, i) as u32 + 1;
+                    tags.family[a + 1] = fid;
+                    tags.family[b + 1] = fid;
+                }
+            }
+        }
+        let mut pair_net_ids: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for pc in &self.config.pairs {
+            if let (Some(a), Some(b)) = (net_id(&pc.p), net_id(&pc.n)) {
+                tags.mate_of[a + 1] = b as u32 + 1;
+                tags.mate_of[b + 1] = a as u32 + 1;
+                tags.restricted[a + 1] = true;
+                tags.restricted[b + 1] = true;
+                pair_net_ids.insert(a);
+                pair_net_ids.insert(b);
+            }
+        }
+        for (name, gap) in &self.config.net_gap {
+            if let Some(n) = net_id(name) {
+                tags.gap_of[n + 1] = gap.max(self.config.clearance);
+            }
+        }
+        for name in &self.config.restricted_nets {
+            if let Some(n) = net_id(name) {
+                tags.restricted[n + 1] = true;
+            }
+        }
+        let gap_of: Vec<f64> = (0..max_tag).map(|i| if i == 0 { self.config.clearance } else { tags.gap_of[i] }).collect();
+        let gap_by_net: Vec<f64> = (0..max_tag).map(|n| tags.gap_of.get(n + 1).copied().unwrap_or(self.config.clearance)).collect();
+        let _ = &gap_of;
+        let mut state = RouteState {
+            routed: Vec::new(),
+            fanouts: Vec::new(),
+            escapes: Vec::new(),
+            failed: Vec::new(),
+            fanout_failed: Vec::new(),
+            pairs: Vec::new(),
+            pair_reports: Vec::new(),
+        };
+        let mut grid = Grid::new(w, h, nlayers, pitch);
+        grid.tags = tags.clone();
+        let mut dsu = Dsu::new(pads.len());
+        self.stamp_static(&mut grid, &pads, bx1 - bx0, by1 - by0);
+        self.stamp_keepouts(&mut grid, board, bx0, by0);
+        // Pairs first — the most constrained copper on the board leaves the
+        // fine-pitch bands before escape vias and plane fanouts fill them.
+        {
+            let refs_of_net = |n: usize| -> Vec<String> {
+                let mut v: Vec<String> = pads.iter().filter(|p| p.net == Some(n) && !p.virtual_pad).map(|p| p.reference.clone()).collect();
+                v.sort();
+                v.dedup();
+                v
+            };
+            let refs: Vec<Vec<String>> = (0..max_tag).map(|n| refs_of_net(n)).collect();
+            let refs_fn = |n: usize| -> Vec<String> { refs.get(n).cloned().unwrap_or_default() };
+            self.route_pairs(&mut grid, &mut pads, &mut dsu, &mut state, &net_id, &gap_by_net, &refs_fn);
+        }
+        self.escape_vias(&mut grid, &pads, &plane_ids, &pair_net_ids, &mut state);
+        self.fanout_planes(&mut grid, &pads, &plane_ids, &mut state, &net_name);
+        let exempt_rects: Vec<ExemptRect> = self
+            .breakout_rects(&pads)
+            .into_iter()
+            .map(|(x0, y0, x1, y1, l, axis)| ExemptRect {
+                x0: x0 + bx0,
+                y0: y0 + by0,
+                x1: x1 + bx0,
+                y1: y1 + by0,
+                layer: l.map(|i| self.config.signal_layers[i as usize].clone()).unwrap_or_else(|| "*".into()),
+                axis,
+            })
+            .collect();
+        let pads = pads; // frozen from here on
+
         // Same-numbered pads (e.g. a switch's two "1" pads) are distinct
         // copper: resolve by position, not only by name.
         let pad_lookup = |reference: &str, number: &str, x: f64, y: f64| -> Option<u32> {
@@ -599,20 +902,6 @@ impl Router {
         });
         let order: Vec<usize> = (0..edges.len()).collect();
 
-        // ─── Pass 1 ───
-        let mut state = RouteState {
-            routed: Vec::new(),
-            fanouts: Vec::new(),
-            escapes: Vec::new(),
-            failed: Vec::new(),
-            fanout_failed: Vec::new(),
-        };
-        let mut grid = Grid::new(w, h, nlayers, pitch);
-        let mut dsu = Dsu::new(pads.len());
-        self.stamp_static(&mut grid, &pads, bx1 - bx0, by1 - by0);
-        self.stamp_keepouts(&mut grid, board, bx0, by0);
-        self.escape_vias(&mut grid, &pads, &plane_ids, &mut state);
-        self.fanout_planes(&mut grid, &pads, &plane_ids, &mut state, &net_name);
         // Plane pads that found no via site are routed as ordinary
         // connections to the nearest member of their net that did.
         for &pid in &state.fanout_failed.clone() {
@@ -695,7 +984,7 @@ impl Router {
                     .routed
                     .iter()
                     .enumerate()
-                    .filter(|(_, r)| r.net != nid)
+                    .filter(|(_, r)| r.net != nid && !pair_net_ids.contains(&r.net))
                     .map(|(i, r)| {
                         let inside = r
                             .cells
@@ -732,9 +1021,11 @@ impl Router {
                     .collect();
                 // Rebuild the grid from pads + surviving copper
                 let mut g2 = Grid::new(w, h, nlayers, pitch);
+                g2.tags = tags.clone();
                 let mut dsu2 = Dsu::new(pads.len());
                 self.stamp_static(&mut g2, &pads, bx1 - bx0, by1 - by0);
                 self.stamp_keepouts(&mut g2, board, bx0, by0);
+                self.replay_pairs(&mut g2, &mut dsu2, &pads, &state.pairs, &gap_by_net);
                 self.replay_fanouts(&mut g2, &pads, &state.escapes);
                 for e in &state.escapes {
                     for c in &e.cells {
@@ -873,6 +1164,25 @@ impl Router {
             }
         }
 
+        // Debug: SOMEDA_ROUTE_DEBUG_NET=<name> prints every routed cell of
+        // that net with the crosstalk map it sat on (xt owner, exempt flag).
+        if let Ok(dbg_net) = std::env::var("SOMEDA_ROUTE_DEBUG_NET") {
+            for r in &state.routed {
+                if net_name(r.net) != dbg_net {
+                    continue;
+                }
+                let Some(ed) = edges.iter().find(|x| x.0 == r.edge_index) else { continue };
+                eprintln!("route-debug: NET {} edge {}:{} → {}:{} ({} cells)", dbg_net, ed.1.from_ref, ed.1.from_pin, ed.1.to_ref, ed.1.to_pin, r.cells.len());
+                for c in &r.cells {
+                    if let Some(i) = grid.idx(c.x, c.y, c.layer) {
+                        let xt = grid.xt[i];
+                        let xt_name = if xt == FREE { "-".to_string() } else if xt == BLOCK { "BLOCK".to_string() } else { net_name(xt as usize - 1) };
+                        eprintln!("route-debug:   ({:.3},{:.3},{}) xt={} exempt={} corridor={}", c.x as f64 * pitch + bx0, c.y as f64 * pitch + by0, self.config.signal_layers[c.layer as usize], xt_name, grid.exempt[i], grid.corridor[i]);
+                    }
+                }
+            }
+        }
+
         // Escape vias that routing did not use stay in place: a via with
         // copper on one layer is electrically harmless (KiCad notes it as
         // via_dangling, a warning). Removing them after the fact broke
@@ -897,6 +1207,20 @@ impl Router {
         // ─── Emit ───
         let mut result = RouteResult::default();
         result.total_edges = edges.len();
+        for pr in &state.pairs {
+            self.emit_pair(&mut result, pr, &net_name, bx0, by0);
+        }
+        result.pairs = state.pair_reports.clone();
+        result.exempt_rects = exempt_rects;
+        {
+            let mut by_fam: std::collections::BTreeMap<u32, Vec<String>> = std::collections::BTreeMap::new();
+            for (t, &f) in grid.tags.family.iter().enumerate() {
+                if f != 0 && t > 0 {
+                    by_fam.entry(f).or_default().push(net_name(t - 1));
+                }
+            }
+            result.families = by_fam.into_values().collect();
+        }
         for r in &state.routed {
             let name = net_name(r.net);
             self.emit_path(&mut result, &r.cells, (r.net, name), r.width, bx0, by0);
@@ -1023,7 +1347,7 @@ impl Router {
             }
         }
         // Halos first (claims), then pad copper (wins)
-        for p in pads {
+        for p in pads.iter().filter(|p| !p.virtual_pad) {
             let tag = match p.net {
                 Some(n) if !p.npth => n as u32 + 1,
                 _ => BLOCK,
@@ -1064,7 +1388,7 @@ impl Router {
                 grid.forbid_via_disc(p.x, p.y, r.max(p.hx.max(p.hy) + self.config.clearance + self.config.via_size / 2.0));
             }
         }
-        for p in pads {
+        for p in pads.iter().filter(|p| !p.virtual_pad) {
             let tag = match p.net {
                 Some(n) if !p.npth => n as u32 + 1,
                 _ => BLOCK,
@@ -1102,7 +1426,7 @@ impl Router {
         {
             let ring = 0.45;
             for p in pads {
-                if p.npth {
+                if p.npth || p.virtual_pad {
                     continue;
                 }
                 let (rx, ry) = (p.hx + self.config.clearance + tw2 + ring, p.hy + self.config.clearance + tw2 + ring);
@@ -1130,7 +1454,7 @@ impl Router {
         {
             let band = self.config.escape_band_mm;
             for p in pads {
-                if !p.fine_pitch || p.npth || p.through {
+                if !p.fine_pitch || p.npth || p.through || p.virtual_pad {
                     continue;
                 }
                 let along_x = p.hx >= p.hy;
@@ -1165,7 +1489,7 @@ impl Router {
         // overwritten.
         let lane_len = (self.config.escape_mm / pitch).ceil() as i32;
         for p in pads {
-            if !p.fine_pitch || p.npth || p.net.is_none() || p.through {
+            if !p.fine_pitch || p.npth || p.net.is_none() || p.through || p.virtual_pad {
                 continue;
             }
             let tag = p.net.unwrap() as u32 + 1;
@@ -1198,6 +1522,51 @@ impl Router {
                     }
                 }
             }
+        }
+        // BREAKOUT ZONES: the crosstalk spacing rule (3W/5W) is relaxed
+        // next to pads and inside fine-pitch escape bands and lanes, where
+        // the pin pitch makes it physically impossible. The SI audit uses
+        // the same rectangles (RouteResult::exempt_rects).
+        for (x0, y0, x1, y1, layer, axis) in self.breakout_rects(pads) {
+            let (gx0, gx1) = ((x0 / pitch).floor() as i32, (x1 / pitch).ceil() as i32);
+            let (gy0, gy1) = ((y0 / pitch).floor() as i32, (y1 / pitch).ceil() as i32);
+            let layers: Vec<u8> = match layer {
+                Some(l) => vec![l],
+                None => (0..grid.layers as u8).collect(),
+            };
+            for l in layers {
+                for y in gy0..=gy1 {
+                    for x in gx0..=gx1 {
+                        if let Some(i) = grid.idx(x, y, l) {
+                            if axis == 0 {
+                                grid.exempt[i] = true;
+                            } else {
+                                grid.xt_band[i] = axis;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // (Escape lanes are inside the pad layer's escape bands and need no
+        // exemption of their own; marking them exempt on EVERY layer let a
+        // quiet net hug a pair tail on In2 at the design clearance —
+        // live-verified ETH_LED_LINK 0.39 mm from ETH_RXN.)
+    }
+
+    /// Debug aid: print the occupancy around a cell on its layer.
+    pub(crate) fn dump_occupancy(&self, grid: &Grid, at: Cell, tag: u32, r: i32) {
+        eprintln!("route-debug: occupancy around ({:.3},{:.3}) {} (tag {}; '.' free, '#' block, 'o' own, 'x' other, 'O' own copper, 'X' other copper, 'c' corridor halo, 'l' other lane):", at.x as f64 * self.config.grid, at.y as f64 * self.config.grid, self.config.signal_layers[at.layer as usize], tag);
+        for y in (at.y - r)..=(at.y + r) {
+            let mut line = String::from("    ");
+            for x in (at.x - r)..=(at.x + r) {
+                let c = Cell { x, y, layer: at.layer };
+                let o = grid.owner_at(c);
+                let (cp, cor) = grid.idx(x, y, at.layer).map(|i| (grid.copper_pad[i], grid.corridor[i] != 0)).unwrap_or((0, false));
+                let lane = if x >= 0 && y >= 0 && (x as usize) < grid.w && (y as usize) < grid.h { grid.lane[y as usize * grid.w + x as usize] } else { 0 };
+                line.push(if x == at.x && y == at.y { '@' } else if o == BLOCK { '#' } else if cp != 0 && o == tag { 'O' } else if cp != 0 { 'X' } else if cor && o != tag { 'c' } else if o == FREE { if lane != 0 && lane != tag { 'l' } else { '.' } } else if o == tag { 'o' } else { 'x' });
+            }
+            eprintln!("{}", line);
         }
     }
 
@@ -1264,8 +1633,118 @@ impl Router {
         ((s / self.config.grid).ceil() as i32 - 1).max(0)
     }
 
-    /// Stamp a routed path (copper + halos; vias where the layer changes).
+    /// Which near map (0 = 3W radius, 1 = 5W radius) a net with required
+    /// edge gap `gap` consults; None when the gap is just the clearance.
+    fn near_radius_index(&self, gap: f64) -> Option<usize> {
+        if gap <= self.config.clearance + 1e-9 {
+            None
+        } else if gap <= 2.0 * self.config.trace_width + 1e-9 {
+            Some(0)
+        } else {
+            Some(1)
+        }
+    }
+
+    /// (near-map index, crosstalk halo radius in cells) for a trace of
+    /// width `w` whose net requires edge gap `gap` to other traces.
+    fn xt_radius(&self, gap: f64, w: f64) -> (Option<usize>, i32) {
+        let idx = self.near_radius_index(gap);
+        let r = if idx.is_none() {
+            0
+        } else {
+            (((w / 2.0 + gap + self.config.trace_width / 2.0) / self.config.grid).ceil() as i32 - 1).max(0)
+        };
+        (idx, r)
+    }
+
+    /// Dilate trace copper into the near maps: the 3W and 5W radii an
+    /// aggressor of default width must keep from a victim of width `w`.
+    fn stamp_near(&self, grid: &mut Grid, cells: &[Cell], w: f64, tag: u32, _mate: u32) {
+        let tw = self.config.trace_width;
+        let r3 = (((w / 2.0 + 2.0 * tw + tw / 2.0) / self.config.grid).ceil() as i32 - 1).max(0);
+        let r5 = (((w / 2.0 + 4.0 * tw + tw / 2.0) / self.config.grid).ceil() as i32 - 1).max(0);
+        for c in cells {
+            for dy in -r5..=r5 {
+                for dx in -r5..=r5 {
+                    if let Some(i) = grid.idx(c.x + dx, c.y + dy, c.layer) {
+                        if dx.abs() <= r3 && dy.abs() <= r3 {
+                            Grid::claim_fam(&mut grid.near3, i, tag, &grid.tags.family);
+                        }
+                        Grid::claim_fam(&mut grid.near5, i, tag, &grid.tags.family);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Breakout zones (board-relative mm, layer index or None = all):
+    /// every pad grown by `xt_exempt_pad_mm`, and the escape band strip of
+    /// every fine-pitch pad.
+    fn breakout_rects(&self, pads: &[RPad]) -> Vec<(f64, f64, f64, f64, Option<u8>, u8)> {
+        let d = self.config.xt_exempt_pad_mm;
+        let mut out = Vec::new();
+        for p in pads {
+            if p.virtual_pad {
+                continue;
+            }
+            let layer = if p.through || p.npth { None } else { p.layers.first().copied() };
+            out.push((p.x - p.hx - d, p.y - p.hy - d, p.x + p.hx + d, p.y + p.hy + d, layer, 0));
+            if p.fine_pitch && !p.through && !p.npth {
+                let along_x = p.hx >= p.hy;
+                let dir = if along_x { (p.x - p.fp_cx).signum() } else { (p.y - p.fp_cy).signum() };
+                if dir == 0.0 {
+                    continue;
+                }
+                let band = self.config.xt_exempt_band_mm.max(self.config.escape_band_mm);
+                let r = if along_x {
+                    let (x0, x1) = if dir > 0.0 { (p.x + p.hx, p.x + p.hx + band) } else { (p.x - p.hx - band, p.x - p.hx) };
+                    (x0, p.y - p.hy - 0.2, x1, p.y + p.hy + 0.2, layer, 1)
+                } else {
+                    let (y0, y1) = if dir > 0.0 { (p.y + p.hy, p.y + p.hy + band) } else { (p.y - p.hy - band, p.y - p.hy) };
+                    (p.x - p.hx - 0.2, y0, p.x + p.hx + 0.2, y1, layer, 2)
+                };
+                out.push(r);
+            }
+        }
+        out
+    }
+
+    /// Stamp a routed path (copper + halos; vias where the layer changes),
+    /// plus its crosstalk halo and the near maps other nets consult.
     fn stamp_path(&self, grid: &mut Grid, cells: &[Cell], net: usize, width: f64, pad_id: u32) {
+        self.stamp_copper(grid, cells, net, width, pad_id);
+        let tag = net as u32 + 1;
+        let mate = grid.tags.mate(tag);
+        let gap = grid.tags.gap(tag, self.config.clearance);
+        let (_, xr) = self.xt_radius(gap, width);
+        if xr > 0 {
+            for c in cells {
+                for dy in -xr..=xr {
+                    for dx in -xr..=xr {
+                        if let Some(i) = grid.idx(c.x + dx, c.y + dy, c.layer) {
+                            if !grid.exempt[i] {
+                                Grid::claim_fam(&mut grid.xt, i, tag, &grid.tags.family);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.stamp_near(grid, cells, width, tag, mate);
+    }
+
+    /// Stamp copper + clearance halos and the near maps, but no crosstalk
+    /// halo of its own (fanout and escape stubs: short copper that is a
+    /// victim others must respect, never an aggressor).
+    fn stamp_stub(&self, grid: &mut Grid, cells: &[Cell], net: usize, width: f64, pad_id: u32) {
+        self.stamp_copper(grid, cells, net, width, pad_id);
+        let tag = net as u32 + 1;
+        let mate = grid.tags.mate(tag);
+        self.stamp_near(grid, cells, width, tag, mate);
+    }
+
+    /// Copper + clearance halos only.
+    fn stamp_copper(&self, grid: &mut Grid, cells: &[Cell], net: usize, width: f64, pad_id: u32) {
         let tag = net as u32 + 1;
         let halo = self.halo_cells(width);
         // Copper for connectivity: only cells inside the actual copper.
@@ -1278,7 +1757,7 @@ impl Router {
         for c in cells {
             for dy in -halo..=halo {
                 for dx in -halo..=halo {
-                    grid.claim(c.x + dx, c.y + dy, c.layer, tag);
+                    grid.claim_halo(c.x + dx, c.y + dy, c.layer, tag);
                 }
             }
             for dy in -body..=body {
@@ -1312,7 +1791,7 @@ impl Router {
 
     fn replay_fanouts(&self, grid: &mut Grid, _pads: &[RPad], fanouts: &[Fanout]) {
         for f in fanouts {
-            self.stamp_path(grid, &f.cells, f.net, self.config.trace_width, f.pad);
+            self.stamp_stub(grid, &f.cells, f.net, self.config.trace_width, f.pad);
             if let Some((vx, vy)) = f.via {
                 self.stamp_via(grid, vx, vy, f.net, f.pad);
             }
@@ -1379,16 +1858,16 @@ impl Router {
     /// 0.366mm of blocking radius: a neighbour's stub passes at 0.4mm).
     /// The pin's connection then starts on the inner layers where there is
     /// room, instead of fighting for the pin-row surface.
-    fn escape_vias(&self, grid: &mut Grid, pads: &[RPad], plane_ids: &[usize], state: &mut RouteState) {
+    fn escape_vias(&self, grid: &mut Grid, pads: &[RPad], plane_ids: &[usize], skip_nets: &std::collections::HashSet<usize>, state: &mut RouteState) {
         let pitch = self.config.grid;
         let via_r = self.config.via_size / 2.0;
         let step = (2 * self.via_halo_cells() + 1) as f64 * pitch + pitch;
         for p in pads {
-            if !p.fine_pitch || p.npth || p.through {
+            if !p.fine_pitch || p.npth || p.through || p.virtual_pad {
                 continue;
             }
             let Some(net) = p.net else { continue };
-            if plane_ids.contains(&net) {
+            if plane_ids.contains(&net) || skip_nets.contains(&net) {
                 continue;
             }
             let tag = net as u32 + 1;
@@ -1433,7 +1912,7 @@ impl Router {
                 if !ok {
                     continue;
                 }
-                self.stamp_path(grid, &cells, net, self.config.trace_width, p.id);
+                self.stamp_stub(grid, &cells, net, self.config.trace_width, p.id);
                 self.stamp_via(grid, gx, gy, net, p.id);
                 // the stub is this pad's lane now: nobody else's via near it
                 for c in &cells {
@@ -1475,7 +1954,7 @@ impl Router {
         let max_cells = (self.config.fanout_max_mm / self.config.grid).ceil() as i32;
         for p in pads {
             let Some(net) = p.net else { continue };
-            if !plane_ids.contains(&net) || p.npth {
+            if !plane_ids.contains(&net) || p.npth || p.virtual_pad {
                 continue;
             }
             if p.through {
@@ -1540,6 +2019,9 @@ impl Router {
                     if o != FREE && o != tag {
                         continue;
                     }
+                    if grid.lane_adjacent(n.x, n.y, n.layer, tag, self.halo_cells(self.config.trace_width)) {
+                        continue;
+                    }
                     let extra = grid.idx(n.x, n.y, n.layer).map(|i| grid.cost[i] as f64 * 0.25).unwrap_or(0.0);
                     let nd = d + 1.0 + extra;
                     if nd < *best.get(&n).unwrap_or(&f64::INFINITY) {
@@ -1561,7 +2043,7 @@ impl Router {
                         cur = prev;
                     }
                     path.reverse();
-                    self.stamp_path(grid, &path, net, self.config.trace_width, p.id);
+                    self.stamp_stub(grid, &path, net, self.config.trace_width, p.id);
                     let via = if with_via {
                         self.stamp_via(grid, goal.x, goal.y, net, p.id);
                         Some((goal.x, goal.y))
@@ -1587,7 +2069,28 @@ impl Router {
         net: usize,
         width: f64,
     ) -> Option<Vec<Cell>> {
+        self.route_edge_opt(grid, pads, dsu, a, b, net, width, false)
+    }
+
+    /// `tail`: a pair tail — never inside a corridor's halo except through
+    /// the terminal approach cells.
+    #[allow(clippy::too_many_arguments)]
+    fn route_edge_opt(
+        &self,
+        grid: &mut Grid,
+        pads: &[RPad],
+        dsu: &mut Dsu,
+        a: u32,
+        b: u32,
+        net: usize,
+        width: f64,
+        tail: bool,
+    ) -> Option<Vec<Cell>> {
         let tag = net as u32 + 1;
+        let _mate = grid.tags.mate(tag);
+        let gap = grid.tags.gap(tag, self.config.clearance);
+        let (near_idx, _) = self.xt_radius(gap, width);
+        let restricted = grid.tags.is_restricted(tag);
         let pa = &pads[a as usize];
         let pb = &pads[b as usize];
         if dsu.find(a) == dsu.find(b) {
@@ -1644,11 +2147,57 @@ impl Router {
                 None => false,
             }
         };
+        // Crosstalk: never inside another aggressor's 3W/5W halo, and an
+        // aggressor never within its own spacing of another net's trace
+        // (outside breakout zones).
+        // `dir` is the direction of travel into `q`: inside an escape band
+        // the rule is relaxed only when moving along the band's escape axis.
+        let xt_ok = |q: &Cell, grid: &Grid, dir: (i32, i32)| -> bool {
+            match grid.idx(q.x, q.y, q.layer) {
+                Some(i) => {
+                    let relaxed = grid.exempt[i]
+                        || match grid.xt_band[i] {
+                            1 => dir.0 != 0 && dir.1 == 0,
+                            2 => dir.1 != 0 && dir.0 == 0,
+                            _ => false,
+                        };
+                    if !relaxed {
+                        let x = grid.xt[i];
+                        if x != FREE && !grid.tags.friendly(tag, x) {
+                            return false;
+                        }
+                        if let Some(m) = near_idx {
+                            let v = if m == 0 { grid.near3[i] } else { grid.near5[i] };
+                            if v != FREE && !grid.tags.friendly(tag, v) {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
         // Free for this net's trace body (default traces: the cell itself)
-        let is_free = |c: &Cell, grid: &Grid| -> bool {
+        let halo_r = self.halo_cells(width);
+        let is_free = |c: &Cell, grid: &Grid, dir: (i32, i32)| -> bool {
+            if restricted && !grid.tags.layer_ok(c.layer) {
+                return false;
+            }
+            if grid.lane_adjacent(c.x, c.y, c.layer, tag, halo_r) {
+                return false;
+            }
+            if tail {
+                if let Some(i) = grid.idx(c.x, c.y, c.layer) {
+                    let cp = grid.corridor[i];
+                    if cp != 0 && !grid.tags.friendly(tag, cp) {
+                        return false;
+                    }
+                }
+            }
             if body == 0 {
                 let o = grid.owner_at(*c);
-                return o == FREE || o == tag;
+                return (o == FREE || o == tag) && xt_ok(c, grid, dir);
             }
             // Wide (power) traces never enter escape lanes or bands of
             // other nets: a 0.4mm rail through a pin row walls the pins
@@ -1666,8 +2215,12 @@ impl Router {
             }
             for dy in -body..=body {
                 for dx in -body..=body {
-                    let o = grid.owner_at(Cell { x: c.x + dx, y: c.y + dy, layer: c.layer });
+                    let q = Cell { x: c.x + dx, y: c.y + dy, layer: c.layer };
+                    let o = grid.owner_at(q);
                     if o != FREE && o != tag {
+                        return false;
+                    }
+                    if !xt_ok(&q, grid, dir) {
                         return false;
                     }
                 }
@@ -1710,7 +2263,7 @@ impl Router {
             let pref_h = node.cell.layer % 2 == 1;
             for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                 let next = Cell { x: node.cell.x + dx, y: node.cell.y + dy, layer: node.cell.layer };
-                if !is_free(&next, grid) {
+                if !is_free(&next, grid, (dx, dy)) {
                     continue;
                 }
                 let against = if grid.layers > 2 && node.cell.layer != 0 && node.cell.layer as usize != grid.layers - 1 {
@@ -1741,7 +2294,7 @@ impl Router {
                         continue;
                     }
                     let next = Cell { x: node.cell.x, y: node.cell.y, layer: l };
-                    if !is_free(&next, grid) {
+                    if !is_free(&next, grid, (0, 0)) {
                         continue;
                     }
                     let tentative = g_here + via_cost;
@@ -1822,6 +2375,8 @@ struct RouteState {
     escapes: Vec<Fanout>,
     failed: Vec<usize>,
     fanout_failed: Vec<u32>,
+    pairs: Vec<pairs::PairRoute>,
+    pair_reports: Vec<PairReport>,
 }
 
 #[cfg(test)]
@@ -1937,6 +2492,92 @@ mod tests {
                 (pad \"2\" thru_hole circle (at 2.54 0) (size 1.7 1.7) (drill 1) (layers \"*.Cu\" \"*.Mask\") (net 3 \"SIG2\"))))",
         )
         .unwrap()
+    }
+
+
+    fn board_pair() -> Board {
+        // Two components 14 mm apart with a P/N pad couple each (0.5 mm
+        // pitch), a GND plane pad, and an unrelated net that must keep 5W.
+        Board::from_kicad_pcb(
+            "(kicad_pcb (version 20221018)
+              (layers (0 \"F.Cu\" signal) (1 \"In1.Cu\" signal) (2 \"In2.Cu\" signal) (3 \"In3.Cu\" signal) (4 \"In4.Cu\" signal) (31 \"B.Cu\" signal))
+              (gr_line (start 0 0) (end 30 0) (layer \"Edge.Cuts\") (width 0.1))
+              (gr_line (start 30 0) (end 30 20) (layer \"Edge.Cuts\") (width 0.1))
+              (gr_line (start 30 20) (end 0 20) (layer \"Edge.Cuts\") (width 0.1))
+              (gr_line (start 0 20) (end 0 0) (layer \"Edge.Cuts\") (width 0.1))
+              (net 1 \"GND\")
+              (net 2 \"DP\")
+              (net 3 \"DN\")
+              (net 4 \"QUIET\")
+              (footprint \"U\" (layer \"F.Cu\") (at 6 10 0)
+                (fp_text reference \"U1\" (at 0 -2))
+                (pad \"1\" smd rect (at 0 -0.25) (size 0.8 0.3) (layers \"F.Cu\") (net 2 \"DP\"))
+                (pad \"2\" smd rect (at 0 0.25) (size 0.8 0.3) (layers \"F.Cu\") (net 3 \"DN\"))
+                (pad \"3\" smd rect (at 0 1.5) (size 0.8 0.3) (layers \"F.Cu\") (net 4 \"QUIET\")))
+              (footprint \"J\" (layer \"F.Cu\") (at 22 12 0)
+                (fp_text reference \"J1\" (at 0 -2))
+                (pad \"1\" smd rect (at 0 -0.25) (size 0.8 0.3) (layers \"F.Cu\") (net 2 \"DP\"))
+                (pad \"2\" smd rect (at 0 0.25) (size 0.8 0.3) (layers \"F.Cu\") (net 3 \"DN\"))
+                (pad \"3\" smd rect (at 0 1.5) (size 0.8 0.3) (layers \"F.Cu\") (net 4 \"QUIET\"))
+                (pad \"4\" smd rect (at 0 3.0) (size 0.8 0.3) (layers \"F.Cu\") (net 1 \"GND\"))))",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn differential_pair_routes_coupled_and_matched() {
+        let b = board_pair();
+        let nl = Netlist::from_board(&b);
+        let rules = crate::rules::DesignRules::for_layers(6);
+        let mut cfg = RouterConfig::from_rules(
+            &rules,
+            vec!["F.Cu".into(), "In2.Cu".into(), "B.Cu".into()],
+            vec!["GND".into()],
+            vec![],
+        );
+        cfg.pairs = vec![PairConfig { p: "DP".into(), n: "DN".into(), width_mm: 0.127, pitch_mm: 0.254, z_diff: 100.0, skew_budget_mm: 0.15 }];
+        cfg.pair_layers = vec!["F.Cu".into(), "In2.Cu".into()];
+        cfg.net_gap.insert("DP".into(), 4.0 * 0.127);
+        cfg.net_gap.insert("DN".into(), 4.0 * 0.127);
+        let router = Router::new(cfg);
+        let r = router.route(&b, &nl);
+        assert!(r.unrouted.is_empty(), "all routed: {} {:?}", r.summary_line(), r.unrouted);
+        assert_eq!(r.pairs.len(), 1, "one pair trunk reported");
+        let pr = &r.pairs[0];
+        assert!(pr.routed, "pair routed: {}", pr.cause);
+        assert!(pr.coupled_mm > 8.0, "coupled length {} mm", pr.coupled_mm);
+        assert!(pr.skew_mm.abs() <= pr.skew_budget_mm + 1e-6, "skew {} within {}", pr.skew_mm, pr.skew_budget_mm);
+        assert!(pr.tail_max_mm < 8.0, "tails short: {}", pr.tail_max_mm);
+        // Both tracks on the pair layer, every P corridor segment has an N
+        // segment running parallel at the pitch
+        let on_layer = |net: &str| r.segments.iter().filter(|s| s.net.1 == net && s.layer == pr.layer).count();
+        assert!(on_layer("DP") > 0 && on_layer("DN") > 0);
+        for s in r.segments.iter().filter(|s| s.net.1 == "DP" || s.net.1 == "DN") {
+            assert!((s.width - 0.127).abs() < 1e-9);
+        }
+        // Length measure from the geometry agrees with the report
+        let len_of = |net: &str| r.segments.iter().filter(|s| s.net.1 == net).map(|s| ((s.x2 - s.x1).powi(2) + (s.y2 - s.y1).powi(2)).sqrt()).sum::<f64>();
+        let (lp, ln) = (len_of("DP"), len_of("DN"));
+        assert!(((lp - ln) - pr.skew_mm).abs() < 0.3, "geometry skew {} vs report {}", lp - ln, pr.skew_mm);
+        // The quiet net never runs parallel within 4W of the pair outside
+        // the breakout zones (pads grown by 1 mm)
+        let pads: Vec<(f64, f64)> = b.footprints.iter().flat_map(|f| f.pads.iter().map(|p| (p.x, p.y))).collect();
+        let exempt = |x: f64, y: f64| pads.iter().any(|(px, py)| (x - px).abs() < 1.5 && (y - py).abs() < 1.5);
+        for q in r.segments.iter().filter(|s| s.net.1 == "QUIET") {
+            for p in r.segments.iter().filter(|s| (s.net.1 == "DP" || s.net.1 == "DN") && s.layer == q.layer) {
+                let horiz_q = (q.y1 - q.y2).abs() < 1e-9;
+                let horiz_p = (p.y1 - p.y2).abs() < 1e-9;
+                if horiz_q != horiz_p { continue; }
+                let (q0, q1, p0, p1, qc, pc) = if horiz_q { (q.x1.min(q.x2), q.x1.max(q.x2), p.x1.min(p.x2), p.x1.max(p.x2), q.y1, p.y1) } else { (q.y1.min(q.y2), q.y1.max(q.y2), p.y1.min(p.y2), p.y1.max(p.y2), q.x1, p.x1) };
+                let overlap = q1.min(p1) - q0.max(p0);
+                let gap = (qc - pc).abs() - 0.127;
+                if overlap > 0.0 && gap < 4.0 * 0.127 - 1e-6 {
+                    let mid = (q0.max(p0) + q1.min(p1)) / 2.0;
+                    let (mx, my) = if horiz_q { (mid, qc) } else { (qc, mid) };
+                    assert!(exempt(mx, my), "QUIET runs {:.2}mm parallel to the pair at {:.3}mm gap outside breakouts at ({:.2},{:.2})", overlap, gap, mx, my);
+                }
+            }
+        }
     }
 
     #[test]

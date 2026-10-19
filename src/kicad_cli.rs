@@ -63,7 +63,10 @@ impl DrcSummary {
     pub const FAB_BLOCKING: &'static [&'static str] = &[
         "silk_over_copper",
         "silk_overlap",
-        "silk_edge_clearance",
+        // silk_edge_clearance is NOT here: a connector whose shell protrudes
+        // past the board edge (declared edge_overhang_mm) draws silk over
+        // the outline; every fab clips silkscreen to the outline. It stays
+        // a listed warning.
         "courtyards_overlap",
         "items_not_allowed",
         "connection_width",
@@ -271,10 +274,84 @@ impl KiCadCli {
 
     /// Render the board to a PNG (3D view), top or bottom side.
     pub fn render_png(&self, pcb_file: &str, output_file: &str, side: &str) -> CliResult {
-        self.run(&[
-            "pcb", "render", "--side", side, "--width", "2400", "--height", "1600",
-            "--quality", "high", "--background", "opaque", "--output", output_file, pcb_file,
-        ])
+        self.render_3d(pcb_file, output_file, side, None)
+    }
+
+    /// 3D render with component bodies when a 3D model library is known:
+    /// `view` is "top", "bottom" or "iso" (perspective, rotated). The model
+    /// directory is handed to kicad-cli as every KICAD*_3DMODEL_DIR the
+    /// library footprints reference.
+    pub fn render_3d(&self, pcb_file: &str, output_file: &str, view: &str, model_dir: Option<&str>) -> CliResult {
+        let mut args: Vec<String> = vec![
+            "pcb".into(), "render".into(), "--width".into(), "2400".into(), "--height".into(), "1600".into(),
+            "--quality".into(), "high".into(), "--background".into(), "opaque".into(),
+        ];
+        if let Some(dir) = model_dir {
+            for v in ["KICAD10_3DMODEL_DIR", "KICAD9_3DMODEL_DIR", "KICAD8_3DMODEL_DIR", "KICAD7_3DMODEL_DIR"] {
+                args.push("--define-var".into());
+                args.push(format!("{}={}", v, dir));
+            }
+        }
+        match view {
+            "iso" => {
+                args.push("--perspective".into());
+                args.push("--floor".into());
+                args.push("--rotate".into());
+                args.push("-35,0,30".into());
+                args.push("--zoom".into());
+                args.push("1.1".into());
+            }
+            side => {
+                args.push("--side".into());
+                args.push(side.into());
+            }
+        }
+        args.push("--output".into());
+        args.push(output_file.into());
+        args.push(pcb_file.into());
+        let refs: Vec<&str> = args.iter().map(|a| a.as_str()).collect();
+        self.run(&refs)
+    }
+
+    /// The first 3D model library directory that exists: `SOMEDA_3DMODEL_DIR`,
+    /// the KiCad environment variables, the Debian/Ubuntu package path, or
+    /// the someda-fetched models under the user's data directory.
+    pub fn find_3d_model_dir() -> Option<String> {
+        let mut candidates: Vec<String> = Vec::new();
+        for v in ["SOMEDA_3DMODEL_DIR", "KICAD10_3DMODEL_DIR", "KICAD9_3DMODEL_DIR", "KICAD8_3DMODEL_DIR"] {
+            if let Ok(p) = std::env::var(v) {
+                candidates.push(p);
+            }
+        }
+        candidates.push("/usr/share/kicad/3dmodels".into());
+        candidates.push("/usr/local/share/kicad/3dmodels".into());
+        candidates.push("/Applications/KiCad/KiCad.app/Contents/SharedSupport/3dmodels".into());
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(format!("{}/.local/share/someda/3dmodels", home));
+        }
+        candidates.into_iter().find(|p| std::path::Path::new(p).is_dir())
+    }
+
+    /// Gerbers the way JLCPCB's KiCad guide asks: Protel extensions, no X2,
+    /// no netlist attributes, silk subtracted by mask, zones checked.
+    pub fn export_gerbers_jlc(&self, pcb_file: &str, output_dir: &str, layer_count: u32) -> CliResult {
+        let mut layers: Vec<String> = vec!["F.Cu".into()];
+        for i in 1..layer_count.saturating_sub(1) {
+            layers.push(format!("In{}.Cu", i));
+        }
+        layers.extend(["B.Cu", "F.Paste", "B.Paste", "F.Silkscreen", "B.Silkscreen", "F.Mask", "B.Mask", "Edge.Cuts"].iter().map(|s| s.to_string()));
+        let layer_arg = layers.join(",");
+        self.run(&["pcb", "export", "gerbers", "--output", output_dir, "--layers", &layer_arg, "--no-x2", "--no-netlist", "--subtract-soldermask", "--check-zones", pcb_file])
+    }
+
+    /// Excellon drill for JLCPCB: PTH and NPTH in one file, mm, decimal, with a PDF map.
+    pub fn export_drill_jlc(&self, pcb_file: &str, output_dir: &str) -> CliResult {
+        self.run(&["pcb", "export", "drill", "--output", output_dir, "--format", "excellon", "--excellon-units", "mm", "--excellon-zeros-format", "decimal", "--generate-map", "--map-format", "pdf", pcb_file])
+    }
+
+    /// Position CSV (both sides, SMD only) for the assembly CPL.
+    pub fn export_pos_csv(&self, pcb_file: &str, output_file: &str) -> CliResult {
+        self.run(&["pcb", "export", "pos", "--format", "csv", "--units", "mm", "--side", "both", "--smd-only", "--output", output_file, pcb_file])
     }
 
     /// Export position files (pick-and-place): `kicad-cli pcb export pos <file>`

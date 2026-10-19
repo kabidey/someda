@@ -31,6 +31,24 @@ pub struct CircuitPlan {
     /// the main power net on the layer before the last inner GND.
     #[serde(default)]
     pub planes: Option<Vec<PlaneSpec>>,
+    /// Differential pairs: routed as coupled pairs (same layer, constant
+    /// gap, matched length) to a differential impedance target.
+    #[serde(default)]
+    pub pairs: Option<Vec<PairSpec>>,
+}
+
+/// A differential pair: nets `p` and `n` are routed side by side as one
+/// coupled pair at `z_diff` Ω (default 100), with intra-pair length
+/// mismatch held under `skew_mm` (default: the interface class budget —
+/// see `pair_skew_budget_mm`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairSpec {
+    pub p: String,
+    pub n: String,
+    #[serde(default)]
+    pub z_diff: Option<f64>,
+    #[serde(default)]
+    pub skew_mm: Option<f64>,
 }
 
 /// A fixed board outline request (mm).
@@ -95,6 +113,20 @@ pub struct PlannedComponent {
     /// 1.0 = right/bottom end). Still intent, not a coordinate.
     #[serde(default)]
     pub edge_at: Option<f64>,
+    /// Optional: the LCSC part number ("C165948"). The plugin's fetch-libs
+    /// step pulls the part's footprint and 3D model from EasyEDA/LCSC when
+    /// the KiCad libraries have none.
+    #[serde(default)]
+    pub lcsc: Option<String>,
+    /// Optional: manufacturer part number, for the Mouser/Digi-Key lookups
+    /// of the fetch-libs step and for the BOM.
+    #[serde(default)]
+    pub mpn: Option<String>,
+    /// Optional, edge connectors: how far the body may protrude past the
+    /// board edge (mm; e.g. 0.8 for a USB-C receptacle whose datasheet puts
+    /// the shell lip beyond the PCB). Default 0: courtyard flush with the edge.
+    #[serde(default)]
+    pub edge_overhang_mm: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +144,13 @@ pub struct PlannedNet {
     /// highspeed | analog | digital. Otherwise derived from the name.
     #[serde(default)]
     pub role: Option<String>,
+    /// Optional: how the net is terminated — "series" (resistor at the
+    /// driver), "parallel" (resistor at the receiver), "on-chip" (the
+    /// interface terminates inside the ICs: USB, MIPI, Ethernet PHY),
+    /// "none". Otherwise derived: a ≤100 Ω two-pin resistor on the net
+    /// counts as series termination; pair nets count as on-chip.
+    #[serde(default)]
+    pub termination: Option<String>,
 }
 
 /// The system prompt for circuit planning. The LLM sees the JSON contract
@@ -138,6 +177,8 @@ Rules:
 - Power nets are named "VCC" and "GND" (use these exact names)
 - Declare each net's "freq_hz" when the circuit's intent knows it (clocks, RF, high-speed interfaces); leave it out when unknown
 - Declare "role" (power|ground|clock|rf|highspeed|analog|digital) when the net name alone is ambiguous
+- Declare "termination" (series|parallel|on-chip|none) on fast nets when known; a series resistor on the net is detected automatically
+- Declare differential pairs as "pairs": [{"p": "USB_DP", "n": "USB_DM", "z_diff": 90}] — both nets must connect the same two components; they are routed as one coupled, length-matched pair
 - Declare "power_w" for components that dissipate noticeably (regulators, power LEDs, resistors in power paths)
 - Include decoupling capacitors (100nF) on every IC's power pins
 - Use standard values: E12 series for resistors, standard capacitor values
@@ -176,6 +217,12 @@ pub struct BuildResult {
     pub schematic_file: String,
     pub board_file: String,
     pub stages: Vec<StageResult>,
+    /// What the engine could fix with a plan edit (see `repair`).
+    pub repairs: Vec<crate::repair::RepairHint>,
+    /// All six export gates passed.
+    pub honest_done: bool,
+    /// The board outline the build used (mm).
+    pub board_mm: (f64, f64),
 }
 
 #[derive(Debug)]
@@ -192,8 +239,6 @@ pub fn build(
     project_dir: &Path,
     description: &str,
 ) -> Result<BuildResult, OrchestrateError> {
-    let mut stages = Vec::new();
-
     // ─── Stage 1: Plan (LLM) ───
     println!("─── Stage 1: Planning circuit ───");
     // SOMEDA_PLAN_FILE: inject a plan for testing the full pipeline offline.
@@ -216,6 +261,25 @@ pub fn build(
         .map_err(|e| OrchestrateError::PlanInvalid(format!("LLM output does not match the contract: {}", e)))?;
 
     validate_plan(&plan)?;
+    crate::repair::build_with_repairs(cli, project_dir, plan)
+}
+
+/// One deterministic build of a validated plan: every stage, honest gates,
+/// and the repair hints the engine collected on the way. [`build`] wraps
+/// this in the repair loop.
+pub fn build_with_plan(
+    cli: &KiCadCli,
+    project_dir: &Path,
+    plan: CircuitPlan,
+) -> Result<BuildResult, OrchestrateError> {
+    let mut stages = Vec::new();
+    let mut repairs: Vec<crate::repair::RepairHint> = Vec::new();
+    let mut board_mm: (f64, f64) = (0.0, 0.0);
+    // Edge connectors: decide their rotation from the footprint geometry
+    // BEFORE the board model is instantiated (pads are placed absolutely
+    // with the rotation; the placer only translates).
+    let mut plan = plan;
+    orient_edge_connectors(&mut plan, true);
     stages.push(StageResult {
         stage: "plan".into(),
         success: true,
@@ -228,6 +292,18 @@ pub fn build(
         .map_err(|e| OrchestrateError::Io(e.to_string()))?;
 
     let sch_content = generate_schematic(&plan);
+    {
+        let (lib, table) = generate_symbol_library(&plan);
+        std::fs::create_dir_all(project_dir).ok();
+        fs::write(project_dir.join("someda-symbols.kicad_sym"), lib).map_err(|e| OrchestrateError::Io(e.to_string()))?;
+        fs::write(project_dir.join("sym-lib-table"), table).map_err(|e| OrchestrateError::Io(e.to_string()))?;
+    }
+    if std::env::var("SOMEDA_STOP_AFTER").map(|v| v == "schematic").unwrap_or(false) {
+        std::fs::create_dir_all(project_dir).ok();
+        let sch_path = project_dir.join("circuit.kicad_sch");
+        std::fs::write(&sch_path, &sch_content).map_err(|e| OrchestrateError::Io(e.to_string()))?;
+        return Ok(BuildResult { plan, project_dir: project_dir.display().to_string(), schematic_file: sch_path.display().to_string(), board_file: String::new(), stages: Vec::new(), repairs: Vec::new(), honest_done: false, board_mm });
+    }
     let (mut board, fp_report) = generate_board_model_with_report(&plan);
     {
         let real = fp_report.iter().filter(|r| r.real).count();
@@ -236,6 +312,9 @@ pub fn build(
             .filter(|r| !r.real)
             .map(|r| format!("{} ({})", r.reference, r.lib_id))
             .collect();
+        for r in fp_report.iter().filter(|r| !r.real) {
+            repairs.push(crate::repair::RepairHint::FootprintMissing { reference: r.reference.clone(), lib_id: r.lib_id.clone() });
+        }
         for r in &fp_report {
             println!("  footprint {:>5} {:<55} {}", r.reference, r.lib_id, if r.real { r.note.clone() } else { format!("SYNTHETIC — {}", r.note) });
         }
@@ -282,25 +361,35 @@ pub fn build(
     // may express INTENT: semantic/edge positions, "near" relations; the
     // physics adds thermal keep-apart for hot parts.
     println!("─── Stage 2b: Deterministic placement (real courtyards) ───");
-    let plane_specs = resolve_planes(&plan, &board);
+    let mut plane_specs = resolve_planes(&plan, &board);
+    let mut edge_failures: Vec<String> = Vec::new();
     {
-        let nl = crate::netlist::Netlist::from_board(&board);
         let (w, h) = board
             .outline_bbox()
             .map(|(x0, y0, x1, y1)| (x1 - x0, y1 - y0))
             .unwrap_or((100.0, 80.0));
+        board_mm = (w, h);
         let placer = crate::placer::Placer::new(w, h);
+        let build_intent = |plan: &CircuitPlan, plane_specs: &[PlaneSpec], verbose: bool| -> crate::placer::PlacementIntent {
         let mut intent = crate::placer::PlacementIntent::default();
         for c in &plan.components {
             if let Some(pos) = c.position.as_deref() {
                 match crate::placer::Pos::parse(pos) {
-                    Some(p) => intent.places.push(crate::placer::PlaceIntent {
-                        reference: c.reference.clone(),
-                        pos: Some(p),
-                        rot: c.rotation.map(|r| r as i32),
-                        side_back: false,
-                        edge_at: c.edge_at,
-                    }),
+                    Some(p) => {
+                        // Edge connectors: the engine turns the opening toward
+                        // the edge from the footprint geometry and puts the
+                        // courtyard flush with the edge (plus any declared
+                        // overhang) — a plan never has to know rotations.
+                        let overhang = if p.is_edge() { edge_connector_orientation(c, p).1 } else { 0.0 };
+                        intent.places.push(crate::placer::PlaceIntent {
+                            reference: c.reference.clone(),
+                            pos: Some(p),
+                            rot: c.rotation.map(|r| r as i32),
+                            side_back: false,
+                            edge_at: c.edge_at,
+                            edge_overhang: overhang,
+                        })
+                    }
                     None => println!("  [warning] {}: unknown position '{}' ignored", c.reference, pos),
                 }
             }
@@ -308,8 +397,11 @@ pub fn build(
                 intent.near.push((c.reference.clone(), anchor.clone()));
             }
         }
-        for ps in &plane_specs {
+        for ps in plane_specs {
             intent.ignore_nets.push(ps.net.clone());
+            if crate::netfreq::net_signal(&ps.net, &[], None, None).role == crate::netfreq::NetRole::Ground {
+                intent.ground_nets.push(ps.net.clone());
+            }
         }
         {
             let hot: Vec<&crate::orchestrator::PlannedComponent> = plan
@@ -329,17 +421,163 @@ pub fn build(
                     });
                 }
             }
-            if !intent.apart.is_empty() {
+            if !intent.apart.is_empty() && verbose {
                 println!("  thermal placement: {} hot pair(s) ≥15mm apart", intent.apart.len());
             }
         }
-        let solved = placer.arrange_courtyards(&board, &nl, &intent);
-        for s in &solved {
-            if let Some(fp) = board.footprints.iter_mut().find(|f| f.reference == s.reference) {
-                let (dx, dy) = (s.x - fp.x, s.y - fp.y);
-                fp.translate(dx, dy);
+            intent
+        };
+        let mut intent = build_intent(&plan, &plane_specs, true);
+        // Place; an edge connector that found no room on its edge is moved
+        // to another edge (adjacent first), re-oriented from its geometry
+        // and the board re-placed — bounded, printed as `repair:`. A
+        // connector in the interior is unusable (live-verified: a 3.5 mm
+        // jack parked mid-board with its opening facing nothing).
+        let mut tried: std::collections::HashMap<String, Vec<crate::placer::Pos>> = std::collections::HashMap::new();
+        let mut solved;
+        let mut round = 0usize;
+        loop {
+            let nl = crate::netlist::Netlist::from_board(&board);
+            solved = placer.arrange_courtyards(&board, &nl, &intent);
+            for s in &solved {
+                if let Some(fp) = board.footprints.iter_mut().find(|f| f.reference == s.reference) {
+                    let (dx, dy) = (s.x - fp.x, s.y - fp.y);
+                    fp.translate(dx, dy);
+                }
+            }
+            let mut reassign: Option<(String, crate::placer::Pos)> = None;
+            edge_failures.clear();
+            for c in &plan.components {
+                let Some(pos) = c.position.as_deref().and_then(crate::placer::Pos::parse) else { continue };
+                if !pos.is_edge() {
+                    continue;
+                }
+                let Some(fp) = board.footprints.iter().find(|f| f.reference == c.reference) else { continue };
+                let (x0, y0, x1, y1) = fp.abs_bbox();
+                // the same courtyard-frame overhang the placer was given
+                let o = edge_connector_orientation(c, pos).1;
+                let m = placer.margin;
+                let off = match pos {
+                    crate::placer::Pos::TopEdge => (y0 - (m - o)).abs(),
+                    crate::placer::Pos::BottomEdge => ((h - m + o) - y1).abs(),
+                    crate::placer::Pos::LeftEdge => (x0 - (m - o)).abs(),
+                    _ => ((w - m + o) - x1).abs(),
+                };
+                if off <= 0.05 {
+                    continue;
+                }
+                let t = tried.entry(c.reference.clone()).or_default();
+                if !t.contains(&pos) {
+                    t.push(pos);
+                }
+                let next = pos.fallback_edges().iter().copied().find(|e| !t.contains(e));
+                match next {
+                    Some(e) if round < 12 => {
+                        if reassign.is_none() {
+                            reassign = Some((c.reference.clone(), e));
+                        }
+                    }
+                    _ => edge_failures.push(format!("{} ({} full, {:.1} mm off its edge)", c.reference, pos.name(), off)),
+                }
+            }
+            let Some((reference, edge)) = reassign else { break };
+            if let Some(c) = plan.components.iter_mut().find(|c| c.reference == reference) {
+                let from = c.position.clone().unwrap_or_default();
+                c.position = Some(edge.name().to_string());
+                c.edge_at = None;
+                c.rotation = None;
+                let (rot, _, _) = edge_connector_orientation(&*c, edge);
+                c.rotation = rot.map(|r| r as f64);
+                println!(
+                    "  repair: {}: no room on the {} — moved to the {} (rotation {}°), board re-placed",
+                    reference,
+                    from.replace('_', " "),
+                    edge.name().replace('_', " "),
+                    rot.unwrap_or(0)
+                );
+            }
+            round += 1;
+            board = generate_board_model_with_report(&plan).0;
+            intent = build_intent(&plan, &plane_specs, false);
+        }
+        if !edge_failures.is_empty() {
+            for f in &edge_failures {
+                println!("  [error] edge connector {} could not be placed on any edge", f);
+                println!("  suggest: enlarge the board or free that edge (board.width_mm/height_mm, other parts' position)");
             }
         }
+        // Split-plane islands grow to reach their own decoupling
+        // capacitors: a capacitor at the IC whose rail pad lies outside the
+        // island has no plane to fan out to (live-verified: a +1V8 island
+        // under the SoC only, its capacitors just outside the escape ring →
+        // 18.8 mm stubs, 9.6 nH loops). Bounded to 6 mm per side; beyond
+        // that the plan must move the part or grow the region.
+        {
+            let components = &plan.components;
+            if let Some(planes) = plan.planes.as_mut() {
+                for ps in planes.iter_mut() {
+                    if std::env::var("SOMEDA_PLACE_DEBUG").is_ok() {
+                        println!("place-debug: island check {} {} region {:?} priority {:?}", ps.net, ps.layer, ps.region, ps.priority);
+                    }
+                    if ps.priority.is_none() {
+                        continue;
+                    }
+                    let r0: [f64; 4] = match ps.region.clone() {
+                        Some(PlaneRegionSpec::Rect(r)) => r,
+                        Some(PlaneRegionSpec::Auto(_)) => match auto_plane_region(&board, &ps.net) {
+                            Some(r) => r,
+                            None => continue,
+                        },
+                        None => continue,
+                    };
+                    let inside = |x: f64, y: f64, r: &[f64; 4]| x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3];
+                    let mut r = r0;
+                    let mut reached: Vec<String> = Vec::new();
+                    let mut unreachable: Vec<String> = Vec::new();
+                    for c in components {
+                        let Some(anchor) = c.near.as_deref() else { continue };
+                        let Some(fp) = board.footprints.iter().find(|f| f.reference == c.reference) else { continue };
+                        if fp.pads.len() != 2 {
+                            continue;
+                        }
+                        let Some(pad) = fp.pads.iter().find(|p| p.net.as_ref().map(|n| n.1 == ps.net).unwrap_or(false)) else { continue };
+                        let Some(afp) = board.footprints.iter().find(|f| f.reference == anchor) else { continue };
+                        if !inside(afp.x, afp.y, &r0) || inside(pad.x, pad.y, &r0) {
+                            continue;
+                        }
+                        let want = [pad.x - 1.0, pad.y - 1.0, pad.x + 1.0, pad.y + 1.0];
+                        let grown = [
+                            r[0].min(want[0]).max(r0[0] - 6.0),
+                            r[1].min(want[1]).max(r0[1] - 6.0),
+                            r[2].max(want[2]).min(r0[2] + 6.0),
+                            r[3].max(want[3]).min(r0[3] + 6.0),
+                        ];
+                        if inside(want[0], want[1], &grown) && inside(want[2], want[3], &grown) {
+                            reached.push(c.reference.clone());
+                            r = grown;
+                        } else {
+                            unreachable.push(c.reference.clone());
+                        }
+                    }
+                    if !reached.is_empty() {
+                        ps.region = Some(PlaneRegionSpec::Rect(r));
+                        println!(
+                            "  repair: {} island on {} grown from [{:.1}, {:.1}, {:.1}, {:.1}] to [{:.1}, {:.1}, {:.1}, {:.1}] so {} can fan out into it",
+                            ps.net, ps.layer, r0[0], r0[1], r0[2], r0[3], r[0], r[1], r[2], r[3], reached.join(", ")
+                        );
+                    }
+                    if !unreachable.is_empty() {
+                        println!(
+                            "  suggest: {} sit more than 6 mm outside the {} island — move them next to the island (\"near\" the IC's rail pins) or enlarge planes[].region for {}",
+                            unreachable.join(", "), ps.net, ps.net
+                        );
+                    }
+                }
+            }
+        }
+        // Plane regions resolved AFTER placement: "auto" regions follow the
+        // placed pads and islands may have grown.
+        plane_specs = resolve_planes(&plan, &board);
         // Courtyard overlap is a DRC error in KiCad: report it here first
         let mut overlaps = 0;
         for (i, a) in board.footprints.iter().enumerate() {
@@ -407,12 +645,16 @@ pub fn build(
                 println!("  silkscreen: {} reference(s) have no clear spot and go on F.Fab instead", on_fab);
             }
         }
+        if overlaps > 0 {
+            repairs.push(crate::repair::RepairHint::Overlap(overlaps));
+        }
         stages.push(StageResult {
             stage: "placement".into(),
-            success: overlaps == 0,
+            success: overlaps == 0 && edge_failures.is_empty(),
             detail: format!(
-                "placed {} footprint(s) on {:.0}x{:.0}mm, {} hint(s), {} courtyard overlap(s)",
-                solved.len(), w, h, intent.places.len() + intent.near.len(), overlaps
+                "placed {} footprint(s) on {:.0}x{:.0}mm, {} hint(s), {} courtyard overlap(s){}",
+                solved.len(), w, h, intent.places.len() + intent.near.len(), overlaps,
+                if edge_failures.is_empty() { String::new() } else { format!(", {} edge connector(s) NOT on an edge: {}", edge_failures.len(), edge_failures.join("; ")) }
             ),
         });
     }
@@ -435,26 +677,7 @@ pub fn build(
         let r = match &ps.region {
             None => None,
             Some(PlaneRegionSpec::Rect([x0, y0, x1, y1])) => Some((*x0, *y0, *x1, *y1)),
-            Some(PlaneRegionSpec::Auto(_)) => {
-                // The island follows the footprint that owns most of the
-                // net's pins (the SoC's rail pins) plus 3.5mm for the
-                // decoupling caps hugging them. Pads elsewhere are routed
-                // to the island as traces.
-                let anchor = board
-                    .footprints
-                    .iter()
-                    .max_by_key(|fp| fp.pads.iter().filter(|pd| pd.net.as_ref().map(|n| n.1 == ps.net).unwrap_or(false)).count());
-                let mut b = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-                if let Some(fp) = anchor {
-                    for pd in &fp.pads {
-                        if pd.net.as_ref().map(|n| n.1 == ps.net).unwrap_or(false) {
-                            b.0 = b.0.min(pd.x - bx0); b.1 = b.1.min(pd.y - by0);
-                            b.2 = b.2.max(pd.x - bx0); b.3 = b.3.max(pd.y - by0);
-                        }
-                    }
-                }
-                if b.0.is_finite() { Some((b.0 - 3.5, b.1 - 3.5, b.2 + 3.5, b.3 + 3.5)) } else { None }
-            }
+            Some(PlaneRegionSpec::Auto(_)) => auto_plane_region(&board, &ps.net).map(|r| (r[0], r[1], r[2], r[3])),
         };
         if let Some(r) = r {
             println!("  plane {} on {}: region x {:.1}..{:.1} y {:.1}..{:.1} (priority {})", ps.net, ps.layer, r.0, r.2, r.1, r.3, ps.priority.unwrap_or(0));
@@ -493,6 +716,13 @@ pub fn build(
     );
     let route_summary;
     let unrouted_count;
+    let route_pairs: Vec<crate::router::PairReport>;
+    let route_exempt: Vec<(f64, f64, f64, f64, String, u8)>;
+    let route_families: Vec<Vec<String>>;
+    let router_net_gap: std::collections::HashMap<String, f64>;
+    let pair_infos: Vec<crate::si::PairInfo>;
+    let pairs_ok: bool;
+    let pairs_detail: String;
     {
         let nl = crate::netlist::Netlist::from_board(&board);
         // Power nets (routed as wide traces when not planes)
@@ -508,7 +738,13 @@ pub fn build(
                 }
             }
             let sig = crate::netfreq::net_signal(&net.name, &member_values, net.freq_hz, net.role.as_deref());
-            if matches!(sig.role, crate::netfreq::NetRole::Power | crate::netfreq::NetRole::Ground) {
+            // Wide traces for rails; a secondary ground (AGND behind a 0 Ω
+            // link) carries decoupling return currents only and routes at
+            // the default width — a 0.4 mm trace cannot thread a fine-pitch
+            // breakout (live-verified: AGND unrouted between two capacitors).
+            let is_plane = plane_specs.iter().any(|p| p.net == net.name);
+            let secondary_ground = matches!(sig.role, crate::netfreq::NetRole::Ground) && !is_plane;
+            if matches!(sig.role, crate::netfreq::NetRole::Power | crate::netfreq::NetRole::Ground) && !secondary_ground {
                 power_nets.push(net.name.clone());
             }
         }
@@ -528,8 +764,77 @@ pub fn build(
                 priority: p.priority.unwrap_or(0),
             })
             .collect();
+        // ─── Differential pairs: cross-section per pair from the stackup ───
+        let fab_limits = crate::materials::FabLimits::default();
+        let mut pair_cfgs: Vec<crate::router::PairConfig> = Vec::new();
+        let mut pair_net_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pair_geometry_failed = 0usize;
+        let mut infos: Vec<crate::si::PairInfo> = Vec::new();
+        if let Some(pairs) = &plan.pairs {
+            for pr in pairs {
+                let z = pr.z_diff.unwrap_or(100.0);
+                match stackup.pair_geometry(z, fab_limits.min_trace_mm, rules.clearance_mm) {
+                    Some(g) => {
+                        let budget = pr.skew_mm.unwrap_or_else(|| pair_skew_budget_mm(&pr.p, &pr.n));
+                        println!(
+                            "  pair {}/{}: {:.0} Ω → w {:.4} mm / gap {:.4} mm, skew budget {:.3} mm ({})",
+                            pr.p, pr.n, z, g.width_mm, g.gap_mm, budget, g.source
+                        );
+                        pair_cfgs.push(crate::router::PairConfig {
+                            p: pr.p.clone(),
+                            n: pr.n.clone(),
+                            width_mm: g.width_mm,
+                            pitch_mm: g.width_mm + g.gap_mm,
+                            z_diff: z,
+                            skew_budget_mm: budget,
+                        });
+                        infos.push(crate::si::PairInfo { p: pr.p.clone(), n: pr.n.clone(), z_diff: z, width_mm: g.width_mm, gap_mm: g.gap_mm, source: g.source.clone(), routed: false });
+                        pair_net_names.insert(pr.p.clone());
+                        pair_net_names.insert(pr.n.clone());
+                    }
+                    None => {
+                        println!("  [error] pair {}/{}: no {:.0} Ω cross-section within the fab scope on {}", pr.p, pr.n, z, stackup.name);
+                        pair_geometry_failed += 1;
+                        infos.push(crate::si::PairInfo { p: pr.p.clone(), n: pr.n.clone(), z_diff: z, width_mm: 0.0, gap_mm: 0.0, source: "none".into(), routed: false });
+                    }
+                }
+            }
+        }
+        cfg.pairs = pair_cfgs;
+        // Clean layers: signal layers next to a single whole-board plane
+        // (a split plane under a trace breaks its return path).
+        cfg.pair_layers = clean_signal_layers(&board, &signal_layers, &plane_specs, &plane_rects);
+        if !cfg.pairs.is_empty() {
+            println!("  pair/impedance layers: {}", cfg.pair_layers.join(", "));
+        }
+        // Crosstalk: every net that carries a frequency gets its 3W/5W gap
+        for net in &plan.nets {
+            let mut member_values: Vec<&str> = Vec::new();
+            for pin in &net.pins {
+                if let Some((refdes, _)) = pin.split_once(':') {
+                    if let Some(c) = plan.components.iter().find(|c| c.reference == refdes) {
+                        member_values.push(&c.value);
+                        member_values.push(&c.lib_id);
+                    }
+                }
+            }
+            let sig = crate::netfreq::net_signal(&net.name, &member_values, net.freq_hz, net.role.as_deref());
+            let fast = sig.freq_hz >= 1.0e6 || matches!(sig.role, crate::netfreq::NetRole::Rf | crate::netfreq::NetRole::HighSpeed | crate::netfreq::NetRole::Clock);
+            if fast && !matches!(sig.role, crate::netfreq::NetRole::Power | crate::netfreq::NetRole::Ground) {
+                // 3W/5W with W = the board's design trace width: one spacing
+                // class per board, so router halo and audit rule agree for
+                // every width that net may take (pair width, neck-down, 50 Ω).
+                let w = rules.trace_width_mm;
+                let gap = sig.crosstalk_spacing_mm(w) - w; // centre spacing 3W/5W → edge gap 2W/4W
+                cfg.net_gap.insert(net.name.clone(), gap);
+            }
+        }
+        router_net_gap = cfg.net_gap.clone();
         let mut router = crate::router::Router::new(cfg).stackup_with(stackup.clone());
         for net in &plan.nets {
+            if pair_net_names.contains(&net.name) {
+                continue; // pair nets take the pair cross-section, not a 50 Ω single-ended width
+            }
             let mut member_values: Vec<&str> = Vec::new();
             for pin in &net.pins {
                 if let Some((refdes, _)) = pin.split_once(':') {
@@ -548,9 +853,48 @@ pub fn build(
                 }
             }
         }
+        router.config.restricted_nets = router.impedance_targets.keys().cloned().collect();
         let route = router.route(&board, &nl);
         route_summary = route.summary_line();
         unrouted_count = route.unrouted.len();
+        if unrouted_count > 0 {
+            repairs.push(crate::repair::RepairHint::Unrouted(unrouted_count));
+        }
+        // Pair reports → gate facts
+        for pr in &route.pairs {
+            println!(
+                "  pair {}/{}: {}",
+                pr.p, pr.n,
+                if pr.routed {
+                    format!("coupled {:.1} mm on {}, tails ≤ {:.1} mm, len P {:.2} / N {:.2} mm, skew {:+.3} mm (budget {:.3}), {} corner(s), {} bump(s){}{}",
+                        pr.coupled_mm, pr.layer, pr.tail_max_mm, pr.p_len_mm, pr.n_len_mm, pr.skew_mm, pr.skew_budget_mm, pr.corners, pr.bumps,
+                        if pr.crossover { ", P/N order differs at the two ends: far tails cross through a via" } else { "" },
+                        if pr.cause.is_empty() { String::new() } else { format!(" — {}", pr.cause) })
+                } else {
+                    format!("NOT COUPLED — {}", pr.cause)
+                }
+            );
+        }
+        let mut infos = infos;
+        for info in infos.iter_mut() {
+            info.routed = route.pairs.iter().filter(|r| r.p == info.p && r.n == info.n).all(|r| r.routed) && route.pairs.iter().any(|r| r.p == info.p && r.n == info.n);
+        }
+        let declared = plan.pairs.as_ref().map(|p| p.len()).unwrap_or(0);
+        let trunks_ok = route.pairs.iter().filter(|r| r.routed && r.skew_mm.abs() <= r.skew_budget_mm + 1e-6).count();
+        let trunks = route.pairs.len();
+        pairs_ok = pair_geometry_failed == 0 && infos.iter().all(|i| i.routed) && trunks_ok == trunks;
+        if !pairs_ok && pair_geometry_failed == 0 {
+            repairs.push(crate::repair::RepairHint::PairFailed);
+        }
+        pairs_detail = format!(
+            "{} pair(s) declared, {} trunk(s) coupled, {} within skew budget{}",
+            declared, route.pairs.iter().filter(|r| r.routed).count(), trunks_ok,
+            if pair_geometry_failed > 0 { format!(", {} without a fab cross-section", pair_geometry_failed) } else { String::new() }
+        );
+        route_pairs = route.pairs.clone();
+        route_exempt = route.exempt_rects.iter().map(|r| (r.x0, r.y0, r.x1, r.y1, r.layer.clone(), r.axis)).collect();
+        route_families = route.families.clone();
+        pair_infos = infos;
         for u in &route.unrouted {
             println!("  UNROUTED {} {} → {}: {}", u.net.1, u.from, u.to, u.cause);
         }
@@ -578,6 +922,30 @@ pub fn build(
             stage: "route".into(),
             success: route.unrouted.is_empty(),
             detail: route_summary.clone(),
+        });
+    }
+    if plan.pairs.as_ref().map(|p| !p.is_empty()).unwrap_or(false) {
+        stages.push(StageResult { stage: "pairs".into(), success: pairs_ok, detail: pairs_detail.clone() });
+    }
+    let _ = &route_pairs;
+    // Developer switch: SOMEDA_STOP_AFTER=route writes the board and stops
+    // before the audits and kicad-cli (fast routing iteration).
+    if std::env::var("SOMEDA_STOP_AFTER").map(|v| v == "route").unwrap_or(false) {
+        let pcb_path = project_dir.join("circuit.kicad_pcb");
+        std::fs::create_dir_all(project_dir).ok();
+        std::fs::write(&pcb_path, board.to_kicad_pcb()).map_err(|e| OrchestrateError::Io(e.to_string()))?;
+        for stage in &stages {
+            println!("  {} [{}] {}", if stage.success { "✓" } else { "✗" }, stage.stage, stage.detail);
+        }
+        return Ok(BuildResult {
+            plan,
+            project_dir: project_dir.display().to_string(),
+            schematic_file: String::new(),
+            board_file: pcb_path.display().to_string(),
+            stages,
+            repairs,
+            honest_done: false,
+            board_mm,
         });
     }
 
@@ -655,8 +1023,9 @@ pub fn build(
             );
         }
 
-        // SI audit (stray L/C + SWR + stubs + crosstalk)
-        let si = crate::si::audit(&board, &signals, &stackup, &fab);
+        // SI audit (stray L/C + SWR + stubs + crosstalk + pairs + decoupling)
+        let si_ctx = build_si_context(&plan, &board, &pair_infos, &route_exempt, &route_families, &router_net_gap, rules.clearance_mm, &plane_specs);
+        let si = crate::si::audit(&board, &signals, &stackup, &fab, &si_ctx);
         let si_errors = si.findings.iter().filter(|f| f.severity == "error").count();
         let si_warnings = si.findings.iter().filter(|f| f.severity == "warning").count();
         for f in &si.findings {
@@ -711,6 +1080,48 @@ pub fn build(
             detail: format!("{} error(s), {} warning(s)", th_errors, th_warnings),
         });
 
+        // ─── Stability audit: regulators, crystals, switch/feedback nodes ───
+        {
+            let stab = crate::stability::audit(&plan, &board);
+            for f in stab.iter().filter(|f| f.severity == "error") {
+                if let Some(r) = &f.repair {
+                    repairs.push(r.clone());
+                }
+            }
+            let errs = stab.iter().filter(|f| f.severity == "error").count();
+            let warns = stab.iter().filter(|f| f.severity == "warning").count();
+            for f in &stab {
+                println!("  [{}] {} {}: {}", f.severity, f.code, f.subject, f.detail);
+            }
+            stages.push(StageResult {
+                stage: "stability-audit".into(),
+                success: errs == 0,
+                detail: format!("{} error(s), {} warning(s): regulator output capacitance, crystal loads and traces, switch/feedback nodes", errs, warns),
+            });
+        }
+
+        // ─── PDN: |Z(f)| per rail from the decouplers as mounted ───
+        {
+            let results = pdn_audit(&plan, &board, &stackup, &si_ctx, &plane_specs, &plane_rects);
+            let mut over = 0usize;
+            for r in &results {
+                let status = if r.peak_ohm > r.z_target_ohm { over += 1; "warning" } else { "info" };
+                println!(
+                    "  [{}] pdn {}: peak |Z| {:.3} Ω at {:.1} MHz vs target {:.3} Ω ({} capacitor(s){})",
+                    status, r.rail, r.peak_ohm, r.peak_hz / 1e6, r.z_target_ohm, r.n_caps,
+                    match (r.over_target_from_hz, r.over_target_to_hz) {
+                        (Some(a), Some(b)) => format!("; above target {:.1}–{:.1} MHz — add low-ESL capacitance or shorten its loops", a / 1e6, b / 1e6),
+                        _ => String::new(),
+                    }
+                );
+            }
+            stages.push(StageResult {
+                stage: "pdn-audit".into(),
+                success: true,
+                detail: format!("{} rail(s) swept 100 kHz–200 MHz, {} above the ΔV/ΔI target (model: MLCC ESR/ESL classes + measured mounting loops; above 200 MHz the package/die decoupling owns the rail)", results.len(), over),
+            });
+        }
+
         // Fab-scope: the design rules the board was routed with must fit JLCPCB
         let fab_checks = rules.fab_violations(&fab, stackup.finished_thickness_mm);
         let fab_ok = fab_checks.is_empty();
@@ -730,6 +1141,7 @@ pub fn build(
     }
 
     let pcb_content = board.to_kicad_pcb();
+    let pcb_content = resolve_fetched_models(&pcb_content, crate::kicad_cli::KiCadCli::find_3d_model_dir().as_deref());
     fs::write(&pcb_path, &pcb_content)
         .map_err(|e| OrchestrateError::Io(e.to_string()))?;
     // The KiCad project file carries the design rules kicad-cli judges by
@@ -836,20 +1248,78 @@ pub fn build(
         });
 
         let bom = cli.export_bom("circuit.kicad_sch", "fab/bom.csv");
+        // The detailed BOM from the plan: quantities, references, MPN, LCSC,
+        // package — the order sheet (kicad-cli's bom.csv is the symbol list)
+        let lines = crate::bom::build(&plan);
+        let bom_ok = fs::write(project_dir.join("fab/bom-detailed.csv"), crate::bom::to_csv(&lines)).is_ok()
+            && fs::write(project_dir.join("fab/bom.md"), crate::bom::to_markdown(&plan.name, &lines)).is_ok();
+        let with_mpn = lines.iter().filter(|l| !l.mpn.is_empty() || !l.lcsc.is_empty()).count();
         stages.push(StageResult {
             stage: "export-bom".into(),
-            success: bom.success,
-            detail: format!("{}", bom),
+            success: bom.success && bom_ok,
+            detail: format!("{} — fab/bom-detailed.csv + fab/bom.md: {} line items, {} components, {} with a part number", bom, lines.len(), lines.iter().map(|l| l.qty).sum::<usize>(), with_mpn),
         });
 
-        // Renders for humans: top and bottom 3D views
+        // JLCPCB fabrication package: the files their order page takes
+        {
+            let jdir = project_dir.join("fab/jlcpcb");
+            let _ = fs::remove_dir_all(&jdir);
+            let _ = fs::create_dir_all(&jdir);
+            let g = cli.export_gerbers_jlc("circuit.kicad_pcb", "fab/jlcpcb", board.layer_count);
+            let d = cli.export_drill_jlc("circuit.kicad_pcb", "fab/jlcpcb");
+            let p = cli.export_pos_csv("circuit.kicad_pcb", "fab/jlcpcb/positions-kicad.csv");
+            let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+            if let Ok(rd) = fs::read_dir(&jdir) {
+                let mut names: Vec<std::path::PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+                names.sort();
+                for f in names {
+                    let name = f.file_name().unwrap().to_string_lossy().to_string();
+                    if name.ends_with(".csv") || name.ends_with(".zip") || name.ends_with(".gbrjob") {
+                        continue;
+                    }
+                    if let Ok(bytes) = fs::read(&f) {
+                        files.push((name, bytes));
+                    }
+                }
+            }
+            let zip_ok = crate::jlcpcb::write_store_zip(&jdir.join("jlcpcb-gerbers.zip"), &files).is_ok();
+            let lines = crate::bom::build(&plan);
+            let _ = fs::write(jdir.join("jlcpcb-bom.csv"), crate::jlcpcb::bom_csv(&lines));
+            let pos_csv = fs::read_to_string(jdir.join("positions-kicad.csv")).unwrap_or_default();
+            let fp_of = |r: &str| plan.components.iter().find(|c| c.reference == r).and_then(|c| c.footprint.clone());
+            let rows = crate::jlcpcb::cpl_from_positions(&pos_csv, &fp_of);
+            let _ = fs::write(jdir.join("jlcpcb-cpl.csv"), crate::jlcpcb::cpl_csv(&rows));
+            let corrected: Vec<String> = rows.iter().filter(|r| r.correction != 0.0).map(|r| format!("{} {:+.0}°", r.designator, r.correction)).collect();
+            let with_lcsc = lines.iter().filter(|l| !l.lcsc.is_empty()).count();
+            stages.push(StageResult {
+                stage: "jlcpcb-package".into(),
+                success: g.success && d.success && p.success && zip_ok && files.len() >= 8,
+                detail: format!(
+                    "fab/jlcpcb/jlcpcb-gerbers.zip ({} files: Protel names, no X2, mask-subtracted silk, merged Excellon + map), jlcpcb-bom.csv ({} lines, {} with an LCSC part), jlcpcb-cpl.csv ({} SMD parts, rotation corrections on {}: {}) — check the SMT preview before ordering",
+                    files.len(), lines.len(), with_lcsc, rows.len(), corrected.len(),
+                    if corrected.is_empty() { "none".to_string() } else { corrected.join(", ") }
+                ),
+            });
+        }
+
+        // Renders for humans: top, bottom and an isometric view WITH the
+        // component bodies when a 3D model library is available.
         let _ = fs::create_dir_all(project_dir.join("render"));
-        let top = cli.render_png("circuit.kicad_pcb", "render/board-top.png", "top");
-        let bottom = cli.render_png("circuit.kicad_pcb", "render/board-bottom.png", "bottom");
+        let model_dir = crate::kicad_cli::KiCadCli::find_3d_model_dir();
+        let top = cli.render_3d("circuit.kicad_pcb", "render/board-top.png", "top", model_dir.as_deref());
+        let bottom = cli.render_3d("circuit.kicad_pcb", "render/board-bottom.png", "bottom", model_dir.as_deref());
+        let iso = cli.render_3d("circuit.kicad_pcb", "render/board-iso.png", "iso", model_dir.as_deref());
+        // Which referenced models the library actually has
+        let pcb_text = fs::read_to_string(&pcb_path).unwrap_or_default();
+        let (models_total, models_missing) = count_missing_models(&pcb_text, model_dir.as_deref());
+        let models_note = match &model_dir {
+            Some(d) => format!("component bodies from {} ({} of {} referenced models found{})", d, models_total - models_missing.len(), models_total, if models_missing.is_empty() { String::new() } else { format!("; missing: {}", models_missing.join(", ")) }),
+            None => "no 3D model library found: bodies missing — install kicad-packages3d or run the plugin's fetch-libs step".to_string(),
+        };
         stages.push(StageResult {
             stage: "render".into(),
-            success: top.success && bottom.success,
-            detail: format!("render/board-top.png render/board-bottom.png {}", top),
+            success: top.success && bottom.success && iso.success && model_dir.is_some() && models_missing.is_empty(),
+            detail: format!("render/board-top.png render/board-bottom.png render/board-iso.png — {}", models_note),
         });
     } else {
         stages.push(StageResult {
@@ -866,6 +1336,11 @@ pub fn build(
     let sch = crate::schematic::Schematic::from_kicad_sch(&sch_text)
         .map_err(|e| OrchestrateError::Verification(format!("schematic parse: {}", e)))?;
     let erc_report = crate::schematic::run_erc(&sch);
+    for f in erc_report.findings.iter().filter(|f| f.code == "missing-decoupling") {
+        if let Some(n) = &f.net {
+            repairs.push(crate::repair::RepairHint::MissingDecoupling { net: n.clone() });
+        }
+    }
     // Honest classification: missing-power-flag is the known M4 gap (power
     // symbols not yet emitted) — a limitation note, not a design failure.
     // Everything else (floating pins, decoupling, shorts) is a real finding.
@@ -981,6 +1456,9 @@ pub fn build(
         schematic_file: sch_path.display().to_string(),
         board_file: pcb_path.display().to_string(),
         stages,
+        repairs,
+        honest_done: preflight_pass,
+        board_mm,
     })
 }
 
@@ -1067,6 +1545,38 @@ pub fn validate_plan(plan: &CircuitPlan) -> Result<(), OrchestrateError> {
             }
         }
     }
+    if let Some(pairs) = &plan.pairs {
+        let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for pr in pairs {
+            if pr.p == pr.n {
+                return Err(OrchestrateError::PlanInvalid(format!("pair '{}' names the same net twice", pr.p)));
+            }
+            for name in [&pr.p, &pr.n] {
+                if !plan.nets.iter().any(|n| &n.name == name) {
+                    return Err(OrchestrateError::PlanInvalid(format!("pair net '{}' is not a plan net", name)));
+                }
+                if !used.insert(name.as_str()) {
+                    return Err(OrchestrateError::PlanInvalid(format!("net '{}' belongs to more than one pair", name)));
+                }
+            }
+            if let Some(z) = pr.z_diff {
+                if !(20.0..=300.0).contains(&z) {
+                    return Err(OrchestrateError::PlanInvalid(format!("pair {}/{}: z_diff {} Ω is not a PCB pair impedance (20..300)", pr.p, pr.n, z)));
+                }
+            }
+            // The two nets must run between the same two components
+            let refs_of = |name: &str| -> std::collections::HashSet<String> {
+                plan.nets.iter().find(|n| n.name == name).map(|n| n.pins.iter().filter_map(|p| p.split(':').next().map(|s| s.to_string())).collect()).unwrap_or_default()
+            };
+            let shared = refs_of(&pr.p).intersection(&refs_of(&pr.n)).count();
+            if shared < 2 {
+                return Err(OrchestrateError::PlanInvalid(format!(
+                    "pair {}/{}: the two nets share {} component(s); a pair runs between two components both nets connect to",
+                    pr.p, pr.n, shared
+                )));
+            }
+        }
+    }
     // Duplicate references would make net-to-pad joins ambiguous
     let mut seen = std::collections::HashSet::new();
     for c in &plan.components {
@@ -1115,183 +1625,232 @@ pub fn verify_pin_coverage(
 }
 
 /// Generate a .kicad_sch from the plan (deterministic, no LLM involvement).
-pub fn generate_schematic(plan: &CircuitPlan) -> String {
-    let mut out = String::new();
-    out.push_str("(kicad_sch (version 20220904) (generator someda)\n");
-    out.push_str(&format!("  (title_block (title \"{}\"))\n", plan.name));
+/// Schematic pin geometry for a plan pin set (mm, library coordinates:
+/// y up). Two pins inline; more on a DIP rectangle — left column top to
+/// bottom, right column bottom to top. Connection points sit `SCH_PIN_X`
+/// from the origin; the pin runs `SCH_PIN_LEN` inward to the body edge.
+pub const SCH_PIN_X: f64 = 12.7;
+pub const SCH_PIN_LEN: f64 = 5.08;
+pub fn symbol_pin_geometry(pin_nums: &[String]) -> Vec<(String, f64, f64, i32)> {
+    let n = pin_nums.len();
+    let half = (n + 1) / 2;
+    let pitch = 2.54;
+    pin_nums
+        .iter()
+        .enumerate()
+        .map(|(pi, num)| {
+            // Both columns centred on the origin: row 0 at the top of the
+            // left column, the right column climbing from the bottom. (The
+            // earlier form put the left column above the origin and the
+            // right column below it — a 128-pin part became 320 mm tall and
+            // overlapped its neighbours; live-verified multiple_net_names.)
+            let top = (half as f64 - 1.0) / 2.0 * pitch;
+            if n <= 2 {
+                if pi == 0 { (num.clone(), -SCH_PIN_X, 0.0, -1) } else { (num.clone(), SCH_PIN_X, 0.0, 1) }
+            } else if pi < half {
+                (num.clone(), -SCH_PIN_X, top - pi as f64 * pitch, -1)
+            } else {
+                let k = n - 1 - pi;
+                (num.clone(), SCH_PIN_X, -top + k as f64 * pitch, 1)
+            }
+        })
+        .collect()
+}
 
-    // Place symbols in a grid: 50mm apart, 2 per row
-    let mut lib_symbols = String::new();
-    let mut symbols = String::new();
-    let mut emitted_symbols: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for (i, comp) in plan.components.iter().enumerate() {
-        // KiCad schematic grid: 1.27 mm (50 mil). Snap the symbol origin so
-        // every pin endpoint (origin ± 5.08 / ± 2.54k) lands ON grid —
-        // endpoint_off_grid violations disappear (live-verified).
-        let snap = |v: f64| (v / 1.27).round() * 1.27;
-        let x = snap(comp.x_mm.unwrap_or(50.8 + (i % 2) as f64 * 63.5));
-        let y = snap(comp.y_mm.unwrap_or(50.8 + (i / 2) as f64 * 38.1));
-
-        // ONE SYMBOL PIN PER PLAN-REFERENCED PIN — mirror of the board fix.
-        let mut pin_nums: Vec<String> = Vec::new();
-        for net in plan.nets.iter() {
-            for pin in &net.pins {
-                if let Some((refdes, num)) = pin.split_once(':') {
-                    if refdes == comp.reference && !pin_nums.iter().any(|p| p == num) {
-                        pin_nums.push(num.to_string());
-                    }
+/// Plan-referenced pins of a component, in first-seen order.
+fn plan_pins_of(plan: &CircuitPlan, reference: &str) -> Vec<String> {
+    let mut pin_nums: Vec<String> = Vec::new();
+    for net in plan.nets.iter() {
+        for pin in &net.pins {
+            if let Some((refdes, num)) = pin.split_once(':') {
+                if refdes == reference && !pin_nums.iter().any(|p| p == num) {
+                    pin_nums.push(num.to_string());
                 }
             }
         }
+    }
+    pin_nums
+}
+
+/// Where every symbol sits on the sheet: a column layout sized from each
+/// symbol's pin count, on the smallest standard sheet that holds it.
+pub struct SchLayout {
+    /// Symbol origin per component index (mm, sheet coordinates, y down).
+    pub origins: Vec<(f64, f64)>,
+    /// Body half-height per component index (mm).
+    pub half_heights: Vec<f64>,
+    pub paper: &'static str,
+}
+
+pub fn sch_layout(plan: &CircuitPlan) -> SchLayout {
+    let snap = |v: f64| (v / 1.27).round() * 1.27;
+    let n = plan.components.len();
+    // symbol body half-height from its pin rows
+    let half_heights: Vec<f64> = plan
+        .components
+        .iter()
+        .map(|c| {
+            let pins = plan_pins_of(plan, &c.reference);
+            let rows = if pins.len() <= 2 { 1 } else { (pins.len() + 1) / 2 };
+            ((rows as f64 - 1.0) * 2.54) / 2.0 + 2.54
+        })
+        .collect();
+    // tallest first, then by reference, so ICs anchor the left columns
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        half_heights[b].partial_cmp(&half_heights[a]).unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| plan.components[a].reference.cmp(&plan.components[b].reference))
+    });
+    // paper candidates (landscape, mm) — the smallest whose columns fit
+    let papers: [(&str, f64, f64); 5] = [("A4", 297.0, 210.0), ("A3", 420.0, 297.0), ("A2", 594.0, 420.0), ("A1", 841.0, 594.0), ("A0", 1189.0, 841.0)];
+    let col_w = 63.5; // pins ± 12.7, 2.54 stubs, ~17 mm of label each side
+    let (margin_l, margin_t, margin_b) = (25.4, 25.4, 38.1);
+    let mut origins = vec![(0.0, 0.0); n];
+    let mut paper = "A0";
+    for (name, pw, ph) in papers {
+        let usable_h = ph - margin_t - margin_b;
+        let mut col = 0usize;
+        let mut y = margin_t;
+        let mut fits = true;
+        for &i in &order {
+            let slot = 2.0 * half_heights[i] + 10.16; // reference above, value below
+            if y + slot > margin_t + usable_h && y > margin_t {
+                col += 1;
+                y = margin_t;
+            }
+            let x = margin_l + col_w / 2.0 + col as f64 * col_w;
+            if x + col_w / 2.0 > pw - 12.7 {
+                fits = false;
+            }
+            origins[i] = (snap(x), snap(y + 5.08 + half_heights[i]));
+            y += slot;
+        }
+        paper = name;
+        if fits {
+            break;
+        }
+    }
+    SchLayout { origins, half_heights, paper }
+}
+
+pub fn generate_schematic(plan: &CircuitPlan) -> String {
+    generate_schematic_parts(plan).0
+}
+
+/// The project symbol library (`someda-symbols.kicad_sym`) holding every
+/// embedded symbol, and a `sym-lib-table` mapping each library nickname the
+/// schematic references to it — so kicad-cli ERC stops reporting
+/// `lib_symbol_issues` for nicknames the project does not configure.
+pub fn generate_symbol_library(plan: &CircuitPlan) -> (String, String) {
+    let (_, defs) = generate_schematic_parts(plan);
+    let mut lib = String::from("(kicad_symbol_lib (version 20220914) (generator someda)\n");
+    let mut nicknames: Vec<String> = Vec::new();
+    for (full_name, def) in &defs {
+        let (nick, short) = full_name.split_once(':').unwrap_or(("someda", full_name.as_str()));
+        if !nicknames.iter().any(|n| n == nick) {
+            nicknames.push(nick.to_string());
+        }
+        // the embedded definition names the symbol "Nick:Short"; a library
+        // file names it "Short"
+        lib.push_str(&def.replacen(&format!("(symbol \"{}\"", full_name), &format!("(symbol \"{}\"", short), 1));
+    }
+    lib.push_str(")\n");
+    let mut table = String::from("(sym_lib_table\n  (version 7)\n");
+    for n in nicknames {
+        table.push_str(&format!("  (lib (name \"{}\")(type \"KiCad\")(uri \"${{KIPRJMOD}}/someda-symbols.kicad_sym\")(options \"\")(descr \"someda generated symbols\"))\n", n));
+    }
+    table.push_str(")\n");
+    (lib, table)
+}
+
+fn generate_schematic_parts(plan: &CircuitPlan) -> (String, Vec<(String, String)>) {
+    let layout = sch_layout(plan);
+    let mut defs: Vec<(String, String)> = Vec::new();
+    let mut out = String::new();
+    out.push_str("(kicad_sch (version 20220904) (generator someda)\n");
+    out.push_str(&format!("  (paper \"{}\")\n", layout.paper));
+    out.push_str(&format!("  (title_block (title \"{}\"))\n", plan.name));
+
+    let mut lib_symbols = String::new();
+    let mut symbols = String::new();
+    let mut labels = String::new();
+    let mut emitted_symbols: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut wire_id = 0usize;
+
+    for (i, comp) in plan.components.iter().enumerate() {
+        let (x, y) = layout.origins[i];
+        let hh = layout.half_heights[i];
+        // ONE SYMBOL PIN PER PLAN-REFERENCED PIN — mirror of the board fix.
+        let pin_nums = plan_pins_of(plan, &comp.reference);
+        let geometry = symbol_pin_geometry(&pin_nums);
         // Embed a lib symbol per (lib_id, pin set): two "Device:C" parts
         // using different pins must not share one definition (the parser
         // keeps one, and the other's pins float — live-verified ERC noise).
         let lib_name = symbol_name_for(&comp.lib_id, &pin_nums);
         let base_name = lib_name.split(':').last().unwrap_or(&lib_name).to_string();
         let sub_name = format!("{}_0_1", base_name);
-        if !emitted_symbols.insert(lib_name.clone()) {
-            // definition already written: only place the instance below
-            symbols.push_str(&format!(
-                "  (symbol (lib_id \"{}\") (at {:.2} {:.2} 0) (unit 1)\n\
-                 (property \"Reference\" \"{}\" (at 0 -5 0))\n\
-                 (property \"Value\" \"{}\" (at 0 5 0))\n  )\n",
-                lib_name, x, y, comp.reference, comp.value
+        let instance = format!(
+            "  (symbol (lib_id \"{}\") (at {:.2} {:.2} 0) (unit 1)\n\
+             (property \"Reference\" \"{}\" (at {:.2} {:.2} 0) (effects (font (size 1.27 1.27))))\n\
+             (property \"Value\" \"{}\" (at {:.2} {:.2} 0) (effects (font (size 1.27 1.27))))\n  )\n",
+            lib_name, x, y, comp.reference, x, y - hh - 2.54, comp.value, x, y + hh + 2.54
+        );
+        // Every plan pin carries a short stub and a net label: same-named
+        // labels connect on the sheet, so the schematic reads as a labelled
+        // netlist (no wire channels crossing the sheet). The stub points
+        // outward, the label text runs away from the body.
+        for (num, px, py, side) in &geometry {
+            let Some(net) = plan.nets.iter().find(|n| n.pins.iter().any(|p| p == &format!("{}:{}", comp.reference, num))) else { continue };
+            let (cx, cy) = (x + px, y - py); // KiCad: lib y up, sheet y down
+            let sx = cx + *side as f64 * 2.54;
+            labels.push_str(&format!(
+                "  (wire (pts (xy {:.2} {:.2}) (xy {:.2} {:.2})) (uuid wire_{}) )\n",
+                cx, cy, sx, cy, wire_id
             ));
+            wire_id += 1;
+            let (rot, justify) = if *side < 0 { (180, "right bottom") } else { (0, "left bottom") };
+            labels.push_str(&format!(
+                "  (label \"{}\" (at {:.2} {:.2} {}) (effects (font (size 1.27 1.27)) (justify {})))\n",
+                net.name, sx, cy, rot, justify
+            ));
+        }
+        if !emitted_symbols.insert(lib_name.clone()) {
+            symbols.push_str(&instance);
             continue;
         }
-        lib_symbols.push_str(&format!(
-            "    (symbol \"{}\" (pin_names (offset 0.254))\n      (symbol \"{}\"\n",
-            lib_name, sub_name
+        let mut def = String::new();
+        def.push_str(&format!(
+            "    (symbol \"{}\" (pin_names (offset 0.254)) (in_bom yes) (on_board yes)\n      (property \"Reference\" \"{}\" (at 0 {:.2} 0) (effects (font (size 1.27 1.27))))\n      (property \"Value\" \"{}\" (at 0 {:.2} 0) (effects (font (size 1.27 1.27))))\n      (symbol \"{}\"\n",
+            lib_name, comp.reference.trim_end_matches(|c: char| c.is_ascii_digit()), hh + 2.54, comp.value, -hh - 2.54, sub_name
         ));
-        // Components no net references (mounting holes, mechanical parts)
-        // get a pin-less symbol: nothing to float, nothing to connect.
-        // Pin geometry: 2 pins inline; >2 pins on a DIP rectangle
-        // (left column top-to-bottom, right column bottom-to-top)
-        let n = pin_nums.len();
-        for (pi, pin_num) in pin_nums.iter().enumerate() {
-            let (px, py, ang) = if n <= 2 {
-                if pi == 0 { (-5.08, 0.0, 0) } else { (5.08, 0.0, 180) }
-            } else {
-                let half = (n + 1) / 2;
-                let pitch = 2.54;
-                if pi < half {
-                    (-5.08, (half as f64 - 1.0 - pi as f64) * pitch, 0)
-                } else {
-                    let k = n - 1 - pi;
-                    (5.08, (k as f64 - (half as f64 - 1.0)) * pitch, 180)
-                }
-            };
-            lib_symbols.push_str(&format!(
-                "        (pin passive line (at {:.2} {:.2} {}) (length 5.08)\n\
+        // Body rectangle between the pin ends
+        let body_x = SCH_PIN_X - SCH_PIN_LEN;
+        def.push_str(&format!(
+            "        (rectangle (start {:.2} {:.2}) (end {:.2} {:.2}) (stroke (width 0.254) (type default)) (fill (type background)))\n",
+            -body_x, hh, body_x, -hh
+        ));
+        for (num, px, py, side) in &geometry {
+            let ang = if *side < 0 { 0 } else { 180 };
+            def.push_str(&format!(
+                "        (pin passive line (at {:.2} {:.2} {}) (length {:.2})\n\
                  (name \"{}\" (effects (font (size 1.27 1.27))))\n\
                  (number \"{}\" (effects (font (size 1.27 1.27)))))\n",
-                px, py, ang, pin_num, pin_num
+                px, py, ang, SCH_PIN_LEN, num, num
             ));
         }
-        lib_symbols.push_str("             )\n    )\n");
-
-        symbols.push_str(&format!(
-            "  (symbol (lib_id \"{}\") (at {:.2} {:.2} 0) (unit 1)\n\
-             (property \"Reference\" \"{}\" (at 0 -5 0))\n\
-             (property \"Value\" \"{}\" (at 0 5 0))\n  )\n",
-            lib_name, x, y, comp.reference, comp.value
-        ));
+        def.push_str("             )\n    )\n");
+        lib_symbols.push_str(&def);
+        defs.push((lib_name.clone(), def));
+        symbols.push_str(&instance);
     }
 
     out.push_str("  (lib_symbols\n");
     out.push_str(&lib_symbols);
     out.push_str("  )\n");
-
-    // Wires from nets: Manhattan channel routing (per-net rows below the grid)
-    let mut wire_id = 0;
-    // Channel rows start 30mm below the lowest symbol and stack 5mm per net
-    let snap_grid = |v: f64| (v / 1.27).round() * 1.27;
-    let n_rows = (plan.components.len() as f64 / 2.0).ceil().max(1.0);
-    let channel_base = snap_grid(50.8 + n_rows * 38.1 + 12.7);
-    let channel_gap = 5.08;
-    for (net_index, net) in plan.nets.iter().enumerate() {
-        if net.pins.len() < 2 {
-            continue;
-        }
-        // MANHATTAN CHANNEL ROUTING (schematic bus): every net gets a
-        // dedicated horizontal channel row far below the component grid.
-        // pin → vertical drop to the channel → horizontal run → vertical
-        // rise to the target pin. Straight runs THROUGH other components'
-        // pins created real shorts (live-verified: GND's horizontal passed
-        // through R1:1, joining VCC and GND — multiple_net_names).
-        // Channel rows are per-net unique: crossings without shared
-        // endpoints do not connect in KiCad.
-        let channel_y = channel_base - net_index as f64 * channel_gap;
-        for pair in net.pins.windows(2) {
-            let p1 = parse_pin(&pair[0], &plan);
-            let p2 = parse_pin(&pair[1], &plan);
-            if let (Some((x1, y1)), Some((x2, y2))) = (p1, p2) {
-                // Vertical drop from pin1 to channel
-                out.push_str(&format!(
-                    "  (wire (pts (xy {:.2} {:.2}) (xy {:.2} {:.2})) (uuid wire_{}) )\n",
-                    x1, y1, x1, channel_y, wire_id
-                ));
-                wire_id += 1;
-                // Horizontal run in the channel
-                out.push_str(&format!(
-                    "  (wire (pts (xy {:.2} {:.2}) (xy {:.2} {:.2})) (uuid wire_{}) )\n",
-                    x1, channel_y, x2, channel_y, wire_id
-                ));
-                wire_id += 1;
-                // Vertical rise to pin2
-                out.push_str(&format!(
-                    "  (wire (pts (xy {:.2} {:.2}) (xy {:.2} {:.2})) (uuid wire_{}) )\n",
-                    x2, channel_y, x2, y2, wire_id
-                ));
-                wire_id += 1;
-            }
-        }
-        // Label the net on a DEDICATED STUB: a 1.27mm wire sticking out from
-        // the first pin, perpendicular to the net's first wire, with the
-        // label at the stub's far end. The stub belongs to exactly one net
-        // and touches no other wire — label collisions are structurally
-        // impossible (live-verified: every on-wire placement collided with
-        // a neighboring net's crossing or column).
-        // Stub direction: OUTWARD from the symbol body (pin left of origin
-        // → −x, right → +x). Vertical stubs on a pin column collide with
-        // the vertical L-wire runs (live-verified: GND+VCC labels joined on
-        // U1's left column). Outward stubs point into empty space.
-        if let Some((x1, y1)) = net.pins.first().and_then(|p| parse_pin(p, &plan)) {
-            let comp_idx = plan
-                .components
-                .iter()
-                .position(|c| c.reference == net.pins[0].split(':').next().unwrap_or(""));
-            let outward = match comp_idx {
-                Some(i) => {
-                    let snap = |v: f64| (v / 1.27).round() * 1.27;
-                    let cx = snap(
-                        plan.components[i]
-                            .x_mm
-                            .unwrap_or(50.8 + (i % 2) as f64 * 63.5),
-                    );
-                    if x1 < cx { -1.0 } else { 1.0 }
-                }
-                None => -1.0,
-            };
-            let stub_len = 1.27;
-            let (sx, sy) = (x1 + outward * stub_len, y1);
-            out.push_str(&format!(
-                "  (wire (pts (xy {:.2} {:.2}) (xy {:.2} {:.2})) (uuid wire_{}) )\n",
-                x1, y1, sx, sy, wire_id
-            ));
-            wire_id += 1;
-            let rot = if outward < 0.0 { 0 } else { 180 };
-            out.push_str(&format!(
-                "  (label \"{}\" (at {:.2} {:.2} {}))\n",
-                net.name, sx, sy, rot
-            ));
-        }
-    }
-
+    out.push_str(&labels);
     out.push_str(&symbols);
     out.push_str(")\n");
-    out
+    (out, defs)
 }
 
 /// The embedded symbol name for a lib_id with a given pin set: the lib_id
@@ -1310,42 +1869,11 @@ fn symbol_name_for(lib_id: &str, pins: &[String]) -> String {
 fn parse_pin(pin_ref: &str, plan: &CircuitPlan) -> Option<(f64, f64)> {
     let (ref_des, pin_num) = pin_ref.split_once(':')?;
     let idx = plan.components.iter().position(|c| c.reference == ref_des)?;
-    let comp = &plan.components[idx];
-    let snap = |v: f64| (v / 1.27).round() * 1.27;
-    let x = snap(comp.x_mm.unwrap_or(50.8 + (idx % 2) as f64 * 63.5));
-    let y = snap(comp.y_mm.unwrap_or(50.8 + (idx / 2) as f64 * 38.1));
-
-    // Mirror of generate_schematic's pin placement: compute this component's
-    // plan-referenced pin list, then place pin N exactly where the symbol did.
-    let mut pin_nums: Vec<String> = Vec::new();
-    for (net_index, net) in plan.nets.iter().enumerate() {
-        for pin in &net.pins {
-            if let Some((r, n_)) = pin.split_once(':') {
-                if r == comp.reference && !pin_nums.iter().any(|p| p == n_) {
-                    pin_nums.push(n_.to_string());
-                }
-            }
-        }
-    }
-    let n = pin_nums.len();
-    let pi = pin_nums.iter().position(|p| p == pin_num)?;
-    if n <= 2 {
-        // Inline: pin 0 left, pin 1 right (matches the symbol)
-        if pi == 0 { Some((x - 5.08, y)) } else { Some((x + 5.08, y)) }
-    } else {
-        // DIP rectangle: same math as generate_schematic, with the KiCad
-        // Y-mirror applied — a lib pin stored at file-y +2.54 RENDERS at
-        // origin −2.54 (live-verified: ERC saw U1 pin1 at 48.26 for origin
-        // 50.8). Wires must target the RENDERED position.
-        let half = (n + 1) / 2;
-        let pitch = 2.54;
-        if pi < half {
-            Some((x - 5.08, y - (half as f64 - 1.0 - pi as f64) * pitch))
-        } else {
-            let k = n - 1 - pi;
-            Some((x + 5.08, y + (half as f64 - 1.0 - k as f64) * pitch))
-        }
-    }
+    let layout = sch_layout(plan);
+    let (x, y) = layout.origins[idx];
+    let pins = plan_pins_of(plan, ref_des);
+    let (_, px, py, _) = symbol_pin_geometry(&pins).into_iter().find(|(n, _, _, _)| n == pin_num)?;
+    Some((x + px, y - py))
 }
 
 /// How one component's footprint was obtained.
@@ -1620,6 +2148,440 @@ pub fn generate_board(plan: &CircuitPlan) -> String {
     out
 }
 
+
+
+/// Rail voltage from a net name: "+3V3" → 3.3, "+1V8" → 1.8, "VBUS"/"+5V" → 5.
+pub fn rail_volts(name: &str) -> Option<f64> {
+    let u = name.to_ascii_uppercase();
+    if u == "VBUS" || u == "+5V" || u == "5V" || u == "VIN" {
+        return Some(5.0);
+    }
+    let bytes: Vec<char> = u.chars().collect();
+    for i in 0..bytes.len() {
+        if bytes[i] == 'V' && i > 0 && bytes[i - 1].is_ascii_digit() {
+            let int_part: String = bytes[..i].iter().rev().take_while(|c| c.is_ascii_digit()).collect::<String>().chars().rev().collect();
+            let frac: String = bytes[i + 1..].iter().take_while(|c| c.is_ascii_digit()).collect();
+            let v: f64 = format!("{}.{}", int_part, if frac.is_empty() { "0".to_string() } else { frac }).parse().ok()?;
+            if v > 0.0 && v < 60.0 {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Build and sweep a PDN model per power rail that has decouplers.
+fn pdn_audit(
+    plan: &CircuitPlan,
+    board: &crate::board::Board,
+    stackup: &crate::materials::Stackup,
+    ctx: &crate::si::SiContext,
+    plane_specs: &[PlaneSpec],
+    plane_rects: &[Option<(f64, f64, f64, f64)>],
+) -> Vec<crate::pdn::RailResult> {
+    use crate::pdn::*;
+    let ground = |n: &str| ctx.decouplers.iter().any(|d| (d.net_a == n || d.net_b == n) && crate::netfreq::net_signal(n, &[], None, None).role == crate::netfreq::NetRole::Ground);
+    // Consumers: components with declared power, split across their rails by pin count
+    let consumers: Vec<(String, f64, Vec<(String, f64, usize)>)> = plan
+        .components
+        .iter()
+        .filter_map(|c| {
+            let p = c.power_w?;
+            if p <= 0.0 {
+                return None;
+            }
+            let mut rails: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for n in &plan.nets {
+                if let Some(v) = rail_volts(&n.name) {
+                    let _ = v;
+                    let cnt = n.pins.iter().filter(|pin| pin.starts_with(&format!("{}:", c.reference))).count();
+                    if cnt > 0 && crate::netfreq::net_signal(&n.name, &[], n.freq_hz, n.role.as_deref()).role == crate::netfreq::NetRole::Power {
+                        *rails.entry(n.name.clone()).or_insert(0) += cnt;
+                    }
+                }
+            }
+            Some((c.reference.clone(), p, rails.into_iter().map(|(r, cnt)| (r.clone(), rail_volts(&r).unwrap_or(3.3), cnt)).collect()))
+        })
+        .collect();
+    let currents = rail_currents(&consumers);
+    let (bw, bh) = board.outline_bbox().map(|(x0, y0, x1, y1)| (x1 - x0, y1 - y0)).unwrap_or((100.0, 80.0));
+    let mut rails: Vec<String> = ctx.decouplers.iter().filter_map(|d| if ground(&d.net_b) { Some(d.net_a.clone()) } else if ground(&d.net_a) { Some(d.net_b.clone()) } else { None }).collect();
+    rails.sort();
+    rails.dedup();
+    let mut out = Vec::new();
+    for rail in rails {
+        let Some(volts) = rail_volts(&rail) else { continue };
+        let caps: Vec<CapBranch> = ctx
+            .decouplers
+            .iter()
+            .filter(|d| d.net_a == rail || d.net_b == rail)
+            .map(|d| {
+                let loop_nh = crate::si::cap_loop_inductance_nh(board, stackup, ctx, d).map(|(l, _)| l).unwrap_or(2.0);
+                CapBranch { reference: d.reference.clone(), c_f: d.c_farads, esr_ohm: mlcc_esr_ohm(d.c_farads), esl_nh: mlcc_esl_nh(d.c_farads) + loop_nh }
+            })
+            .collect();
+        // Plane capacitance to the nearest GND plane (depth difference)
+        let plane_c_pf = plane_specs
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.net == rail)
+            .map(|(i, p)| {
+                let area = plane_rects.get(i).copied().flatten().map(|(x0, y0, x1, y1)| (x1 - x0) * (y1 - y0)).unwrap_or(bw * bh);
+                let k = p.layer.strip_prefix("In").and_then(|r| r.strip_suffix(".Cu")).and_then(|d| d.parse::<usize>().ok()).unwrap_or(1);
+                let kg = plane_specs.iter().find(|q| crate::netfreq::net_signal(&q.net, &[], None, None).role == crate::netfreq::NetRole::Ground).and_then(|q| q.layer.strip_prefix("In").and_then(|r| r.strip_suffix(".Cu")).and_then(|d| d.parse::<usize>().ok())).unwrap_or(1);
+                let step = (stackup.finished_thickness_mm - 2.0 * (stackup.h_mm + stackup.copper_thickness_mm)).max(0.1) / (board.layer_count as f64 - 3.0).max(1.0);
+                let h = ((k as f64 - kg as f64).abs() * step).max(stackup.h_mm);
+                plane_capacitance_pf(area, h, stackup.er)
+            })
+            .sum();
+        // Regulator branch: the output path from the regulator (or its buck
+        // inductor) to the first via/pad — measured; 20 mΩ source resistance.
+        let (vrm_l_nh, _src) = plan
+            .components
+            .iter()
+            .filter(|c| crate::values::inductance_h(&c.value).is_some() || { let u = format!("{} {}", c.value, c.lib_id).to_ascii_uppercase(); u.contains("REGULATOR") || u.contains("LDO") || u.contains("TPS5") || u.contains("ME62") || u.contains("XC62") })
+            .filter(|c| plan.nets.iter().any(|n| n.name == rail && n.pins.iter().any(|p| p.starts_with(&format!("{}:", c.reference)))))
+            .filter_map(|c| crate::si::component_stub(board, &c.reference, &rail).map(|(len, w, _)| (crate::si::trace_l_per_mm(w, stackup.h_mm, stackup.copper_thickness_mm) * len + 0.5, c.reference.clone())))
+            .next()
+            .unwrap_or((10.0, "assumed 10 nH (no regulator found on this rail)".into()));
+        let model = RailModel { rail: rail.clone(), volts, current_a: currents.get(&rail).copied().unwrap_or(0.1).max(0.05), caps, plane_c_pf, vrm_r_ohm: 0.02, vrm_l_nh };
+        out.push(sweep(&model));
+    }
+    out
+}
+
+
+/// Referenced 3D models (`(model "${KICAD*_3DMODEL_DIR}/Lib.3dshapes/X.step")`)
+/// and which of them the model directory lacks: (total, missing names).
+pub fn count_missing_models(pcb_text: &str, model_dir: Option<&str>) -> (usize, Vec<String>) {
+    let mut total = 0usize;
+    let mut missing: Vec<String> = Vec::new();
+    for line in pcb_text.lines() {
+        let Some(i) = line.find("(model \"") else { continue };
+        let rest = &line[i + 8..];
+        let Some(j) = rest.find('"') else { continue };
+        let path = &rest[..j];
+        total += 1;
+        let Some(k) = path.find("3DMODEL_DIR}") else { continue };
+        let rel = &path[k + "3DMODEL_DIR}".len()..];
+        let rel = rel.trim_start_matches('/');
+        let fetched = std::env::var("HOME").map(|h| format!("{}/.local/share/someda/3dmodels", h)).unwrap_or_default();
+        let overridden = std::fs::read_to_string(format!("{}/overrides.json", fetched))
+            .ok()
+            .and_then(|t| serde_json::from_str::<std::collections::HashMap<String, String>>(&t).ok())
+            .map(|m| m.get(rel).map(|o| std::path::Path::new(o).exists()).unwrap_or(false))
+            .unwrap_or(false);
+        let found = model_dir.map(|d| std::path::Path::new(d).join(rel).exists()).unwrap_or(false)
+            || std::path::Path::new(&fetched).join(rel).exists()
+            || overridden;
+        if !found {
+            missing.push(rel.rsplit('/').next().unwrap_or(rel).to_string());
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    (total, missing)
+}
+
+/// Point every referenced model that the system library lacks but the
+/// someda-fetched directory has at that absolute file, so kicad-cli renders
+/// it (one KICAD*_3DMODEL_DIR cannot name two directories).
+pub fn resolve_fetched_models(pcb_text: &str, model_dir: Option<&str>) -> String {
+    let Ok(home) = std::env::var("HOME") else { return pcb_text.to_string() };
+    let fetched = format!("{}/.local/share/someda/3dmodels", home);
+    if !std::path::Path::new(&fetched).is_dir() {
+        return pcb_text.to_string();
+    }
+    // overrides.json: models fetched from another source (LCSC/EasyEDA,
+    // UltraLibrarian, SnapEDA) for a KiCad footprint whose own model does
+    // not exist: {"Lib.3dshapes/X.step": "/abs/path/model.step"}
+    let overrides: std::collections::HashMap<String, String> = std::fs::read_to_string(format!("{}/overrides.json", fetched))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let mut out = String::with_capacity(pcb_text.len());
+    for line in pcb_text.lines() {
+        let mut replaced = line.to_string();
+        if let Some(i) = line.find("(model \"") {
+            let rest = &line[i + 8..];
+            if let Some(j) = rest.find('"') {
+                let path = &rest[..j];
+                if let Some(k) = path.find("3DMODEL_DIR}") {
+                    let rel = path[k + "3DMODEL_DIR}".len()..].trim_start_matches('/');
+                    let in_system = model_dir.map(|d| std::path::Path::new(d).join(rel).exists()).unwrap_or(false);
+                    let local = std::path::Path::new(&fetched).join(rel);
+                    if !in_system && local.exists() {
+                        replaced = line.replace(path, &local.display().to_string());
+                    } else if !in_system {
+                        if let Some(o) = overrides.get(rel) {
+                            if std::path::Path::new(o).exists() {
+                                replaced = line.replace(path, o);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out.push_str(&replaced);
+        out.push('\n');
+    }
+    out
+}
+
+
+/// Rotation and outward overhang for a component placed on a board edge.
+/// The opening direction comes from the library footprint (courtyard
+/// overhang beyond the pads); the rotation (KiCad: CCW, y down) is the one
+/// that turns it toward the edge's outward normal. A plan `rotation` wins
+/// when given. Returns (rotation, overhang mm, a printed note).
+/// An "auto" plane island: the footprint that owns most of the net's pins
+/// (the SoC's rail pins) plus 5 mm for the decoupling capacitors hugging
+/// them, in board mm from the outline's top-left corner. Pads elsewhere
+/// are routed to the island as traces.
+pub fn auto_plane_region(board: &crate::board::Board, net: &str) -> Option<[f64; 4]> {
+    let (bx0, by0, _, _) = board.outline_bbox().unwrap_or((0.0, 0.0, 100.0, 80.0));
+    let on_net = |pd: &crate::board::Pad| pd.net.as_ref().map(|n| n.1 == net).unwrap_or(false);
+    let anchor = board.footprints.iter().max_by_key(|fp| fp.pads.iter().filter(|pd| on_net(pd)).count())?;
+    let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    for pd in anchor.pads.iter().filter(|pd| on_net(pd)) {
+        b[0] = b[0].min(pd.x - bx0);
+        b[1] = b[1].min(pd.y - by0);
+        b[2] = b[2].max(pd.x - bx0);
+        b[3] = b[3].max(pd.y - by0);
+    }
+    if b[0].is_finite() {
+        Some([b[0] - 5.0, b[1] - 5.0, b[2] + 5.0, b[3] + 5.0])
+    } else {
+        None
+    }
+}
+
+/// Rotate every edge connector so its opening faces its edge (plan
+/// rotation, when given, wins). Prints the decision when `verbose`.
+pub fn orient_edge_connectors(plan: &mut CircuitPlan, verbose: bool) {
+    for c in plan.components.iter_mut() {
+        let Some(pos) = c.position.as_deref().and_then(crate::placer::Pos::parse) else { continue };
+        if !pos.is_edge() {
+            continue;
+        }
+        let (rot, _overhang, note) = edge_connector_orientation(&*c, pos);
+        if let (Some(n), true) = (note, verbose) {
+            println!("  {}", n);
+        }
+        if c.rotation.is_none() {
+            c.rotation = rot.map(|r| r as f64);
+        }
+    }
+}
+
+pub fn edge_connector_orientation(c: &PlannedComponent, pos: crate::placer::Pos) -> (Option<i32>, f64, Option<String>) {
+    let want: (i32, i32) = match pos {
+        crate::placer::Pos::LeftEdge => (-1, 0),
+        crate::placer::Pos::RightEdge => (1, 0),
+        crate::placer::Pos::TopEdge => (0, -1),
+        _ => (0, 1),
+    };
+    let lib = c
+        .footprint
+        .as_deref()
+        .and_then(crate::footprint_lib::resolve)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| crate::footprint_lib::parse_kicad_mod(&text).ok());
+    // `edge_overhang_mm` is how far the BODY FRONT protrudes past the board
+    // edge. The placer works in courtyard terms with a 0.5 mm margin, so
+    // the value it gets is overhang + (courtyard-to-body inset) + margin
+    // (live-verified: passing the raw value left a "0.8 mm" USB-C 0.2 mm
+    // inside the edge).
+    let overhang = c.edge_overhang_mm.unwrap_or(0.0).max(0.0);
+    let Some(lib) = lib else {
+        return (c.rotation.map(|r| r as i32), if overhang > 0.0 { overhang + crate::placer::EDGE_MARGIN_MM } else { 0.0 }, None);
+    };
+    let Some(opening) = lib.opening_direction() else {
+        return (
+            c.rotation.map(|r| r as i32),
+            if overhang > 0.0 { overhang + crate::placer::EDGE_MARGIN_MM } else { 0.0 },
+            Some(match c.rotation {
+                Some(r) => format!("{}: no connector opening found in {} geometry; plan rotation {} kept", c.reference, lib.name, r),
+                None => format!("{}: no connector opening found in {} geometry and no plan rotation — placed at 0°; set \"rotation\" if it has a mating direction", c.reference, lib.name),
+            }),
+        );
+    };
+    // Body front vs courtyard front along the opening (footprint frame,
+    // rotation-independent).
+    let inset = match (lib.fab, lib.courtyard) {
+        (Some(fb), Some(cb)) => match opening {
+            (-1, 0) => fb.0 - cb.0,
+            (1, 0) => cb.2 - fb.2,
+            (0, -1) => fb.1 - cb.1,
+            _ => cb.3 - fb.3,
+        },
+        _ => 0.0,
+    };
+    let placer_overhang = if overhang > 0.0 { overhang + inset.max(0.0) + crate::placer::EDGE_MARGIN_MM } else { 0.0 };
+    let edge_note = if overhang > 0.0 {
+        format!("body front protrudes {:.2} mm past the board edge (courtyard {:.2} mm past)", overhang, overhang + inset.max(0.0))
+    } else {
+        format!("courtyard {:.1} mm inside the board edge, body front {:.2} mm inside", crate::placer::EDGE_MARGIN_MM, crate::placer::EDGE_MARGIN_MM + inset)
+    };
+    if let Some(r) = c.rotation {
+        return (Some(r as i32), placer_overhang, Some(format!("{}: opening {:?} in footprint frame, plan rotation {} kept; {}", c.reference, opening, r, edge_note)));
+    }
+    for rot in [0i32, 90, 180, 270] {
+        let a = (rot as f64).to_radians();
+        let ox = (opening.0 as f64 * a.cos() + opening.1 as f64 * a.sin()).round() as i32;
+        let oy = (-(opening.0 as f64) * a.sin() + opening.1 as f64 * a.cos()).round() as i32;
+        if (ox, oy) == want {
+            return (
+                Some(rot),
+                placer_overhang,
+                Some(format!("{}: {} opening faces the {} (rotation {}°); {}", c.reference, lib.name, format!("{:?}", pos).to_lowercase().replace("edge", " edge"), rot, edge_note)),
+            );
+        }
+    }
+    (c.rotation.map(|r| r as i32), placer_overhang, None)
+}
+
+/// Intra-pair skew budget by interface class (Toradex Layout Design
+/// Guide 102492, interface tables: USB 2.0 < 7.5 ps ≈ 1.1 mm; Ethernet
+/// < 1.6 ps ≈ 250 µm; MIPI CSI/DSI, USB 3, PCIe, SATA, LVDS < 1 ps ≈
+/// 150 µm). Unknown interfaces get the Ethernet figure.
+pub fn pair_skew_budget_mm(p: &str, n: &str) -> f64 {
+    let u = format!("{} {}", p, n).to_ascii_uppercase();
+    let has = |keys: &[&str]| keys.iter().any(|k| u.contains(k));
+    if has(&["MIPI", "CSI", "DSI", "LVDS", "PCIE", "SATA", "HDMI", "USB3", "SS_", "SSTX", "SSRX", "TMDS"]) {
+        0.15
+    } else if has(&["USB", "DP", "DM", "D+", "D-"]) {
+        1.1
+    } else if has(&["ETH", "MDI", "TXP", "TXN", "RXP", "RXN", "TD", "RD", "TRD"]) {
+        0.25
+    } else {
+        0.25
+    }
+}
+
+/// Signal layers that sit next to one whole-board plane: a trace there has
+/// an unbroken return path. A layer next to a split plane, or to no plane
+/// at all on a multilayer board, is excluded for pairs and
+/// impedance-controlled nets. 2-layer boards: both layers (nothing better).
+pub fn clean_signal_layers(
+    board: &crate::board::Board,
+    signal_layers: &[String],
+    plane_specs: &[PlaneSpec],
+    plane_rects: &[Option<(f64, f64, f64, f64)>],
+) -> Vec<String> {
+    let copper = board.copper_layers();
+    if board.layer_count <= 2 || plane_specs.is_empty() {
+        return signal_layers.to_vec();
+    }
+    let whole_single = |layer: &str| -> bool {
+        let on: Vec<usize> = plane_specs.iter().enumerate().filter(|(_, p)| p.layer == layer).map(|(i, _)| i).collect();
+        on.len() == 1 && plane_rects.get(on[0]).map(|r| r.is_none()).unwrap_or(false)
+    };
+    signal_layers
+        .iter()
+        .filter(|l| {
+            let Some(i) = copper.iter().position(|c| c == *l) else { return false };
+            let neighbours = [i.checked_sub(1), if i + 1 < copper.len() { Some(i + 1) } else { None }];
+            neighbours.iter().flatten().any(|&j| whole_single(&copper[j]))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Everything the SI audit needs beyond the copper, derived from the plan.
+fn build_si_context(
+    plan: &CircuitPlan,
+    board: &crate::board::Board,
+    pair_infos: &[crate::si::PairInfo],
+    exempt: &[(f64, f64, f64, f64, String, u8)],
+    families: &[Vec<String>],
+    net_gap: &std::collections::HashMap<String, f64>,
+    clearance_mm: f64,
+    plane_specs: &[PlaneSpec],
+) -> crate::si::SiContext {
+    let mut ctx = crate::si::SiContext {
+        pairs: pair_infos.to_vec(),
+        exempt_rects: exempt.to_vec(),
+        families: families.to_vec(),
+        gap_of: net_gap.clone(),
+        clearance_mm,
+        layer_count: board.layer_count,
+        ..Default::default()
+    };
+    let comp = |r: &str| plan.components.iter().find(|c| c.reference == r);
+    for net in &plan.nets {
+        let declared = net.termination.as_deref().map(|t| t.to_ascii_lowercase());
+        let terminated = match declared.as_deref() {
+            Some("series") | Some("parallel") | Some("on-chip") | Some("onchip") | Some("ac") => true,
+            Some(_) => false,
+            None => net.pins.iter().any(|pin| {
+                pin.split_once(':').and_then(|(r, _)| comp(r)).map(|c| {
+                    let two_pin = plan.nets.iter().flat_map(|n| n.pins.iter()).filter(|p| p.starts_with(&format!("{}:", c.reference))).count() <= 2;
+                    two_pin && crate::values::resistance_ohm(&c.value).map(|r| r <= 100.0).unwrap_or(false)
+                }).unwrap_or(false)
+            }),
+        };
+        if terminated {
+            ctx.terminated.insert(net.name.clone());
+        }
+    }
+    // Decouplers: two-pin capacitors between a power-role net and a
+    // ground-role net (RC filters, crystal loads and AC couplings are not
+    // decouplers and carry no mounting-loop rule).
+    let role_of = |name: &str| -> crate::netfreq::NetRole {
+        plan.nets.iter().find(|n| n.name == name).map(|n| crate::netfreq::net_signal(&n.name, &[], n.freq_hz, n.role.as_deref()).role).unwrap_or(crate::netfreq::NetRole::Digital)
+    };
+    for c in &plan.components {
+        let Some(cf) = crate::values::capacitance_f(&c.value) else { continue };
+        let pins: Vec<(&str, &str)> = plan.nets.iter().flat_map(|n| n.pins.iter().filter(|p| p.starts_with(&format!("{}:", c.reference))).map(move |p| (n.name.as_str(), p.as_str()))).collect();
+        if pins.len() != 2 || pins[0].0 == pins[1].0 {
+            continue;
+        }
+        let (ra, rb) = (role_of(pins[0].0), role_of(pins[1].0));
+        let is_decoupler = matches!((&ra, &rb), (crate::netfreq::NetRole::Power, crate::netfreq::NetRole::Ground) | (crate::netfreq::NetRole::Ground, crate::netfreq::NetRole::Power));
+        // The mounting-loop model (stub → via → plane) needs a plane on at
+        // least one side; on a board whose rails are traces the loop is
+        // the whole trace path and the PDN sweep judges it instead.
+        let on_plane = plane_specs.iter().any(|p| p.net == pins[0].0 || p.net == pins[1].0);
+        if !is_decoupler || !on_plane {
+            continue;
+        }
+        // A regulator's output capacitor is judged by the regulator check
+        // (its loop is capacitor ↔ regulator pin, not capacitor ↔ plane).
+        let anchor_is_regulator = c
+            .near
+            .as_deref()
+            .and_then(|a| plan.components.iter().find(|x| x.reference == a))
+            .map(|a| crate::stability::regulator_min_cout_uf(&a.value, &a.lib_id).is_some())
+            .unwrap_or(false);
+        if anchor_is_regulator {
+            continue;
+        }
+        // Strict (error) only for a capacitor that actually sits at its IC
+        // (within 6 mm of the anchor's body): a capacitor the placer could
+        // not get there is a bulk capacitor, judged as a warning (the PDN
+        // audit still judges the rail).
+        let strict = c.near.as_deref().map(|a| a.starts_with('U') && {
+            let fp = |r: &str| board.footprints.iter().find(|f| f.reference == r).map(|f| (f.x, f.y));
+            match (fp(&c.reference), fp(a)) {
+                (Some((cx, cy)), Some((ax, ay))) => {
+                    let anchor = board.footprints.iter().find(|f| f.reference == a);
+                    let half = anchor.and_then(|f| f.courtyard.as_ref().map(|q| ((q.2 - q.0).abs().max((q.3 - q.1).abs())) / 2.0)).unwrap_or(5.0);
+                    ((cx - ax).powi(2) + (cy - ay).powi(2)).sqrt() <= half + 6.0
+                }
+                _ => true,
+            }
+        }).unwrap_or(false);
+        ctx.decouplers.push(crate::si::Decoupler { reference: c.reference.clone(), net_a: pins[0].0.to_string(), net_b: pins[1].0.to_string(), c_farads: cf, strict });
+    }
+    for ps in plane_specs {
+        if let Some(k) = ps.layer.strip_prefix("In").and_then(|r| r.strip_suffix(".Cu")).and_then(|d| d.parse::<usize>().ok()) {
+            ctx.plane_layer_of.entry(ps.net.clone()).or_insert(k);
+        }
+    }
+    ctx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1778,14 +2740,14 @@ mod tests {
         //  pi0 (pin "1"): lib (-5.08, (2-1-0)*2.54) = (-5.08, 2.54)
         //  pi1 (pin "3"): lib (-5.08, (2-1-1)*2.54) = (-5.08, 0)
         //  pi2 (pin "8"): right col k=0: lib (5.08, (0-(2-1))*2.54) = (5.08, -2.54)
+        // pins [1,3,8], n=3, half=2, top=1.27: left 1.27 / −1.27, right −1.27
         let expected_lib = [
-            ("1", -5.08f64, 2.54f64),
-            ("3", -5.08, 0.0),
-            ("8", 5.08, -2.54),
+            ("1", -SCH_PIN_X, 1.27f64),
+            ("3", -SCH_PIN_X, -1.27),
+            ("8", SCH_PIN_X, -1.27),
         ];
         let idx = plan.components.iter().position(|c| c.reference == "U1").unwrap();
-        let ox = 50.8; // default placement for idx 0
-        let oy = 50.8;
+        let (ox, oy) = sch_layout(&plan).origins[idx];
         for (num, px, py) in expected_lib {
             // parse_pin says where the wire goes:
             let (wx, wy) = parse_pin(&format!("U1:{}", num), &plan).unwrap();

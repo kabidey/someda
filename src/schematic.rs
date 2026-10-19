@@ -275,6 +275,28 @@ fn parse_label(args: &[Sexp], global: bool) -> Option<Label> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn same_named_labels_on_separate_stubs_form_one_net() {
+        let sch = Schematic::from_kicad_sch(
+            "(kicad_sch (version 20220904) (generator someda)
+              (lib_symbols
+                (symbol \"Device:R\" (pin_names (offset 0.254)) (symbol \"R_0_1\"
+                  (pin passive line (at -12.7 0 0) (length 5.08) (name \"1\" (effects (font (size 1.27 1.27)))) (number \"1\" (effects (font (size 1.27 1.27)))))
+                  (pin passive line (at 12.7 0 180) (length 5.08) (name \"2\" (effects (font (size 1.27 1.27)))) (number \"2\" (effects (font (size 1.27 1.27))))))))
+              (wire (pts (xy 37.3 50) (xy 34.76 50)) (uuid w1))
+              (label \"NET_A\" (at 34.76 50 180) (effects (font (size 1.27 1.27)) (justify right bottom)))
+              (wire (pts (xy 37.3 100) (xy 34.76 100)) (uuid w2))
+              (label \"NET_A\" (at 34.76 100 180) (effects (font (size 1.27 1.27)) (justify right bottom)))
+              (symbol (lib_id \"Device:R\") (at 50 50 0) (unit 1) (property \"Reference\" \"R1\" (at 0 0 0)) (property \"Value\" \"1k\" (at 0 0 0)))
+              (symbol (lib_id \"Device:R\") (at 50 100 0) (unit 1) (property \"Reference\" \"R2\" (at 0 0 0)) (property \"Value\" \"1k\" (at 0 0 0)))
+            )",
+        )
+        .unwrap();
+        let nets = derive_nets(&sch);
+        let a = nets.iter().find(|n| n.name.as_deref() == Some("NET_A")).expect("NET_A");
+        assert_eq!(a.pins.len(), 2, "R1:1 and R2:1 join through the label name: {:?}", a.pins);
+    }
+
     const SAMPLE: &str = r#"(kicad_sch (version 20230121)
       (lib_symbols
         (symbol "Device:R" (pin_names (offset 0)) (in_bom yes) (on_board yes)
@@ -378,6 +400,8 @@ pub struct Net {
 pub struct ErcFinding {
     pub code: String,
     pub message: String,
+    /// The net the finding is about, when it is about one net.
+    pub net: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -535,6 +559,22 @@ pub fn derive_nets(sch: &Schematic) -> Vec<Net> {
         }
     }
 
+    // Same-named local labels on one sheet are one net (KiCad semantics):
+    // a labelled stub per pin is a valid, wire-free schematic style.
+    {
+        let mut first_by_name: HashMap<String, usize> = HashMap::new();
+        for idx in 0..points.len() {
+            if let Some(name) = points[idx].label.clone() {
+                match first_by_name.get(&name) {
+                    Some(&first) => ds.union(first, idx),
+                    None => {
+                        first_by_name.insert(name, idx);
+                    }
+                }
+            }
+        }
+    }
+
     // Collect nets by root
     let mut net_map: HashMap<usize, Net> = HashMap::new();
     for (idx, p) in points.iter().enumerate() {
@@ -593,6 +633,7 @@ pub fn run_erc(sch: &Schematic) -> ErcReport {
             let has_nc = nc_positions.iter().any(|&(nx, ny)| points_match((ax, ay), (nx, ny)));
             if !has_nc {
                 findings.push(ErcFinding {
+                    net: None,
                     code: "floating-pin".into(),
                     message: format!("Pin {}:{} ('{}') is not connected to any net and has no no-connect marker.",
                         inst.reference, num, _name),
@@ -606,6 +647,7 @@ pub fn run_erc(sch: &Schematic) -> ErcReport {
         if net.pins.len() == 1 && !net.is_no_connect && !net.has_power {
             let (ref_, num, _) = &net.pins[0];
             findings.push(ErcFinding {
+                net: None,
                 code: "unconnected-net".into(),
                 message: format!("Net '{}' (label: {:?}) has only one connection: {}:{} — signal goes nowhere.",
                     net.name.as_deref().unwrap_or("<unnamed>"), net.name, ref_, num),
@@ -667,6 +709,7 @@ pub fn run_erc(sch: &Schematic) -> ErcReport {
         });
         if !has_cap {
             findings.push(ErcFinding {
+                net: net.name.clone(),
                 code: "missing-decoupling".into(),
                 message: format!(
                     "Power net '{}' carries an IC pin but no decoupling capacitor — add 100nF within 2mm of each IC power pin (skill 102).",
@@ -685,6 +728,7 @@ pub fn run_erc(sch: &Schematic) -> ErcReport {
             || name.starts_with('+') || name.starts_with('-');
         if looks_like_power && !net.has_power && net.pins.len() > 1 {
             findings.push(ErcFinding {
+                net: None,
                 code: "missing-power-flag".into(),
                 message: format!("Net '{}' looks like a power net but has no power symbol attached.",
                     name),
