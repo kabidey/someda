@@ -329,6 +329,7 @@ impl BoardPlan {
                 rot: p.rot,
                 side_back: p.side_back,
                             edge_at: None,
+                edge_overhang: 0.0,
             });
         }
         for g in &self.groups {

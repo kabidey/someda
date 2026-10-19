@@ -50,8 +50,43 @@ pub struct LibFootprint {
     pub keepouts: Vec<LibKeepout>,
     /// Courtyard bbox relative to origin: (min_x, min_y, max_x, max_y)
     pub courtyard: Option<(f64, f64, f64, f64)>,
+    /// Body (F.Fab / B.Fab) outline bbox relative to origin.
+    pub fab: Option<(f64, f64, f64, f64)>,
     pub is_smd: bool,
     pub sexp: Sexp,
+}
+
+impl LibFootprint {
+    /// Where a connector's opening faces, in footprint coordinates (unit
+    /// axis vector), from the geometry alone: the side on which the
+    /// courtyard reaches farthest beyond the pads (the receptacle that
+    /// sticks out past the last pad row). None when no side stands out
+    /// (not a connector, or a vertical one): overhang must beat the opposite
+    /// side by 1 mm and be at least 1.5 mm. Checked on the KiCad USB-C,
+    /// RJ45, microSD, FPC and 3.5 mm jack footprints of the SomPi board.
+    pub fn opening_direction(&self) -> Option<(i32, i32)> {
+        if self.pads.is_empty() {
+            return None;
+        }
+        let pb = self.pad_bbox();
+        let cb = self.courtyard?;
+        // The body drawing (F.Fab) counts too: a card socket's courtyard
+        // hugs the pads, but its fab outline shows the inserted card.
+        let fb = self.fab.unwrap_or(cb);
+        let over = [
+            ((-1, 0), (pb.0 - cb.0).max(pb.0 - fb.0)),
+            ((1, 0), (cb.2 - pb.2).max(fb.2 - pb.2)),
+            ((0, -1), (pb.1 - cb.1).max(pb.1 - fb.1)),
+            ((0, 1), (cb.3 - pb.3).max(fb.3 - pb.3)),
+        ];
+        let (dir, best) = over.iter().copied().fold(((0, 0), f64::NEG_INFINITY), |acc, x| if x.1 > acc.1 { x } else { acc });
+        let opposite = over.iter().find(|(d, _)| *d == (-dir.0, -dir.1)).map(|x| x.1).unwrap_or(0.0);
+        if best >= 1.5 && best - opposite >= 1.0 {
+            Some(dir)
+        } else {
+            None
+        }
+    }
 }
 
 impl LibFootprint {
@@ -212,6 +247,65 @@ pub fn resolve(lib_id: &str) -> Option<PathBuf> {
     None
 }
 
+/// The library footprint closest to a "Lib:Name" that does not resolve:
+/// the nearest name (normalized Levenshtein ≤ 35 %) inside that library,
+/// else the exact name inside any library. `None` when nothing is close —
+/// the engine never guesses a different part.
+pub fn closest(lib_id: &str) -> Option<String> {
+    let (lib, name) = lib_id.split_once(':')?;
+    let norm = |s: &str| s.to_ascii_lowercase().chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>();
+    let want = norm(name);
+    let mut best: Option<(usize, String)> = None;
+    for dir in search_dirs() {
+        let Ok(rd) = std::fs::read_dir(dir.join(format!("{}.pretty", lib))) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("kicad_mod") {
+                continue;
+            }
+            let Some(stem) = p.file_stem().and_then(|x| x.to_str()).map(|s| s.to_string()) else { continue };
+            let d = levenshtein(&want, &norm(&stem));
+            if best.as_ref().map_or(true, |b| d < b.0 || (d == b.0 && stem < b.1)) {
+                best = Some((d, stem));
+            }
+        }
+    }
+    if let Some((d, stem)) = &best {
+        if d * 100 <= want.len().max(1) * 35 {
+            return Some(format!("{}:{}", lib, stem));
+        }
+    }
+    for dir in search_dirs() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut libs: Vec<std::path::PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().and_then(|x| x.to_str()) == Some("pretty")).collect();
+        libs.sort();
+        for p in libs {
+            if p.join(format!("{}.kicad_mod", name)).is_file() {
+                if let Some(l) = p.file_stem().and_then(|x| x.to_str()) {
+                    return Some(format!("{}:{}", l, name));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 /// Load and parse a library footprint by "Lib:Name".
 pub fn load(lib_id: &str) -> Result<LibFootprint, String> {
     let path = resolve(lib_id).ok_or_else(|| {
@@ -241,6 +335,7 @@ pub fn parse_footprint_sexp(doc: &Sexp) -> Result<LibFootprint, String> {
     let mut pads = Vec::new();
     let mut keepouts = Vec::new();
     let mut crt = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut fab = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
     let mut is_smd = false;
     for child in items.iter().skip(2) {
         if let Some(z) = child.as_tagged("zone") {
@@ -262,19 +357,21 @@ pub fn parse_footprint_sexp(doc: &Sexp) -> Result<LibFootprint, String> {
         if let Sexp::List(parts) = child {
             let tag = parts.first().and_then(|t| t.atom()).unwrap_or("");
             if matches!(tag, "fp_line" | "fp_rect" | "fp_poly" | "fp_circle" | "fp_arc") {
-                let on_crt = parts.iter().any(|p| {
-                    p.as_tagged("layer")
-                        .and_then(|l| l.first())
-                        .and_then(|s| s.str_value())
-                        .map(|s| s.ends_with(".CrtYd"))
-                        .unwrap_or(false)
-                });
-                if on_crt {
+                let layer_name = parts.iter().find_map(|p| p.as_tagged("layer").and_then(|l| l.first()).and_then(|s| s.str_value()).map(|s| s.to_string())).unwrap_or_default();
+                if layer_name.ends_with(".CrtYd") {
                     for pt in graphic_points(parts, tag) {
                         crt.0 = crt.0.min(pt.0);
                         crt.1 = crt.1.min(pt.1);
                         crt.2 = crt.2.max(pt.0);
                         crt.3 = crt.3.max(pt.1);
+                    }
+                }
+                if layer_name.ends_with(".Fab") {
+                    for pt in graphic_points(parts, tag) {
+                        fab.0 = fab.0.min(pt.0);
+                        fab.1 = fab.1.min(pt.1);
+                        fab.2 = fab.2.max(pt.0);
+                        fab.3 = fab.3.max(pt.1);
                     }
                 }
             }
@@ -288,7 +385,8 @@ pub fn parse_footprint_sexp(doc: &Sexp) -> Result<LibFootprint, String> {
     if !is_smd {
         is_smd = !pads.is_empty() && pads.iter().all(|p| p.pad_type == PadType::Smd);
     }
-    Ok(LibFootprint { name, pads, keepouts, courtyard, is_smd, sexp: doc.clone() })
+    let fab = if fab.0.is_finite() && fab.2 > fab.0 && fab.3 > fab.1 { Some(fab) } else { None };
+    Ok(LibFootprint { name, pads, keepouts, courtyard, fab, is_smd, sexp: doc.clone() })
 }
 
 /// `(zone ... (keepout (tracks not_allowed) (vias not_allowed) ...) (polygon (pts ...)))`

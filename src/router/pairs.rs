@@ -77,6 +77,12 @@ pub(super) struct PairRoute {
 struct DState {
     cell: Cell,
     dir: u8,
+    /// Cells travelled since the last corner (saturating): a corner is
+    /// allowed only after `straight_len` cells, so two opposite corners
+    /// never sit closer than the track offset and the offset P/N polylines
+    /// cannot cross each other (live-verified: a 0.5 mm U-turn leg put the
+    /// N track across the P track at a SOT-23 breakout).
+    run: u8,
 }
 
 const DIRS: [(i32, i32); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
@@ -248,6 +254,26 @@ impl Router {
         let mut forbid: std::collections::HashSet<Cell> = std::collections::HashSet::new();
         let layers: Vec<u8> = self.config.pair_layers.iter().filter_map(|l| self.config.signal_layers.iter().position(|s| s == l).map(|i| i as u8)).collect();
         let layers = if layers.is_empty() { vec![0u8] } else { layers };
+        // The corridor never runs over the real pads of its own two nets
+        // or inside their clearance: the tracks sit ±o off the centreline,
+        // so a corridor across the P pad puts the N track on it
+        // (live-verified: a USB corridor started between a SOT-23-6's pad
+        // columns and shorted D+ to the D− pad). The tails reach the pads;
+        // the corridor starts and ends outside this keep-out.
+        {
+            let keep = self.config.clearance + w_eff / 2.0 + pitch;
+            for p in pads.iter().filter(|p| !p.virtual_pad && (p.net == Some(pn) || p.net == Some(nn))) {
+                let (x0, x1) = (((p.x - p.hx - keep) / pitch).floor() as i32, ((p.x + p.hx + keep) / pitch).ceil() as i32);
+                let (y0, y1) = (((p.y - p.hy - keep) / pitch).floor() as i32, ((p.y + p.hy + keep) / pitch).ceil() as i32);
+                for &layer in &layers {
+                    for y in y0..=y1 {
+                        for x in x0..=x1 {
+                            forbid.insert(Cell { x, y, layer });
+                        }
+                    }
+                }
+            }
+        }
         let mut last_cause = String::from("no corridor on any allowed layer");
         for attempt in 0..6 {
             let mut found: Option<(u8, i32, Vec<Cell>, bool)> = None;
@@ -274,6 +300,17 @@ impl Router {
                 break;
             };
             rep.crossover = crossover;
+            if std::env::var("SOMEDA_ROUTE_DEBUG").map(|v| v == "2").unwrap_or(false) {
+                let mm = |c: &Cell| (c.x as f64 * pitch, c.y as f64 * pitch);
+                eprintln!(
+                    "route-debug: PAIR {}/{} attempt {} layer {} side {} crossover {} forbid {} cells; A {}:{} ({:.2},{:.2}) hx {:.2} hy {:.2} fp ({:.2},{:.2}) / {}:{} ({:.2},{:.2}); start_mid ({:.2},{:.2}) away ({:.1},{:.1}); corridor {} cells head {:?} tail {:?}",
+                    pc.p, pc.n, attempt, layer, side, crossover, forbid.len(),
+                    pads[pa as usize].reference, pads[pa as usize].number, pads[pa as usize].x, pads[pa as usize].y, pads[pa as usize].hx, pads[pa as usize].hy, pads[pa as usize].fp_cx, pads[pa as usize].fp_cy,
+                    pads[na as usize].reference, pads[na as usize].number, pads[na as usize].x, pads[na as usize].y,
+                    start_mid.0 * pitch, start_mid.1 * pitch, start_away.0, start_away.1,
+                    corridor.len(), corridor.iter().take(4).map(mm).collect::<Vec<_>>(), corridor.iter().rev().take(3).map(mm).collect::<Vec<_>>()
+                );
+            }
             // Trial on a grid clone: stamp corridor, route tails, keep on success
             let mut g2 = grid.clone();
             let mut d2 = dsu.clone();
@@ -454,7 +491,7 @@ impl Router {
         let turn_penalty = (1.0 / self.config.grid).max(1.0); // ≈1 mm per corner: each corner costs 4·offset of skew
         let near = self.near_radius_index(gap);
         let halo_r = self.halo_cells(2.0 * (body as f64) * self.config.grid + self.config.trace_width);
-        let free_cell = |c: Cell| -> bool {
+        let free_cell = |c: Cell, dir: Option<u8>| -> bool {
             if forbid.contains(&c) {
                 return false;
             }
@@ -477,11 +514,17 @@ impl Router {
                     if lane != 0 && lane != tp && lane != tn {
                         return false;
                     }
-                    let x = grid.xt[i];
-                    if x != FREE && !grid.tags.friendly(tp, x) {
-                        return false;
-                    }
-                    if !grid.exempt[i] {
+                    let relaxed = grid.exempt[i]
+                        || match (grid.xt_band[i], dir.map(|d| DIRS[d as usize])) {
+                            (1, Some((ddx, _))) => ddx != 0,
+                            (2, Some((_, ddy))) => ddy != 0,
+                            _ => false,
+                        };
+                    if !relaxed {
+                        let x = grid.xt[i];
+                        if x != FREE && !grid.tags.friendly(tp, x) {
+                            return false;
+                        }
                         if let Some(m) = near {
                             let v = if m == 0 { grid.near3[i] } else { grid.near5[i] };
                             if v != FREE && !grid.tags.friendly(tp, v) {
@@ -526,7 +569,14 @@ impl Router {
         for y in (sy - radius)..=(sy + radius) {
             for x in (sx - radius)..=(sx + radius) {
                 let c = Cell { x, y, layer };
-                if manh(&c, start_mid) > radius as f64 || !free_cell(c) {
+                if manh(&c, start_mid) > radius as f64 || !free_cell(c, None) {
+                    continue;
+                }
+                // The corridor starts in front of A's pads (on their escape
+                // side), never behind or under the part (live-verified: a
+                // start west of a SOT-23's right pad column, heading east
+                // under the pads, hooked back over them).
+                if (c.x as f64 - start_mid.0) * start_away.0 + (c.y as f64 - start_mid.1) * start_away.1 < -1e-9 {
                     continue;
                 }
                 for d in 0..4u8 {
@@ -539,18 +589,18 @@ impl Router {
                     // live-verified). Pre-extend the start by straight steps.
                     let (dx, dy) = DIRS[d as usize];
                     let chain: Vec<Cell> = (0..straight_len).map(|i| Cell { x: c.x + i * dx, y: c.y + i * dy, layer }).collect();
-                    if chain.iter().skip(1).any(|q| !free_cell(*q)) {
+                    if chain.iter().skip(1).any(|q| !free_cell(*q, Some(d))) {
                         continue;
                     }
                     // Symmetric tails: prefer starts on the pads' bisector
                     let along = ((c.x as f64 - start_mid.0) * start_vec.0 + (c.y as f64 - start_mid.1) * start_vec.1).abs() / (start_vec.0.hypot(start_vec.1)).max(1e-9);
                     let g0 = 2.0 * manh(&c, start_mid) + 2.0 * along;
-                    let last = DState { cell: *chain.last().unwrap(), dir: d };
+                    let last = DState { cell: *chain.last().unwrap(), dir: d, run: straight_len.min(250) as u8 };
                     let g_last = g0 + (straight_len - 1) as f64;
                     if g_score.get(&last).map_or(true, |g| g_last < *g) {
                         let mut prev: Option<DState> = None;
                         for (i, q) in chain.iter().enumerate() {
-                            let st = DState { cell: *q, dir: d };
+                            let st = DState { cell: *q, dir: d, run: ((i as i32) + 1).min(250) as u8 };
                             g_score.insert(st, g0 + i as f64);
                             if let Some(p) = prev {
                                 came.insert(st, p);
@@ -617,7 +667,8 @@ impl Router {
                 else if !approach_free(st.cell, st.dir, false) { bad_approach += 1; }
                 else if !straight_in { bad_straight += 1; }
             }
-            if manh(&st.cell, goal_mid) <= goal_r && side_of(st.dir, goal_vec) == goal_side && enters_b(st.dir) && approach_free(st.cell, st.dir, false) && g_here > 0.0 && straight_in {
+            let in_front_of_b = (goal_mid.0 - st.cell.x as f64) * goal_toward.0 + (goal_mid.1 - st.cell.y as f64) * goal_toward.1 >= -1e-9;
+            if manh(&st.cell, goal_mid) <= goal_r && side_of(st.dir, goal_vec) == goal_side && enters_b(st.dir) && approach_free(st.cell, st.dir, false) && g_here > 0.0 && straight_in && in_front_of_b {
                 // Goal-eligible: costed with its far tails (2× the distance
                 // from here to the pads), accepted only when it is the
                 // cheapest thing left in the heap.
@@ -629,7 +680,7 @@ impl Router {
                 }
                 let (dx, dy) = DIRS[nd as usize];
                 let nc = Cell { x: st.cell.x + dx, y: st.cell.y + dy, layer };
-                if !free_cell(nc) {
+                if !free_cell(nc, Some(nd)) {
                     continue;
                 }
                 let turn = if nd != st.dir { turn_penalty } else { 0.0 };
@@ -642,7 +693,10 @@ impl Router {
                     };
                     iso + if sideways { self.config.band_side_cost } else { 0.0 }
                 }).unwrap_or(0.0);
-                let ns = DState { cell: nc, dir: nd };
+                if nd != st.dir && (st.run as i32) < straight_len {
+                    continue; // minimum leg between corners
+                }
+                let ns = DState { cell: nc, dir: nd, run: if nd == st.dir { st.run.saturating_add(1).min(250) } else { 1 } };
                 let tentative = g_here + 1.0 + turn + extra;
                 if tentative < *g_score.get(&ns).unwrap_or(&f64::INFINITY) {
                     came.insert(ns, st);

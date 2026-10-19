@@ -69,8 +69,44 @@ impl Pos {
         }
     }
 
-    fn is_edge(self) -> bool {
+    pub fn is_edge(self) -> bool {
         matches!(self, Pos::LeftEdge | Pos::RightEdge | Pos::TopEdge | Pos::BottomEdge)
+    }
+
+    pub fn is_corner(self) -> bool {
+        matches!(self, Pos::TopLeft | Pos::TopRight | Pos::BottomLeft | Pos::BottomRight)
+    }
+
+    /// The plan-schema name of this position.
+    pub fn name(self) -> &'static str {
+        use Pos::*;
+        match self {
+            TopLeft => "top_left",
+            Top => "top",
+            TopRight => "top_right",
+            Left => "left",
+            Center => "center",
+            Right => "right",
+            BottomLeft => "bottom_left",
+            Bottom => "bottom",
+            BottomRight => "bottom_right",
+            LeftEdge => "left_edge",
+            RightEdge => "right_edge",
+            TopEdge => "top_edge",
+            BottomEdge => "bottom_edge",
+        }
+    }
+
+    /// The other edges to try when an edge connector finds no room on its
+    /// requested edge: the two adjacent edges first, the opposite one last.
+    pub fn fallback_edges(self) -> [Pos; 3] {
+        use Pos::*;
+        match self {
+            TopEdge => [LeftEdge, RightEdge, BottomEdge],
+            BottomEdge => [LeftEdge, RightEdge, TopEdge],
+            LeftEdge => [TopEdge, BottomEdge, RightEdge],
+            _ => [TopEdge, BottomEdge, LeftEdge],
+        }
     }
 }
 
@@ -84,6 +120,9 @@ pub struct PlaceIntent {
     pub side_back: bool,
     /// Edge positions: fraction along the edge (0..1) to start the slide from.
     pub edge_at: Option<f64>,
+    /// Edge positions: push the part outward by this much beyond the
+    /// courtyard-flush position (mm) — a connector face at the board edge.
+    pub edge_overhang: f64,
 }
 
 /// A keep-together group: members hug the anchor within max_mm.
@@ -128,6 +167,10 @@ pub struct PlacementIntent {
     pub near: Vec<(String, String)>,
     /// Nets ignored for connectivity placement (planes, big power rails).
     pub ignore_nets: Vec<String>,
+    /// Ground nets: a part aimed at its anchor's pins ignores these (and
+    /// only these) when choosing which pins to sit next to — a decoupling
+    /// capacitor goes to its rail's pins even when the rail is a plane.
+    pub ground_nets: Vec<String>,
 }
 
 /// The solved geometry for one footprint.
@@ -162,9 +205,12 @@ fn overlaps(a: Rect, b: Rect, gap: f64) -> bool {
     a.0 < b.2 + gap && b.0 < a.2 + gap && a.1 < b.3 + gap && b.1 < a.3 + gap
 }
 
+/// Courtyard-to-outline margin for edge connectors and everything else (mm).
+pub const EDGE_MARGIN_MM: f64 = 0.5;
+
 impl Placer {
     pub fn new(board_w: f64, board_h: f64) -> Placer {
-        Placer { board_w, board_h, pitch: 10.0, gap: 0.6, margin: 0.5, escape_ring: 3.6 }
+        Placer { board_w, board_h, pitch: 10.0, gap: 0.6, margin: EDGE_MARGIN_MM, escape_ring: 3.6 }
     }
 
     /// Courtyard-aware placement from real footprint geometry.
@@ -213,8 +259,23 @@ impl Placer {
         let part_of = |r: &str| parts.iter().position(|p| p.reference == r);
 
         let mut solved: Vec<Solved> = Vec::new();
-        // placed (reference, courtyard rect, keep-out ring)
-        let mut placed_rects: Vec<(String, Rect, f64)> = Vec::new();
+        // placed (reference, courtyard rect, keep-out ring per side l/t/r/b)
+        let mut placed_rects: Vec<(String, Rect, Rect)> = Vec::new();
+        let inflate = |r: Rect, k: Rect| -> Rect { (r.0 - k.0, r.1 - k.1, r.2 + k.2, r.3 + k.3) };
+        // A fine-pitch part's escape ring is needed where its lanes and
+        // fanout vias go: every side for an IC, only the inward side for an
+        // edge connector (its pins escape away from the edge; live-verified:
+        // an all-round ring kept a camera connector off every edge because
+        // of the corner mounting holes).
+        let ring_sides = |ring: f64, pos: Option<Pos>| -> Rect {
+            match pos {
+                Some(Pos::LeftEdge) => (0.0, 0.0, ring, 0.0),
+                Some(Pos::RightEdge) => (ring, 0.0, 0.0, 0.0),
+                Some(Pos::TopEdge) => (0.0, 0.0, 0.0, ring),
+                Some(Pos::BottomEdge) => (0.0, ring, 0.0, 0.0),
+                _ => (ring, ring, ring, ring),
+            }
+        };
         let hot: std::collections::HashMap<String, Vec<(String, f64)>> = {
             let mut m: std::collections::HashMap<String, Vec<(String, f64)>> = std::collections::HashMap::new();
             for ap in &intent.apart {
@@ -225,14 +286,22 @@ impl Placer {
         };
 
         // The free-spot test for a part's bbox centred at (cx, cy)
-        let fits = |reference: &str, rel: Rect, ring: f64, cx: f64, cy: f64, placed: &[(String, Rect, f64)], solved: &[Solved]| -> bool {
+        // `relax`: how far past the outline margin the courtyard may reach on
+        // the (left, top, right, bottom) side — an edge connector's declared
+        // overhang (live-verified: a 0.8 mm USB-C overhang was rejected by
+        // this bound and the part fell back to the interior search).
+        let fits = |reference: &str, rel: Rect, ring: Rect, cx: f64, cy: f64, placed: &[(String, Rect, Rect)], solved: &[Solved], relax: Rect| -> bool {
             let hw = (rel.2 - rel.0) / 2.0;
             let hh = (rel.3 - rel.1) / 2.0;
             let r = (cx - hw, cy - hh, cx + hw, cy + hh);
-            if r.0 < self.margin || r.1 < self.margin || r.2 > self.board_w - self.margin || r.3 > self.board_h - self.margin {
+            if r.0 < self.margin - relax.0 - 1e-6
+                || r.1 < self.margin - relax.1 - 1e-6
+                || r.2 > self.board_w - self.margin + relax.2 + 1e-6
+                || r.3 > self.board_h - self.margin + relax.3 + 1e-6
+            {
                 return false;
             }
-            if placed.iter().any(|(_, q, qring)| overlaps(r, *q, self.gap + ring.max(*qring))) {
+            if placed.iter().any(|(_, q, qring)| overlaps(inflate(r, ring), *q, self.gap) || overlaps(r, inflate(*q, *qring), self.gap)) {
                 return false;
             }
             if let Some(constraints) = hot.get(reference) {
@@ -248,12 +317,13 @@ impl Placer {
             true
         };
         // Deterministic spiral search on a 0.5mm lattice from a target point
-        let spiral = |reference: &str, rel: Rect, ring: f64, tx: f64, ty: f64, placed: &[(String, Rect, f64)], solved: &[Solved]| -> Option<(f64, f64)> {
+        let no_relax: Rect = (0.0, 0.0, 0.0, 0.0);
+        let spiral = |reference: &str, rel: Rect, ring: Rect, tx: f64, ty: f64, placed: &[(String, Rect, Rect)], solved: &[Solved], relax: Rect| -> Option<(f64, f64)> {
             let step = 0.5;
             let max_r = ((self.board_w.max(self.board_h)) / step).ceil() as i32 + 2;
             let snap = |v: f64| (v / step).round() * step;
             let (sx, sy) = (snap(tx), snap(ty));
-            if fits(reference, rel, ring, sx, sy, placed, solved) {
+            if fits(reference, rel, ring, sx, sy, placed, solved, relax) {
                 return Some((sx, sy));
             }
             for rg in 1..=max_r {
@@ -275,28 +345,57 @@ impl Placer {
                     da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
                 });
                 for (cx, cy) in cands {
-                    if fits(reference, rel, ring, cx, cy, placed, solved) {
+                    if fits(reference, rel, ring, cx, cy, placed, solved, relax) {
                         return Some((cx, cy));
                     }
                 }
             }
             None
         };
-        let commit = |p: &Part, cx: f64, cy: f64, solved: &mut Vec<Solved>, placed: &mut Vec<(String, Rect, f64)>| {
+        let commit = |p: &Part, ring: Rect, cx: f64, cy: f64, solved: &mut Vec<Solved>, placed: &mut Vec<(String, Rect, Rect)>| {
             let hw = (p.rel.2 - p.rel.0) / 2.0;
             let hh = (p.rel.3 - p.rel.1) / 2.0;
             // origin = bbox centre minus the bbox's own offset from the origin
             let ox = cx - (p.rel.0 + hw);
             let oy = cy - (p.rel.1 + hh);
             solved.push(Solved { reference: p.reference.clone(), x: ox, y: oy, rot: p.rot, back: false });
-            placed.push((p.reference.clone(), (cx - hw, cy - hh, cx + hw, cy + hh), p.ring));
+            placed.push((p.reference.clone(), (cx - hw, cy - hh, cx + hw, cy + hh), ring));
         };
 
-        // 1. Semantic / edge positions first
-        for pi in &intent.places {
+        // 1. Mechanical first: mounting holes (no nets) at their exact
+        //    corners, then edge connectors largest first (a big connector
+        //    slid along a crowded edge still finds its edge before the
+        //    small parts fill it), then the other semantic positions —
+        //    plan order within each group (live-verified: plan order put
+        //    two regulators in the corner a camera connector needed, and
+        //    the connector ended 20 mm inside the board).
+        // Order: mounting holes, the centre anchor (the plan's main IC: the
+        // layout is built around it and split-plane regions are declared
+        // relative to it), edge connectors largest first, other positions.
+        let prio = |pi: &PlaceIntent| -> u8 {
+            let pos = pi.pos.unwrap_or(Pos::Center);
+            let degree = part_of(&pi.reference).map(|i| parts[i].degree).unwrap_or(1);
+            if pos.is_corner() && degree == 0 {
+                0
+            } else if pos == Pos::Center {
+                1
+            } else if pos.is_edge() {
+                2
+            } else {
+                3
+            }
+        };
+        let area_of = |pi: &PlaceIntent| part_of(&pi.reference).map(|i| (parts[i].rel.2 - parts[i].rel.0) * (parts[i].rel.3 - parts[i].rel.1)).unwrap_or(0.0);
+        let mut ordered: Vec<&PlaceIntent> = intent.places.iter().collect();
+        ordered.sort_by(|a, b| {
+            prio(a).cmp(&prio(b)).then_with(|| if prio(a) == 2 { area_of(b).partial_cmp(&area_of(a)).unwrap_or(std::cmp::Ordering::Equal) } else { std::cmp::Ordering::Equal })
+        });
+        for pi in ordered {
             let Some(idx) = part_of(&pi.reference) else { continue };
             let p = &parts[idx];
             let pos = pi.pos.unwrap_or(Pos::Center);
+            let exact_corner = pos.is_corner() && p.degree == 0;
+            let ring = ring_sides(p.ring, Some(pos));
             let (mut ux, mut uy) = pos.unit();
             if let Some(f) = pi.edge_at {
                 let f = f.clamp(0.0, 1.0);
@@ -308,13 +407,25 @@ impl Placer {
             }
             let hw = (p.rel.2 - p.rel.0) / 2.0;
             let hh = (p.rel.3 - p.rel.1) / 2.0;
+            let o = pi.edge_overhang;
+            let relax: Rect = match pos {
+                Pos::LeftEdge => (o, 0.0, 0.0, 0.0),
+                Pos::TopEdge => (0.0, o, 0.0, 0.0),
+                Pos::RightEdge => (0.0, 0.0, o, 0.0),
+                Pos::BottomEdge => (0.0, 0.0, 0.0, o),
+                _ => no_relax,
+            };
             let (tx, ty) = if pos.is_edge() {
                 match pos {
-                    Pos::LeftEdge => (self.margin + hw, uy * self.board_h),
-                    Pos::RightEdge => (self.board_w - self.margin - hw, uy * self.board_h),
-                    Pos::TopEdge => (ux * self.board_w, self.margin + hh),
-                    _ => (ux * self.board_w, self.board_h - self.margin - hh),
+                    Pos::LeftEdge => (self.margin + hw - o, uy * self.board_h),
+                    Pos::RightEdge => (self.board_w - self.margin - hw + o, uy * self.board_h),
+                    Pos::TopEdge => (ux * self.board_w, self.margin + hh - o),
+                    _ => (ux * self.board_w, self.board_h - self.margin - hh + o),
                 }
+            } else if exact_corner {
+                let cx = if matches!(pos, Pos::TopLeft | Pos::BottomLeft) { self.margin + hw } else { self.board_w - self.margin - hw };
+                let cy = if matches!(pos, Pos::TopLeft | Pos::TopRight) { self.margin + hh } else { self.board_h - self.margin - hh };
+                (cx, cy)
             } else {
                 (ux * self.board_w, uy * self.board_h)
             };
@@ -331,19 +442,25 @@ impl Placer {
                             Pos::LeftEdge | Pos::RightEdge => (tx, ty + d),
                             _ => (tx + d, ty),
                         };
-                        if fits(&p.reference, p.rel, p.ring, cx, cy, &placed_rects, &solved) {
+                        if fits(&p.reference, p.rel, ring, cx, cy, &placed_rects, &solved, relax) {
                             found = Some((cx, cy));
                             break;
                         }
                     }
                     if found.is_some() { break; }
                 }
-                found.or_else(|| spiral(&p.reference, p.rel, p.ring, tx, ty, &placed_rects, &solved))
+                found.or_else(|| spiral(&p.reference, p.rel, ring, tx, ty, &placed_rects, &solved, relax))
             } else {
-                spiral(&p.reference, p.rel, p.ring, tx, ty, &placed_rects, &solved)
+                spiral(&p.reference, p.rel, ring, tx, ty, &placed_rects, &solved, relax)
             };
+            if std::env::var("SOMEDA_PLACE_DEBUG").is_ok() {
+                println!(
+                    "place-debug: {} pos {:?} rel ({:.1},{:.1},{:.1},{:.1}) ring {:.1} target ({:.1},{:.1}) spot {:?}",
+                    p.reference, pos, p.rel.0, p.rel.1, p.rel.2, p.rel.3, p.ring, tx, ty, spot
+                );
+            }
             if let Some((cx, cy)) = spot {
-                commit(p, cx, cy, &mut solved, &mut placed_rects);
+                commit(p, ring, cx, cy, &mut solved, &mut placed_rects);
             }
         }
 
@@ -380,6 +497,12 @@ impl Placer {
                 .unwrap_or(0);
             let i = remaining.remove(pick);
             let p = &parts[i];
+            // Which of the part's nets pick the anchor pins it sits next
+            // to: everything but ground. (Live-verified: skipping every
+            // plane net left a rail capacitor with no net at all, so it was
+            // aimed at the IC's centre and parked on the far side of the
+            // chip from its rail pins — 18.8 mm stub, 9.6 nH loop.)
+            let skip_nets: &Vec<String> = if intent.ground_nets.is_empty() { &intent.ignore_nets } else { &intent.ground_nets };
             let target = if let Some((_, anchor)) = intent.near.iter().find(|(pr, _)| pr == &p.reference) {
                 // Aim at the anchor's pads that share a net with this part
                 // (a 1V8 cap goes to the 1V8 pins, not the IC's centre).
@@ -388,7 +511,7 @@ impl Placer {
                         .footprints
                         .iter()
                         .find(|f| f.reference == p.reference)
-                        .map(|f| f.pads.iter().filter_map(|pd| pd.net.as_ref().map(|n| &n.1)).filter(|n| !intent.ignore_nets.contains(n)).collect())
+                        .map(|f| f.pads.iter().filter_map(|pd| pd.net.as_ref().map(|n| &n.1)).filter(|n| !skip_nets.contains(n)).collect())
                         .unwrap_or_default();
                     let afp = board.footprints.iter().find(|f| &f.reference == anchor);
                     let pts: Vec<(f64, f64)> = afp
@@ -429,12 +552,17 @@ impl Placer {
                 }
             })
             .unwrap_or((self.board_w / 2.0, self.board_h / 2.0));
-            if let Some((cx, cy)) = spiral(&p.reference, p.rel, p.ring, target.0, target.1, &placed_rects, &solved) {
-                commit(p, cx, cy, &mut solved, &mut placed_rects);
+            let ring = ring_sides(p.ring, None);
+            let spot = spiral(&p.reference, p.rel, ring, target.0, target.1, &placed_rects, &solved, no_relax);
+            if std::env::var("SOMEDA_PLACE_DEBUG").is_ok() {
+                println!("place-debug: {} near-target ({:.1},{:.1}) spot {:?}", p.reference, target.0, target.1, spot);
+            }
+            if let Some((cx, cy)) = spot {
+                commit(p, ring, cx, cy, &mut solved, &mut placed_rects);
             } else {
                 // No room: park at the centre so the pin-coverage/DRC gates
                 // report the overlap honestly rather than losing the part.
-                commit(p, self.board_w / 2.0, self.board_h / 2.0, &mut solved, &mut placed_rects);
+                commit(p, ring, self.board_w / 2.0, self.board_h / 2.0, &mut solved, &mut placed_rects);
             }
         }
         solved
@@ -646,7 +774,7 @@ mod tests {
         let nl = netlist_2comp(&b);
         let p = Placer::new(100.0, 80.0);
         let intent = PlacementIntent {
-            places: vec![PlaceIntent { reference: "R1".into(), pos: Pos::parse("top_left"), rot: None, side_back: false, edge_at: None }],
+            places: vec![PlaceIntent { reference: "R1".into(), pos: Pos::parse("top_left"), rot: None, side_back: false, edge_at: None, edge_overhang: 0.0 }],
             ..Default::default()
         };
         let solved = p.arrange(&b, &nl, &intent);
@@ -717,7 +845,7 @@ mod tests {
         let nl = Netlist::from_board(&b);
         let p = Placer::new(40.0, 30.0);
         let intent = PlacementIntent {
-            places: vec![PlaceIntent { reference: "J1".into(), pos: Pos::parse("left_edge"), rot: None, side_back: false, edge_at: None }],
+            places: vec![PlaceIntent { reference: "J1".into(), pos: Pos::parse("left_edge"), rot: None, side_back: false, edge_at: None, edge_overhang: 0.0 }],
             ignore_nets: vec!["GND".into()],
             ..Default::default()
         };

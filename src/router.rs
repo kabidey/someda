@@ -86,6 +86,9 @@ pub struct RouteResult {
     /// Breakout zones where the crosstalk spacing rule is relaxed (board
     /// mm, per layer name or "*"): the SI audit uses the same zones.
     pub exempt_rects: Vec<ExemptRect>,
+    /// Crosstalk families (net names): nets that carry one signal through
+    /// a small pass-through part and are never aggressors of each other.
+    pub families: Vec<Vec<String>>,
 }
 
 /// A rectangle (board mm) where parallel runs closer than the crosstalk
@@ -98,6 +101,10 @@ pub struct ExemptRect {
     pub y1: f64,
     /// Copper layer name, or "*" for every layer.
     pub layer: String,
+    /// 0: tolerated in every direction (pad surroundings); 1 / 2: a
+    /// fine-pitch escape band whose pins escape along x / y — only runs
+    /// along that axis are tolerated.
+    pub axis: u8,
 }
 
 impl RouteResult {
@@ -368,6 +375,14 @@ struct Grid {
     /// Per cell/layer: breakout zone (pad proximity, escape band or lane)
     /// where the crosstalk rule is relaxed.
     exempt: Vec<bool>,
+    /// Fine-pitch escape band per cell: 0 none, 1 = pins escape along x,
+    /// 2 = along y. Inside a band the crosstalk rule is relaxed ONLY for
+    /// copper running along the escape direction (neighbouring pins must
+    /// leave side by side at the pin pitch); copper running across the
+    /// band — along the pin row — is a normal aggressor/victim
+    /// (live-verified: an audio net ran 3.4 mm along a USB pair at 0.21 mm
+    /// inside the SoC's top band when the whole band was exempt).
+    xt_band: Vec<u8>,
     /// Per cell/layer: inside a pair corridor's halo (the pair's P tag) —
     /// tails of other families stay out (they join only through their own
     /// terminal approach cells).
@@ -436,6 +451,7 @@ impl Grid {
             near3: vec![FREE; n],
             near5: vec![FREE; n],
             exempt: vec![false; n],
+            xt_band: vec![0; n],
             corridor: vec![0; n],
             tags: TagMaps::default(),
         }
@@ -816,12 +832,13 @@ impl Router {
         let exempt_rects: Vec<ExemptRect> = self
             .breakout_rects(&pads)
             .into_iter()
-            .map(|(x0, y0, x1, y1, l)| ExemptRect {
+            .map(|(x0, y0, x1, y1, l, axis)| ExemptRect {
                 x0: x0 + bx0,
                 y0: y0 + by0,
                 x1: x1 + bx0,
                 y1: y1 + by0,
                 layer: l.map(|i| self.config.signal_layers[i as usize].clone()).unwrap_or_else(|| "*".into()),
+                axis,
             })
             .collect();
         let pads = pads; // frozen from here on
@@ -1195,6 +1212,15 @@ impl Router {
         }
         result.pairs = state.pair_reports.clone();
         result.exempt_rects = exempt_rects;
+        {
+            let mut by_fam: std::collections::BTreeMap<u32, Vec<String>> = std::collections::BTreeMap::new();
+            for (t, &f) in grid.tags.family.iter().enumerate() {
+                if f != 0 && t > 0 {
+                    by_fam.entry(f).or_default().push(net_name(t - 1));
+                }
+            }
+            result.families = by_fam.into_values().collect();
+        }
         for r in &state.routed {
             let name = net_name(r.net);
             self.emit_path(&mut result, &r.cells, (r.net, name), r.width, bx0, by0);
@@ -1501,7 +1527,7 @@ impl Router {
         // next to pads and inside fine-pitch escape bands and lanes, where
         // the pin pitch makes it physically impossible. The SI audit uses
         // the same rectangles (RouteResult::exempt_rects).
-        for (x0, y0, x1, y1, layer) in self.breakout_rects(pads) {
+        for (x0, y0, x1, y1, layer, axis) in self.breakout_rects(pads) {
             let (gx0, gx1) = ((x0 / pitch).floor() as i32, (x1 / pitch).ceil() as i32);
             let (gy0, gy1) = ((y0 / pitch).floor() as i32, (y1 / pitch).ceil() as i32);
             let layers: Vec<u8> = match layer {
@@ -1512,23 +1538,20 @@ impl Router {
                 for y in gy0..=gy1 {
                     for x in gx0..=gx1 {
                         if let Some(i) = grid.idx(x, y, l) {
-                            grid.exempt[i] = true;
+                            if axis == 0 {
+                                grid.exempt[i] = true;
+                            } else {
+                                grid.xt_band[i] = axis;
+                            }
                         }
                     }
                 }
             }
         }
-        for l in 0..grid.layers as u8 {
-            for y in 0..grid.h as i32 {
-                for x in 0..grid.w as i32 {
-                    if grid.lane[y as usize * grid.w + x as usize] != 0 {
-                        if let Some(i) = grid.idx(x, y, l) {
-                            grid.exempt[i] = true;
-                        }
-                    }
-                }
-            }
-        }
+        // (Escape lanes are inside the pad layer's escape bands and need no
+        // exemption of their own; marking them exempt on EVERY layer let a
+        // quiet net hug a pair tail on In2 at the design clearance —
+        // live-verified ETH_LED_LINK 0.39 mm from ETH_RXN.)
     }
 
     /// Debug aid: print the occupancy around a cell on its layer.
@@ -1657,7 +1680,7 @@ impl Router {
     /// Breakout zones (board-relative mm, layer index or None = all):
     /// every pad grown by `xt_exempt_pad_mm`, and the escape band strip of
     /// every fine-pitch pad.
-    fn breakout_rects(&self, pads: &[RPad]) -> Vec<(f64, f64, f64, f64, Option<u8>)> {
+    fn breakout_rects(&self, pads: &[RPad]) -> Vec<(f64, f64, f64, f64, Option<u8>, u8)> {
         let d = self.config.xt_exempt_pad_mm;
         let mut out = Vec::new();
         for p in pads {
@@ -1665,7 +1688,7 @@ impl Router {
                 continue;
             }
             let layer = if p.through || p.npth { None } else { p.layers.first().copied() };
-            out.push((p.x - p.hx - d, p.y - p.hy - d, p.x + p.hx + d, p.y + p.hy + d, layer));
+            out.push((p.x - p.hx - d, p.y - p.hy - d, p.x + p.hx + d, p.y + p.hy + d, layer, 0));
             if p.fine_pitch && !p.through && !p.npth {
                 let along_x = p.hx >= p.hy;
                 let dir = if along_x { (p.x - p.fp_cx).signum() } else { (p.y - p.fp_cy).signum() };
@@ -1675,10 +1698,10 @@ impl Router {
                 let band = self.config.xt_exempt_band_mm.max(self.config.escape_band_mm);
                 let r = if along_x {
                     let (x0, x1) = if dir > 0.0 { (p.x + p.hx, p.x + p.hx + band) } else { (p.x - p.hx - band, p.x - p.hx) };
-                    (x0, p.y - p.hy - 0.2, x1, p.y + p.hy + 0.2, layer)
+                    (x0, p.y - p.hy - 0.2, x1, p.y + p.hy + 0.2, layer, 1)
                 } else {
                     let (y0, y1) = if dir > 0.0 { (p.y + p.hy, p.y + p.hy + band) } else { (p.y - p.hy - band, p.y - p.hy) };
-                    (p.x - p.hx - 0.2, y0, p.x + p.hx + 0.2, y1, layer)
+                    (p.x - p.hx - 0.2, y0, p.x + p.hx + 0.2, y1, layer, 2)
                 };
                 out.push(r);
             }
@@ -2127,14 +2150,22 @@ impl Router {
         // Crosstalk: never inside another aggressor's 3W/5W halo, and an
         // aggressor never within its own spacing of another net's trace
         // (outside breakout zones).
-        let xt_ok = |q: &Cell, grid: &Grid| -> bool {
+        // `dir` is the direction of travel into `q`: inside an escape band
+        // the rule is relaxed only when moving along the band's escape axis.
+        let xt_ok = |q: &Cell, grid: &Grid, dir: (i32, i32)| -> bool {
             match grid.idx(q.x, q.y, q.layer) {
                 Some(i) => {
-                    let x = grid.xt[i];
-                    if x != FREE && !grid.tags.friendly(tag, x) {
-                        return false;
-                    }
-                    if !grid.exempt[i] {
+                    let relaxed = grid.exempt[i]
+                        || match grid.xt_band[i] {
+                            1 => dir.0 != 0 && dir.1 == 0,
+                            2 => dir.1 != 0 && dir.0 == 0,
+                            _ => false,
+                        };
+                    if !relaxed {
+                        let x = grid.xt[i];
+                        if x != FREE && !grid.tags.friendly(tag, x) {
+                            return false;
+                        }
                         if let Some(m) = near_idx {
                             let v = if m == 0 { grid.near3[i] } else { grid.near5[i] };
                             if v != FREE && !grid.tags.friendly(tag, v) {
@@ -2149,7 +2180,7 @@ impl Router {
         };
         // Free for this net's trace body (default traces: the cell itself)
         let halo_r = self.halo_cells(width);
-        let is_free = |c: &Cell, grid: &Grid| -> bool {
+        let is_free = |c: &Cell, grid: &Grid, dir: (i32, i32)| -> bool {
             if restricted && !grid.tags.layer_ok(c.layer) {
                 return false;
             }
@@ -2166,7 +2197,7 @@ impl Router {
             }
             if body == 0 {
                 let o = grid.owner_at(*c);
-                return (o == FREE || o == tag) && xt_ok(c, grid);
+                return (o == FREE || o == tag) && xt_ok(c, grid, dir);
             }
             // Wide (power) traces never enter escape lanes or bands of
             // other nets: a 0.4mm rail through a pin row walls the pins
@@ -2189,7 +2220,7 @@ impl Router {
                     if o != FREE && o != tag {
                         return false;
                     }
-                    if !xt_ok(&q, grid) {
+                    if !xt_ok(&q, grid, dir) {
                         return false;
                     }
                 }
@@ -2232,7 +2263,7 @@ impl Router {
             let pref_h = node.cell.layer % 2 == 1;
             for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                 let next = Cell { x: node.cell.x + dx, y: node.cell.y + dy, layer: node.cell.layer };
-                if !is_free(&next, grid) {
+                if !is_free(&next, grid, (dx, dy)) {
                     continue;
                 }
                 let against = if grid.layers > 2 && node.cell.layer != 0 && node.cell.layer as usize != grid.layers - 1 {
@@ -2263,7 +2294,7 @@ impl Router {
                         continue;
                     }
                     let next = Cell { x: node.cell.x, y: node.cell.y, layer: l };
-                    if !is_free(&next, grid) {
+                    if !is_free(&next, grid, (0, 0)) {
                         continue;
                     }
                     let tentative = g_here + via_cost;

@@ -31,3 +31,6 @@ pub mod thermal;
 pub mod values;
 pub mod stability;
 pub mod pdn;
+pub mod bom;
+pub mod jlcpcb;
+pub mod repair;

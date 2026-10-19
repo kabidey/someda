@@ -14,12 +14,14 @@ pub struct StabilityFinding {
     pub severity: &'static str,
     pub subject: String,
     pub detail: String,
+    /// The plan edit that fixes it, when one exists (repair loop).
+    pub repair: Option<crate::repair::RepairHint>,
 }
 
 /// Regulator families and the minimum output capacitance their
 /// datasheets require for loop stability (ceramic, effective value).
 /// Unknown regulators get a generic 1 µF floor with a note.
-fn regulator_min_cout_uf(value: &str, lib_id: &str) -> Option<(f64, &'static str)> {
+pub(crate) fn regulator_min_cout_uf(value: &str, lib_id: &str) -> Option<(f64, &'static str)> {
     let u = format!("{} {}", value, lib_id).to_ascii_uppercase();
     if u.contains("TPS562200") || u.contains("TPS562201") || u.contains("TPS563200") {
         // TI SLVSCQ4: D-CAP2, 10 µF–68 µF ceramic output (20 µF typical app)
@@ -147,6 +149,7 @@ pub fn audit(plan: &CircuitPlan, board: &Board) -> Vec<StabilityFinding> {
         let (uf, n) = cap_on_net_uf(plan, vout, &ground);
         if uf + 1e-9 < min_uf {
             out.push(StabilityFinding {
+                repair: Some(crate::repair::RepairHint::RegulatorOutputCap { regulator: c.reference.clone(), net: vout.to_string(), need_uf: min_uf }),
                 code: "regulator-output-cap",
                 severity: "error",
                 subject: c.reference.clone(),
@@ -154,6 +157,7 @@ pub fn audit(plan: &CircuitPlan, board: &Board) -> Vec<StabilityFinding> {
             });
         } else {
             out.push(StabilityFinding {
+                repair: None,
                 code: "regulator-output-cap",
                 severity: "info",
                 subject: c.reference.clone(),
@@ -166,12 +170,12 @@ pub fn audit(plan: &CircuitPlan, board: &Board) -> Vec<StabilityFinding> {
             if u.ends_with("_SW") || u == "SW" || u.ends_with("_LX") || u == "LX" {
                 let (len, vias) = net_length_and_vias(board, net);
                 let sev = if len > 15.0 { "warning" } else { "info" };
-                out.push(StabilityFinding { code: "switch-node", severity: sev, subject: net.to_string(), detail: format!("{:.1} mm of copper, {} via(s) — the di/dt loop: keep short (≤ 15 mm) and away from FB", len, vias) });
+                out.push(StabilityFinding { repair: None, code: "switch-node", severity: sev, subject: net.to_string(), detail: format!("{:.1} mm of copper, {} via(s) — the di/dt loop: keep short (≤ 15 mm) and away from FB", len, vias) });
             }
             if u.ends_with("_FB") || u == "FB" || u.ends_with("VFB") {
                 let (len, vias) = net_length_and_vias(board, net);
                 let sev = if len > 15.0 { "warning" } else { "info" };
-                out.push(StabilityFinding { code: "feedback-node", severity: sev, subject: net.to_string(), detail: format!("{:.1} mm, {} via(s) — high impedance node: ≤ 15 mm, no parallel run with the switch node", len, vias) });
+                out.push(StabilityFinding { repair: None, code: "feedback-node", severity: sev, subject: net.to_string(), detail: format!("{:.1} mm, {} via(s) — high impedance node: ≤ 15 mm, no parallel run with the switch node", len, vias) });
             }
         }
     }
@@ -189,12 +193,12 @@ pub fn audit(plan: &CircuitPlan, board: &Board) -> Vec<StabilityFinding> {
             let pf = uf * 1e6;
             let (len, vias) = net_length_and_vias(board, net);
             if n == 0 {
-                out.push(StabilityFinding { code: "crystal-load", severity: "error", subject: net.to_string(), detail: format!("{} pin net has no load capacitor to ground — the oscillator will not start reliably", c.value) });
+                out.push(StabilityFinding { repair: None, code: "crystal-load", severity: "error", subject: net.to_string(), detail: format!("{} pin net has no load capacitor to ground — the oscillator will not start reliably", c.value) });
             } else if !(5.0..=40.0).contains(&pf) {
-                out.push(StabilityFinding { code: "crystal-load", severity: "warning", subject: net.to_string(), detail: format!("{:.0} pF load on a {} pin is outside the usual 5–40 pF range", pf, c.value) });
+                out.push(StabilityFinding { repair: None, code: "crystal-load", severity: "warning", subject: net.to_string(), detail: format!("{:.0} pF load on a {} pin is outside the usual 5–40 pF range", pf, c.value) });
             }
             let sev = if len > 10.0 || vias > 0 { "warning" } else { "info" };
-            out.push(StabilityFinding { code: "crystal-trace", severity: sev, subject: net.to_string(), detail: format!("{:.1} mm, {} via(s) — crystal nets: ≤ 10 mm, no vias, nothing fast nearby ({} load)", len, vias, if n > 0 { format!("{:.0} pF", pf) } else { "no".into() }) });
+            out.push(StabilityFinding { repair: None, code: "crystal-trace", severity: sev, subject: net.to_string(), detail: format!("{:.1} mm, {} via(s) — crystal nets: ≤ 10 mm, no vias, nothing fast nearby ({} load)", len, vias, if n > 0 { format!("{:.0} pF", pf) } else { "no".into() }) });
         }
     }
 

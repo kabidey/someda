@@ -51,8 +51,15 @@ pub struct Decoupler {
 #[derive(Debug, Clone, Default)]
 pub struct SiContext {
     pub pairs: Vec<PairInfo>,
-    /// (x0, y0, x1, y1, layer or "*") in board mm.
-    pub exempt_rects: Vec<(f64, f64, f64, f64, String)>,
+    /// (x0, y0, x1, y1, layer or "*", axis) in board mm. Axis 0: tolerated
+    /// in every direction (pad surroundings); 1 / 2: a fine-pitch escape
+    /// band whose pins escape along x / y — only parallel runs along that
+    /// axis are tolerated, a run across the band is a real coupled pair.
+    pub exempt_rects: Vec<(f64, f64, f64, f64, String, u8)>,
+    /// Crosstalk families from the router: one signal carried by several
+    /// nets through a small pass-through part (ESD array, series parts) —
+    /// their traces are the same signal and never aggressors of each other.
+    pub families: Vec<Vec<String>>,
     /// Required edge gap to other nets' traces (3W/5W rule) per net.
     pub gap_of: HashMap<String, f64>,
     /// The design clearance (the gap for nets not in `gap_of`).
@@ -375,6 +382,9 @@ pub fn audit(
                 if mate_of.get(na) == Some(nb) {
                     continue;
                 }
+                if ctx.families.iter().any(|f| f.iter().any(|x| x == na) && f.iter().any(|x| x == nb)) {
+                    continue;
+                }
                 let bh = (b.start.1 - b.end.1).abs() < 1e-6;
                 let bv = (b.start.0 - b.end.0).abs() < 1e-6;
                 if (ah && !bh) || (av && !bv) || (bh && bv) {
@@ -398,8 +408,11 @@ pub fn audit(
                 // perpendicular coordinate midway between the two runs
                 let mid = (ac + bc) / 2.0;
                 let mut cuts: Vec<(f64, f64)> = Vec::new();
-                for (x0, y0, x1, y1, layer) in &ctx.exempt_rects {
+                for (x0, y0, x1, y1, layer, axis) in &ctx.exempt_rects {
                     if layer != "*" && layer != &a.layer {
+                        continue;
+                    }
+                    if (*axis == 1 && !ah) || (*axis == 2 && !av) {
                         continue;
                     }
                     let (p0, p1, q0, q1) = if ah { (*x0, *x1, *y0, *y1) } else { (*y0, *y1, *x0, *x1) };
@@ -722,7 +735,7 @@ mod tests {
         let a = audit(&b, &[(sig.clone(), par.clone())], &Stackup::for_layers(6), &FabLimits::default(), &ctx);
         let v = a.findings.iter().find(|f| f.code == "crosstalk-violation").expect("violation reported");
         assert!(v.detail.starts_with("10.00mm"), "{}", v.detail);
-        ctx.exempt_rects.push((0.0, 0.0, 40.0, 30.0, "*".into()));
+        ctx.exempt_rects.push((0.0, 0.0, 40.0, 30.0, "*".into(), 0));
         let a2 = audit(&b, &[(sig, par)], &Stackup::for_layers(6), &FabLimits::default(), &ctx);
         assert!(a2.findings.iter().all(|f| f.code != "crosstalk-violation"));
         assert!(a2.findings.iter().any(|f| f.code == "crosstalk-breakout"));
